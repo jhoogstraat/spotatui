@@ -151,8 +151,7 @@ pub async fn run_cli() -> Result<()> {
       reconfigure_auth: matches.get_flag("reconfigure-auth"),
       ui_launch: matches.subcommand_name().is_none(),
       cli_subcommand: matches.subcommand_name().is_some(),
-      update_check_enabled: matches.subcommand_name().is_none()
-        && !matches.get_flag("no-update"),
+      update_check_enabled: matches.subcommand_name().is_none() && !matches.get_flag("no-update"),
     },
     onboarding,
   )

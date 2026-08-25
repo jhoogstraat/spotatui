@@ -436,6 +436,121 @@ fn add_to_queue_dispatches_add_item() {
   }
 }
 
+// --- native queue ---
+
+fn queue_track(uri: &str, name: &str) -> crate::core::plugin_api::TrackInfo {
+  crate::core::plugin_api::TrackInfo {
+    uri: Some(uri.to_string()),
+    name: name.to_string(),
+    artists: vec!["Artist".to_string()],
+    album: "Album".to_string(),
+    duration_ms: 200_000,
+    id: None,
+    album_id: None,
+    artist_refs: Vec::new(),
+    is_playable: true,
+    is_local: false,
+    track_number: 0,
+    explicit: false,
+    image_url: None,
+  }
+}
+
+#[test]
+fn enqueue_native_pushes_onto_the_native_queue() {
+  let (mut app, _rx) = app_with_channel();
+
+  app.apply(Action::EnqueueNative(queue_track("subsonic:track:a", "A")));
+
+  assert_eq!(app.native_queue.len(), 1);
+  assert_eq!(app.native_queue[0].name, "A");
+}
+
+#[test]
+fn remove_native_queued_deletes_only_the_indexed_upcoming_item() {
+  let (mut app, _rx) = app_with_channel();
+  app.native_queue = vec![
+    queue_track("subsonic:track:a", "A"),
+    queue_track("subsonic:track:b", "B"),
+  ];
+
+  app.apply(Action::RemoveNativeQueued(0));
+
+  assert_eq!(app.native_queue.len(), 1);
+  assert_eq!(app.native_queue[0].name, "B");
+
+  // Out of range is a no-op.
+  app.apply(Action::RemoveNativeQueued(9));
+  assert_eq!(app.native_queue.len(), 1);
+}
+
+#[test]
+fn move_native_queued_swaps_with_the_neighbor() {
+  let (mut app, _rx) = app_with_channel();
+  app.native_queue = vec![
+    queue_track("subsonic:track:a", "A"),
+    queue_track("subsonic:track:b", "B"),
+    queue_track("subsonic:track:c", "C"),
+  ];
+
+  app.apply(Action::MoveNativeQueued { index: 1, up: true });
+  assert_eq!(app.native_queue[0].name, "B");
+  assert_eq!(app.native_queue[1].name, "A");
+
+  app.apply(Action::MoveNativeQueued {
+    index: 0,
+    up: false,
+  });
+  assert_eq!(app.native_queue[0].name, "A");
+  assert_eq!(app.native_queue[1].name, "B");
+
+  // Boundary indices are no-ops.
+  app.apply(Action::MoveNativeQueued { index: 0, up: true });
+  app.apply(Action::MoveNativeQueued {
+    index: 2,
+    up: false,
+  });
+  assert_eq!(app.native_queue[0].name, "A");
+  assert_eq!(app.native_queue[1].name, "B");
+  assert_eq!(app.native_queue[2].name, "C");
+}
+
+#[test]
+fn clear_native_queue_drops_only_upcoming_items() {
+  let (mut app, _rx) = app_with_channel();
+  app.native_queue = vec![
+    queue_track("subsonic:track:a", "A"),
+    queue_track("subsonic:track:b", "B"),
+  ];
+  // A queue slot that is playing now lives outside `native_queue`; keep a
+  // marker to prove clear leaves it alone. The slot type needs streaming;
+  // without it there is no slot at all, so the assertion is the same.
+  #[cfg(feature = "streaming")]
+  {
+    app.queue_now = Some(crate::infra::queue::QueueNowPlaying::Spotify {
+      track: queue_track("spotify:track:now", "Now"),
+    });
+  }
+
+  app.apply(Action::ClearNativeQueue);
+
+  assert!(app.native_queue.is_empty());
+  #[cfg(feature = "streaming")]
+  assert!(app.queue_now.is_some(), "the active Playable keeps playing");
+}
+
+#[test]
+fn begin_spotify_login_dispatches_begin() {
+  let (mut app, rx) = app_with_channel();
+
+  app.apply(Action::BeginSpotifyLogin);
+
+  match rx.try_recv() {
+    Ok(IoEvent::BeginSpotifyLogin) => {}
+    _other => panic!("expected BeginSpotifyLogin (IoEvent is not Debug)"),
+  }
+}
+
 // --- library / playlists ---
 
 #[test]

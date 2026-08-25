@@ -64,6 +64,11 @@ impl App {
         self.dispatch(IoEvent::TransferPlaybackToDevice(device_id, persist));
       }
       Action::AddToQueue(uri) => self.dispatch(IoEvent::AddItemToQueue(uri)),
+      Action::EnqueueNative(track) => self.add_track_to_native_queue(track),
+      Action::RemoveNativeQueued(index) => self.remove_native_queued(index),
+      Action::MoveNativeQueued { index, up } => self.move_native_queued(index, up),
+      Action::ClearNativeQueue => self.clear_native_queue(),
+      Action::BeginSpotifyLogin => self.dispatch(IoEvent::BeginSpotifyLogin),
       Action::Search(query) => {
         let country = self.get_user_country();
         self.dispatch(IoEvent::GetSearchResults(query, country));

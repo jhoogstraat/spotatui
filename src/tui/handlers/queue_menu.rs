@@ -63,19 +63,18 @@ fn move_selection(delta: i32, app: &mut App) {
 }
 
 /// Remove the selected queue item and clamp the selection to the shortened list.
-/// Row 0 (now playing) is non-actionable.
+/// Row 0 (now playing) is non-actionable. The Vec operation lives on `App` so
+/// every frontend shares one implementation.
 fn remove_selected(app: &mut App) {
   let selected = app.view.queue_selected_index;
   if selected == 0 {
     return;
   }
   let idx = selected - 1;
-  if idx < app.native_queue.len() {
-    app.native_queue.remove(idx);
-    let max_index = row_count(app).saturating_sub(1);
-    if app.view.queue_selected_index > max_index {
-      app.view.queue_selected_index = max_index;
-    }
+  app.remove_native_queued(idx);
+  let max_index = row_count(app).saturating_sub(1);
+  if app.view.queue_selected_index > max_index {
+    app.view.queue_selected_index = max_index;
   }
 }
 
@@ -88,16 +87,15 @@ fn reorder(delta: i32, app: &mut App) {
   }
   let idx = selected - 1;
   let len = app.native_queue.len();
-  if idx >= len {
-    return;
-  }
+  // The Vec operation lives on `App` so every frontend shares it; this
+  // screen only tracks which row is selected.
   match delta {
     1 if idx + 1 < len => {
-      app.native_queue.swap(idx, idx + 1);
+      app.move_native_queued(idx, false);
       app.view.queue_selected_index = selected + 1;
     }
     -1 if idx > 0 => {
-      app.native_queue.swap(idx, idx - 1);
+      app.move_native_queued(idx, true);
       app.view.queue_selected_index = selected - 1;
     }
     _ => {}

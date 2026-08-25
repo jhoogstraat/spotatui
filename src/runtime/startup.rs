@@ -610,10 +610,7 @@ pub(super) struct Services {
   /// `None` in builds where nothing produces one.
   pub shared_position_for_ui: Option<Arc<AtomicU64>>,
   // Read only by the terminal runner, and only on Linux + mpris builds.
-  #[cfg_attr(
-    not(all(feature = "mpris", target_os = "linux")),
-    allow(dead_code)
-  )]
+  #[cfg_attr(not(all(feature = "mpris", target_os = "linux")), allow(dead_code))]
   #[cfg(all(feature = "mpris", target_os = "linux"))]
   pub mpris_for_ui: Option<Arc<mpris::MprisManager>>,
   #[cfg(not(all(feature = "mpris", target_os = "linux")))]

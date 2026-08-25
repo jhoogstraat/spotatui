@@ -111,6 +111,27 @@ pub enum Action {
   },
   /// Add one playable URI (track or episode) to the queue.
   AddToQueue(String),
+  /// Enqueue one playable with full track info onto the native cross-source
+  /// queue. Rejections (no URI, radio streams) report via status message,
+  /// exactly like [`App::add_track_to_native_queue`].
+  EnqueueNative(TrackInfo),
+  /// Remove the native-queue item at a 0-based upcoming index. The active
+  /// Playable is not addressable here; an out-of-range index is a no-op.
+  RemoveNativeQueued(usize),
+  /// Swap the native-queue item at `index` with its neighbor (`up` moves it
+  /// toward the front, mirroring the terminal screen's Shift+K). Boundary
+  /// and out-of-range indices are no-ops.
+  MoveNativeQueued {
+    index: usize,
+    up: bool,
+  },
+  /// Drop every upcoming native-queue item without touching whatever is
+  /// playing now.
+  ClearNativeQueue,
+  /// Begin the in-app Spotify login flow (browser consent plus local OAuth
+  /// callback listener). No-op while a session already exists or a login is
+  /// already pending.
+  BeginSpotifyLogin,
   /// Run a search against the Spotify catalog; the user country is resolved
   /// at apply time. Deliberately source-blind: existing producers (Lua
   /// `spotatui.search`) contracted the Web API search, so browsing scope

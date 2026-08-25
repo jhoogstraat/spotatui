@@ -50,10 +50,13 @@ fn main() -> anyhow::Result<()> {
   });
 
   println!("playing {uri}");
-  println!("apply(PlayUris) -> {:?}", runtime.apply(Action::PlayUris {
-    uris: vec![uri],
-    offset: None,
-  }));
+  println!(
+    "apply(PlayUris) -> {:?}",
+    runtime.apply(Action::PlayUris {
+      uris: vec![uri],
+      offset: None,
+    })
+  );
   std::thread::sleep(Duration::from_secs(20));
 
   println!("pausing");

@@ -46,6 +46,43 @@ impl App {
     }
   }
 
+  /// Remove the upcoming native-queue item at `index`. Out-of-range is a
+  /// no-op; the active Playable is not addressable here (the queue slot's
+  /// now-playing state lives outside [`Self::native_queue`]).
+  pub fn remove_native_queued(&mut self, index: usize) {
+    if index < self.native_queue.len() {
+      self.native_queue.remove(index);
+    }
+  }
+
+  /// Swap the native-queue item at `index` with its neighbor: `up` moves it
+  /// toward the front. The same semantics as the terminal queue screen's
+  /// Shift+J / Shift+K; boundary and out-of-range indexes are no-ops.
+  pub fn move_native_queued(&mut self, index: usize, up: bool) {
+    let len = self.native_queue.len();
+    if index >= len {
+      return;
+    }
+    if up {
+      if index == 0 {
+        return;
+      }
+      self.native_queue.swap(index - 1, index);
+    } else {
+      if index + 1 >= len {
+        return;
+      }
+      self.native_queue.swap(index, index + 1);
+    }
+  }
+
+  /// Drop every upcoming native-queue item. Nothing that is currently
+  /// playing stops: the queue slot (`queue_now`) is untouched, so the active
+  /// Playable keeps playing and simply has nothing after it.
+  pub fn clear_native_queue(&mut self) {
+    self.native_queue.clear();
+  }
+
   /// Whether the native queue's playback slot currently owns the output (either a
   /// decoded queued track or a native-streamed Spotify one). The single gated
   /// entry point for every queue-ownership check; reduces to `false` in a build
