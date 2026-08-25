@@ -189,6 +189,25 @@ impl ClientConfig {
     self.save_config_file()
   }
 
+  /// Write `client.yml` with the shared client ID, port 8989, and a
+  /// frontend-supplied Connect device name — no wizard, no OAuth flow. Used
+  /// by embedded frontends so their first boot never reaches the auth setup
+  /// wizard (the only remaining prompt is the manual redirect-URL paste).
+  /// No-op when the file already exists.
+  pub fn seed_default_spotify_config(&mut self, streaming_device_name: &str) -> Result<()> {
+    let paths = self.get_or_build_paths()?;
+    if paths.config_file_path.exists() {
+      return Ok(());
+    }
+    self.client_id = NCSPOT_CLIENT_ID.to_string();
+    self.fallback_client_id = None;
+    self.client_secret = String::new();
+    self.port = Some(8989);
+    self.setup_version = AUTH_SETUP_VERSION;
+    self.streaming_device_name = streaming_device_name.to_string();
+    self.save_config_file()
+  }
+
   pub fn mark_auth_setup_migrated(&mut self) -> Result<()> {
     self.setup_version = AUTH_SETUP_VERSION;
     self.save_config_file()

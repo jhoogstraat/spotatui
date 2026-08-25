@@ -17,6 +17,7 @@ use tokio::sync::{watch, Mutex};
 pub use crate::core::action::{Action, ActionOutcome};
 pub use crate::core::onboarding::Onboarding;
 pub use crate::core::plugin_api::{PlaybackState, TrackInfo};
+pub use crate::core::source::Source;
 
 /// One published runtime state. Composed from the existing snapshot builders;
 /// equality-deduplicated before publication so a quiet tick publishes nothing.
@@ -118,6 +119,12 @@ impl Runtime {
   /// migration prompt are all skipped.
   pub fn boot(options: Options, onboarding: Arc<dyn Onboarding>) -> Result<Self> {
     crate::core::paths::set_data_root(options.data_root);
+    // Seed client.yml before the bootstrap reads it: the shared client ID
+    // and port 8989 mean the auth setup wizard is never reached, and this
+    // Connect device stays distinguishable from a concurrently running TUI.
+    // The only prompt left is the manual redirect-URL paste.
+    let mut client_config = crate::core::config::ClientConfig::new();
+    client_config.seed_default_spotify_config("Rust Player")?;
     let rt = tokio::runtime::Builder::new_multi_thread()
       .enable_all()
       .build()?;
