@@ -159,12 +159,11 @@ pub(super) async fn handle_self_update_command(_matches: &ArgMatches) -> Result<
 /// authentication has finished.
 #[cfg(feature = "self-update")]
 pub(super) async fn run_auto_update(
-  matches: &ArgMatches,
+  update_check_enabled: bool,
   user_config: &UserConfig,
 ) -> Option<String> {
-  if matches.subcommand_name().is_some()
+  if !update_check_enabled
     || std::env::var_os("SPOTATUI_SKIP_UPDATE").is_some()
-    || matches.get_flag("no-update")
     || user_config.behavior.disable_auto_update
   {
     return None;
@@ -209,7 +208,7 @@ pub(super) async fn run_auto_update(
 
 #[cfg(not(feature = "self-update"))]
 pub(super) async fn run_auto_update(
-  _matches: &ArgMatches,
+  _update_check_enabled: bool,
   _user_config: &UserConfig,
 ) -> Option<String> {
   None

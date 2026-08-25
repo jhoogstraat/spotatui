@@ -7,15 +7,16 @@
 
 mod bootstrap;
 mod cli;
+pub mod frontend;
 mod pump;
-#[cfg(feature = "tui")]
-mod startup;
+pub(crate) mod startup;
 
 use crate::core::migrations::apply_legacy_state_file_migrations;
 use anyhow::{anyhow, Result};
 use clap_complete::{generate, Shell};
 use log::info;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Console implementation of the first-launch surface for builds without the
@@ -141,7 +142,41 @@ pub async fn run_cli() -> Result<()> {
   #[cfg(not(feature = "tui"))]
   let onboarding: Arc<dyn crate::core::onboarding::Onboarding> = Arc::new(HeadlessOnboarding);
 
-  let boot = bootstrap::boot(&matches, onboarding).await?;
+  let boot = bootstrap::boot(
+    &bootstrap::BootOptions {
+      config_path: matches.get_one::<String>("config").map(PathBuf::from),
+      tick_rate_milliseconds: matches
+        .get_one::<String>("tick-rate")
+        .and_then(|tick_rate| tick_rate.parse().ok()),
+      reconfigure_auth: matches.get_flag("reconfigure-auth"),
+      ui_launch: matches.subcommand_name().is_none(),
+      cli_subcommand: matches.subcommand_name().is_some(),
+      update_check_enabled: matches.subcommand_name().is_none()
+        && !matches.get_flag("no-update"),
+    },
+    onboarding,
+  )
+  .await?;
+
+  // `--play-file <PATH>`: queue a local file to start once the UI is up. The
+  // path is canonicalised to an absolute `file://` URI so the local-files
+  // dispatch can route it; an unreadable path is reported as a status message.
+  if let Some(path) = matches.get_one::<String>("play-file") {
+    match std::fs::canonicalize(path).ok().and_then(|abs| {
+      url::Url::from_file_path(abs)
+        .ok()
+        .map(|url| url.to_string())
+    }) {
+      Some(uri) => boot.app.lock().await.pending_play_file = Some(uri),
+      None => {
+        boot
+          .app
+          .lock()
+          .await
+          .set_status_message(format!("Cannot find local file: {path}"), 8);
+      }
+    }
+  }
 
   // Work with the cli (not really async)
   if let Some(cmd) = matches.subcommand_name() {

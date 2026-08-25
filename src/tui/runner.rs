@@ -316,40 +316,6 @@ mod tests {
 }
 
 #[cfg(feature = "streaming")]
-async fn pause_native_playback_before_exit(app: &Arc<Mutex<App>>) {
-  let player = {
-    let mut app = app.lock().await;
-    if !app.is_streaming_active {
-      return;
-    }
-
-    let Some(player) = app.streaming_player.clone() else {
-      return;
-    };
-
-    let is_playing = app.native_is_playing.unwrap_or_else(|| {
-      app
-        .current_playback_context
-        .as_ref()
-        .map(|context| context.is_playing)
-        .unwrap_or(false)
-    });
-
-    if !is_playing {
-      return;
-    }
-
-    app.native_is_playing = Some(false);
-    if let Some(context) = app.current_playback_context.as_mut() {
-      context.is_playing = false;
-    }
-
-    player
-  };
-
-  player.pause();
-  tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-}
 
 pub async fn start_ui(
   user_config: UserConfig,
@@ -618,7 +584,7 @@ pub async fn start_ui(
   }
 
   #[cfg(feature = "streaming")]
-  pause_native_playback_before_exit(app).await;
+  crate::runtime::startup::pause_native_playback_before_exit(app).await;
 
   // Stop the collector and all network work it owns before the final sync and
   // clear. In particular, a pause-triggered now-playing push must not race the

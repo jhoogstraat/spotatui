@@ -317,6 +317,12 @@ pub struct App {
   pub active_source: Source,
   pub clipboard: Option<Clipboard>,
   pub is_loading: bool,
+  /// Change bell for frontends without a render loop of their own: poked
+  /// after every `apply`, every pump iteration, and every tick, so a
+  /// snapshot publisher can rebuild and diff-publish without polling.
+  /// `notify_one` (permit semantics) so pokes between publisher wakes are
+  /// never lost.
+  pub change_notify: Arc<tokio::sync::Notify>,
   io_tx: Option<Sender<IoEvent>>,
   pub is_fetching_current_playback: bool,
   /// Expiry of the current Spotify access token, or `None` when there is no

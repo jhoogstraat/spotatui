@@ -121,5 +121,7 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
       }
     }
     network.process_party_messages().await;
+    // Bell the frontend snapshot publisher: one poke per pump iteration.
+    network.app.lock().await.change_notify.notify_one();
   }
 }

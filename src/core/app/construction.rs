@@ -109,6 +109,7 @@ impl Default for App {
       instant_since_last_current_playback_poll: Instant::now(),
       clipboard: Clipboard::new().ok(),
       is_loading: false,
+      change_notify: Arc::new(tokio::sync::Notify::new()),
       io_tx: None,
       is_fetching_current_playback: false,
       spotify_token_expiry: None,

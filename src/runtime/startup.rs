@@ -7,8 +7,8 @@ use super::pump::start_tokio;
 use crate::core::app::App;
 #[cfg(feature = "streaming")]
 use crate::core::config::ClientConfig;
+use crate::core::driver::MprisHandle;
 use crate::core::user_config::StartupBehavior;
-#[cfg(feature = "discord-rpc")]
 use crate::core::user_config::UserConfig;
 #[cfg(feature = "discord-rpc")]
 use crate::infra::discord_rpc;
@@ -599,10 +599,38 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
   }
 }
 
-/// Launch the terminal UI: OS media integrations, the deferred native
-/// streaming startup, persisted-session restore, the network task driving
-/// the IoEvent pump, and finally the blocking UI event loop.
-pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
+/// What a running set of shared services hands to the frontend that started
+/// them. Every frontend consumes the same handles; the terminal runner and
+/// the windowed `frontend` module each drive their own loop on top.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+pub(super) struct Services {
+  pub app: Arc<Mutex<App>>,
+  pub user_config: UserConfig,
+  /// Real-time position updates from the native player event handler;
+  /// `None` in builds where nothing produces one.
+  pub shared_position_for_ui: Option<Arc<AtomicU64>>,
+  // Read only by the terminal runner, and only on Linux + mpris builds.
+  #[cfg_attr(
+    not(all(feature = "mpris", target_os = "linux")),
+    allow(dead_code)
+  )]
+  #[cfg(all(feature = "mpris", target_os = "linux"))]
+  pub mpris_for_ui: Option<Arc<mpris::MprisManager>>,
+  #[cfg(not(all(feature = "mpris", target_os = "linux")))]
+  #[allow(dead_code)]
+  pub mpris_for_ui: MprisHandle,
+  pub discord_rpc_manager: DiscordRpcHandle,
+  pub history_collector: crate::infra::history::HistoryCollectorHandle,
+}
+
+/// Start every service a frontend shares: OS media integrations, the
+/// deferred native-streaming startup, persisted-session restore, and the
+/// network task driving the IoEvent pump. Returns once the services are
+/// running; the caller then drives its own event loop until shutdown.
+///
+/// Split out of the former single `launch_ui` at the handoff to the terminal
+/// runner so a second frontend boots through exactly the same sequence.
+pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let app = boot.app;
   let sync_io_rx = boot.sync_io_rx;
   let user_config = boot.user_config;
@@ -935,10 +963,6 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
   #[cfg(all(feature = "macos-media", target_os = "macos"))]
   let macos_media_for_events = macos_media_manager.clone();
 
-  // Clone MPRIS manager for UI loop (to update status on device changes)
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  let mpris_for_ui = mpris_manager.clone();
-
   #[cfg(all(feature = "windows-media", target_os = "windows"))]
   let windows_media_for_events = windows_media_manager.clone();
 
@@ -1011,10 +1035,10 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
     });
   }
 
-  let cloned_app = Arc::clone(&app);
+  let network_app = Arc::clone(&app);
   info!("spawning spotify network event handler");
   tokio::spawn(async move {
-    let mut network = Network::new(spotify, client_config, &app, final_token_cache_path);
+    let mut network = Network::new(spotify, client_config, &network_app, final_token_cache_path);
 
     // The saved-device startup decision moved into
     // `deferred_streaming_startup` (it needs the native player's device
@@ -1069,22 +1093,42 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
 
     start_tokio(sync_io_rx, &mut network).await;
   });
-  // The UI must run in the "main" thread
-  info!("starting terminal ui event loop");
+
+  // Clone MPRIS manager for the UI loop (to update status on device changes)
+  #[cfg(all(feature = "mpris", target_os = "linux"))]
+  let mpris_for_ui = mpris_manager.clone();
+  #[cfg(not(all(feature = "mpris", target_os = "linux")))]
+  let mpris_for_ui: MprisHandle = None;
+
   #[cfg(feature = "streaming")]
-  let shared_pos_for_start_ui: Option<Arc<AtomicU64>> = Some(shared_position_for_ui);
+  let shared_position_for_ui: Option<Arc<AtomicU64>> = Some(shared_position_for_ui);
   #[cfg(not(feature = "streaming"))]
-  let shared_pos_for_start_ui: Option<Arc<AtomicU64>> = None;
-  let ui_result = crate::tui::runner::start_ui(
+  let shared_position_for_ui: Option<Arc<AtomicU64>> = None;
+
+  Ok(Services {
+    app,
     user_config,
-    &cloned_app,
-    shared_pos_for_start_ui,
-    #[cfg(all(feature = "mpris", target_os = "linux"))]
+    shared_position_for_ui,
     mpris_for_ui,
-    #[cfg(not(all(feature = "mpris", target_os = "linux")))]
-    None,
     discord_rpc_manager,
     history_collector,
+  })
+}
+
+/// Launch the terminal UI: shared service startup, then the blocking
+/// terminal event loop.
+#[cfg(feature = "tui")]
+pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
+  let services = start_services(boot).await?;
+  // The UI must run in the "main" thread
+  info!("starting terminal ui event loop");
+  let ui_result = crate::tui::runner::start_ui(
+    services.user_config,
+    &services.app,
+    services.shared_position_for_ui,
+    services.mpris_for_ui,
+    services.discord_rpc_manager,
+    services.history_collector,
   )
   .await;
   // Unpublish the control file on the way out, whether the UI exited cleanly
@@ -1094,12 +1138,50 @@ pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
   #[cfg(feature = "mcp-server")]
   crate::infra::mcp::clear_handshake();
   if ui_result.is_err() {
-    let mut app = cloned_app.lock().await;
+    let mut app = services.app.lock().await;
     app.flush_state_save(true);
   }
   ui_result?;
 
   Ok(())
+}
+
+/// Pause native playback on the way out so the Connect device does not keep
+/// reporting this session as playing after the process exits. Shared by the
+/// terminal runner and the `frontend` module.
+pub(crate) async fn pause_native_playback_before_exit(app: &Arc<Mutex<App>>) {
+  let player = {
+    let mut app = app.lock().await;
+    if !app.is_streaming_active {
+      return;
+    }
+
+    let Some(player) = app.streaming_player.clone() else {
+      return;
+    };
+
+    let is_playing = app.native_is_playing.unwrap_or_else(|| {
+      app
+        .current_playback_context
+        .as_ref()
+        .map(|context| context.is_playing)
+        .unwrap_or(false)
+    });
+
+    if !is_playing {
+      return;
+    }
+
+    app.native_is_playing = Some(false);
+    if let Some(context) = app.current_playback_context.as_mut() {
+      context.is_playing = false;
+    }
+
+    player
+  };
+
+  player.pause();
+  tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }
 
 /// Resume a persisted non-Spotify playback session at launch.
