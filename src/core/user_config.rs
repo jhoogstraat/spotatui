@@ -37,6 +37,7 @@ pub fn normalize_playbar_cover_art_size_percent(value: i64) -> u16 {
   ) as u16
 }
 
+#[allow(dead_code)]
 pub fn validate_tick_rate_milliseconds(value: u64, label: &str) -> Result<u64> {
   if (1..=MAX_TICK_RATE_MILLISECONDS).contains(&value) {
     Ok(value)
@@ -436,8 +437,6 @@ pub struct BehaviorConfigString {
   pub volume_increment: Option<u8>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub volume_percent: Option<u8>,
-  pub tick_rate_milliseconds: Option<u64>,
-  pub animation_tick_rate_milliseconds: Option<u64>,
   pub enable_text_emphasis: Option<bool>,
   pub banner_gradient: Option<bool>,
   pub show_loading_indicator: Option<bool>,
@@ -1311,33 +1310,9 @@ impl UserConfig {
       self.behavior.volume_percent = Some(volume.min(100));
     }
 
-    let loaded_tick_rate = behavior_config.tick_rate_milliseconds;
-    let loaded_animation_tick_rate = behavior_config.animation_tick_rate_milliseconds;
-
-    if let Some(tick_rate) = loaded_tick_rate {
-      let tick_rate = validate_tick_rate_milliseconds(tick_rate, "Tick rate")?;
-      // Before animation ticks existed, save_config wrote the old 16ms default
-      // into user configs. Treat the legacy 16ms normal tick as the old default
-      // when animation ticks are absent or still equal to the animation default,
-      // so upgraded users get the new normal UI cadence without manual edits.
-      self.behavior.tick_rate_milliseconds = if tick_rate
-        == DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS
-        && loaded_animation_tick_rate
-          .map(|animation_tick_rate| {
-            animation_tick_rate == DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS
-          })
-          .unwrap_or(true)
-      {
-        DEFAULT_TICK_RATE_MILLISECONDS
-      } else {
-        tick_rate
-      };
-    }
-
-    if let Some(tick_rate) = loaded_animation_tick_rate {
-      self.behavior.animation_tick_rate_milliseconds =
-        validate_tick_rate_milliseconds(tick_rate, "Animation tick rate")?;
-    }
+    // Legacy `tick_rate_milliseconds` / `animation_tick_rate_milliseconds`
+    // keys in existing user configs are simply ignored now: they tuned the
+    // deleted terminal frontend's frame loop (ticket 03, ADR 0016).
 
     if let Some(text_emphasis) = behavior_config.enable_text_emphasis {
       self.behavior.enable_text_emphasis = text_emphasis;
@@ -2020,8 +1995,6 @@ impl UserConfig {
       seek_milliseconds: Some(self.behavior.seek_milliseconds),
       volume_increment: Some(self.behavior.volume_increment),
       volume_percent: self.behavior.volume_percent,
-      tick_rate_milliseconds: Some(self.behavior.tick_rate_milliseconds),
-      animation_tick_rate_milliseconds: Some(self.behavior.animation_tick_rate_milliseconds),
       enable_text_emphasis: Some(self.behavior.enable_text_emphasis),
       banner_gradient: Some(self.behavior.banner_gradient),
       show_loading_indicator: Some(self.behavior.show_loading_indicator),
@@ -2618,66 +2591,30 @@ mod tests {
   }
 
   #[test]
-  fn tick_rates_load_defaults_explicit_values_and_legacy_defaults() {
-    use super::{
-      BehaviorConfigString, UserConfig, DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS,
-      DEFAULT_TICK_RATE_MILLISECONDS,
-    };
+  fn legacy_tick_rate_keys_are_ignored_rather_than_fatal() {
+    use super::{BehaviorConfigString, UserConfig, DEFAULT_TICK_RATE_MILLISECONDS};
 
-    for (yaml, expected_tick_rate, expected_animation_tick_rate) in [
-      (
-        "",
-        DEFAULT_TICK_RATE_MILLISECONDS,
-        DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS,
-      ),
-      (
-        "tick_rate_milliseconds: 500\nanimation_tick_rate_milliseconds: 20",
-        500,
-        20,
-      ),
-      (
-        "tick_rate_milliseconds: 100",
-        100,
-        DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS,
-      ),
-      (
-        "tick_rate_milliseconds: 16",
-        DEFAULT_TICK_RATE_MILLISECONDS,
-        DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS,
-      ),
-      (
-        "tick_rate_milliseconds: 16\nanimation_tick_rate_milliseconds: 16",
-        DEFAULT_TICK_RATE_MILLISECONDS,
-        DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS,
-      ),
-    ] {
-      let behavior: BehaviorConfigString = serde_yaml::from_str(yaml).unwrap();
-      let mut config = UserConfig::new();
-      config.load_behaviorconfig(behavior).unwrap();
+    // Both the old keys and their out-of-range values must load cleanly as
+    // ignored input now that the terminal frame loop they tuned is deleted.
+    let behavior: BehaviorConfigString =
+      serde_yaml::from_str("tick_rate_milliseconds: 500\nanimation_tick_rate_milliseconds: 20")
+        .unwrap();
+    let mut config = UserConfig::new();
+    config.load_behaviorconfig(behavior).unwrap();
 
-      assert_eq!(config.behavior.tick_rate_milliseconds, expected_tick_rate);
-      assert_eq!(
-        config.behavior.animation_tick_rate_milliseconds,
-        expected_animation_tick_rate
-      );
-    }
+    assert_eq!(
+      config.behavior.tick_rate_milliseconds,
+      DEFAULT_TICK_RATE_MILLISECONDS
+    );
+
+    let behavior: BehaviorConfigString = serde_yaml::from_str("tick_rate_milliseconds: 0").unwrap();
+    let mut config = UserConfig::new();
+    config.load_behaviorconfig(behavior).unwrap(); // ignored, not fatal
+    assert_eq!(
+      config.behavior.tick_rate_milliseconds,
+      DEFAULT_TICK_RATE_MILLISECONDS
+    );
   }
-
-  #[test]
-  fn zero_tick_rates_are_rejected() {
-    use super::{BehaviorConfigString, UserConfig};
-
-    for yaml in [
-      "tick_rate_milliseconds: 0",
-      "animation_tick_rate_milliseconds: 0",
-    ] {
-      let behavior: BehaviorConfigString = serde_yaml::from_str(yaml).unwrap();
-      let mut config = UserConfig::new();
-
-      assert!(config.load_behaviorconfig(behavior).is_err());
-    }
-  }
-
   #[test]
   fn parse_update_delay_secs_accepts_supported_units() {
     use super::parse_update_delay_secs;
