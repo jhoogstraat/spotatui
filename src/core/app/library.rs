@@ -167,6 +167,10 @@ impl App {
       // The row pushes the route immediately; only the global navigate
       // binding defers the push to the network result.
       LibraryTarget::RecentlyPlayed => {
+        // Drop the previous page so frontends can represent a refresh as
+        // loading instead of briefly showing stale rows.
+        self.recently_played.result = None;
+        self.recently_played.index = 0;
         self.dispatch(IoEvent::GetRecentlyPlayed);
         self.push_navigation_stack(RouteId::RecentlyPlayed, ActiveBlock::RecentlyPlayed);
       }

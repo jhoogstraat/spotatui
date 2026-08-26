@@ -14,10 +14,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 
-pub use crate::core::action::{Action, ActionOutcome};
+pub use crate::core::action::{Action, ActionOutcome, LibraryTarget};
 pub use crate::core::onboarding::Onboarding;
-pub use crate::core::plugin_api::{PlaybackState, TrackInfo};
+pub use crate::core::plugin_api::{PlaybackState, PlaylistInfo, TrackInfo};
 pub use crate::core::source::Source;
+
+/// Library data made visible to embedded frontends. `None` means the
+/// corresponding Spotify request has not produced a page yet; `Some(empty)`
+/// is a successfully fetched empty list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LibrarySnapshot {
+  pub liked_songs: Option<Vec<TrackInfo>>,
+  pub recently_played: Option<Vec<TrackInfo>>,
+  pub playlists: Option<Vec<PlaylistInfo>>,
+}
 
 /// One published runtime state. Composed from the existing snapshot builders;
 /// equality-deduplicated before publication so a quiet tick publishes nothing.
@@ -25,6 +35,8 @@ pub use crate::core::source::Source;
 pub struct Snapshot {
   /// Current playback state from `plugin_api::playback_state`.
   pub playback: Option<PlaybackState>,
+  /// The user's Spotify library data fetched so far.
+  pub library: LibrarySnapshot,
   /// Authoritative position at publish time (`None` while stale).
   pub position_ms: Option<u64>,
   /// The native queue's upcoming items, in order.
@@ -346,6 +358,19 @@ fn build_snapshot(app: &App) -> Snapshot {
   let search = crate::core::plugin_api::search_results_snapshot(app);
   Snapshot {
     playback: crate::core::plugin_api::playback_state(app),
+    library: LibrarySnapshot {
+      liked_songs: (!app.library.saved_tracks.pages.is_empty())
+        .then(|| crate::core::plugin_api::saved_tracks_snapshot(app)),
+      recently_played: app
+        .recently_played
+        .result
+        .as_ref()
+        .map(|_| crate::core::plugin_api::recently_played_snapshot(app)),
+      playlists: app
+        .playlists
+        .as_ref()
+        .map(|_| crate::core::plugin_api::playlists_snapshot(app)),
+    },
     position_ms: app.playback_position_ms().map(|p| p as u64),
     queue_upcoming: app.native_queue.clone(),
     search_tracks: search.tracks,
