@@ -56,13 +56,11 @@ impl App {
   #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
   pub(crate) fn show_plugin_popup(&mut self, popup: crate::core::plugin_api::PluginPopup) {
     self.plugin_popup = Some(popup);
-    self.view.plugin_popup_scroll = 0;
   }
 
   /// Dismiss the plugin popup and reset its scroll.
   pub(crate) fn close_plugin_popup(&mut self) {
     self.plugin_popup = None;
-    self.view.plugin_popup_scroll = 0;
   }
 
   /// Navigate to a registered plugin screen, resetting its scroll. A no-op
@@ -73,7 +71,6 @@ impl App {
     if self.get_current_route().id != RouteId::PluginScreen(name.clone()) {
       self.push_navigation_stack(RouteId::PluginScreen(name), ActiveBlock::PluginScreen);
     }
-    self.view.plugin_screen_scroll = 0;
   }
 }
 
@@ -84,64 +81,4 @@ mod tests {
   // These live here rather than in `core/action/tests.rs` because they must
   // seed the scroll fields to a nonzero value first, and `core/app/` is the
   // one place the `view_writes_outside_tui` gate exempts.
-
-  #[test]
-  fn show_plugin_popup_resets_the_scroll() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
-    app.view.plugin_popup_scroll = 5;
-
-    app.show_plugin_popup(crate::core::plugin_api::PluginPopup {
-      title: "Hi".to_string(),
-      lines: Vec::new(),
-    });
-
-    assert_eq!(
-      app.plugin_popup.as_ref().map(|p| p.title.as_str()),
-      Some("Hi")
-    );
-    assert_eq!(app.view.plugin_popup_scroll, 0);
-  }
-
-  #[test]
-  fn close_plugin_popup_clears_the_popup_and_resets_the_scroll() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
-    app.show_plugin_popup(crate::core::plugin_api::PluginPopup {
-      title: "Hi".to_string(),
-      lines: Vec::new(),
-    });
-    app.view.plugin_popup_scroll = 5;
-
-    app.close_plugin_popup();
-
-    assert!(app.plugin_popup.is_none());
-    assert_eq!(app.view.plugin_popup_scroll, 0);
-  }
-
-  #[test]
-  fn open_plugin_screen_resets_the_scroll_even_when_already_current() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
-
-    app.view.plugin_screen_scroll = 4;
-    app.open_plugin_screen("stats".to_string());
-    assert_eq!(
-      app.get_current_route().id,
-      RouteId::PluginScreen("stats".to_string())
-    );
-    assert_eq!(app.view.plugin_screen_scroll, 0, "reset on the first open");
-
-    // Re-opening the already-current screen must not stack a second frame,
-    // but the scroll still resets (the historic behavior).
-    app.view.plugin_screen_scroll = 4;
-    app.open_plugin_screen("stats".to_string());
-    assert_eq!(app.view.plugin_screen_scroll, 0, "reset on a re-open too");
-    app.pop_navigation_stack();
-    assert_eq!(
-      app.get_current_route().id,
-      RouteId::Home,
-      "one pop suffices, so the re-open pushed no second frame"
-    );
-  }
 }

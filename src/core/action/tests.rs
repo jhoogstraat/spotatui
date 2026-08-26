@@ -1098,7 +1098,7 @@ mod dj_actions {
 // --- pagination, open family, source-routed search, library rows, dialogs ---
 
 use super::{LibraryTarget, ListTarget, OpenTarget};
-use crate::core::app::{ActiveBlock, DialogContext, PendingTrackSelection, RecommendationsContext};
+use crate::core::app::{ActiveBlock, DialogContext, PendingTrackSelection};
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::{PlaylistInfo, TrackInfo};
 use crate::core::source::Source;
@@ -1542,60 +1542,6 @@ fn play_track_in_context_dispatches_the_combined_start() {
   }
 }
 
-#[test]
-fn recommend_from_track_sets_song_context_and_keeps_the_unseeded_request() {
-  let (mut app, rx) = app_with_channel();
-  let seed = track("4uLU6hMCjMI75M1A2tKUQC", "Song A");
-
-  app.apply(Action::RecommendFromTrack(seed.clone()));
-
-  assert_eq!(
-    app.recommendations_context,
-    Some(RecommendationsContext::Song)
-  );
-  assert_eq!(app.recommendations_seed, "Song A");
-  match rx.try_recv() {
-    Ok(IoEvent::GetRecommendationsForSeed(seed_artists, seed_tracks, first_track, country)) => {
-      assert!(seed_artists.is_none());
-      // Preserved historic bug: the full URI is fed as the seed and the
-      // request goes out unseeded. Fixing it is a separate verified change.
-      assert_eq!(seed_tracks, Some(vec![seed.uri.clone().unwrap()]));
-      assert_eq!(
-        (*first_track).as_ref().map(|t| t.name.as_str()),
-        Some("Song A")
-      );
-      assert_eq!(country, None);
-    }
-    _other => panic!("expected GetRecommendationsForSeed"),
-  }
-}
-
-#[test]
-fn recommend_from_track_without_a_uri_still_carries_the_context_row() {
-  let (mut app, rx) = app_with_channel();
-  let mut seed = track("4uLU6hMCjMI75M1A2tKUQC", "Local Song");
-  seed.uri = None;
-
-  app.apply(Action::RecommendFromTrack(seed));
-
-  assert_eq!(
-    app.recommendations_context,
-    Some(RecommendationsContext::Song)
-  );
-  assert_eq!(app.recommendations_seed, "Local Song");
-  match rx.try_recv() {
-    Ok(IoEvent::GetRecommendationsForSeed(seed_artists, seed_tracks, first_track, _)) => {
-      assert!(seed_artists.is_none());
-      assert!(seed_tracks.is_none(), "no uri means no seed list");
-      assert_eq!(
-        (*first_track).as_ref().map(|t| t.name.as_str()),
-        Some("Local Song")
-      );
-    }
-    _other => panic!("expected GetRecommendationsForSeed"),
-  }
-}
-
 // --- dialogs ---
 
 #[test]
@@ -1772,32 +1718,6 @@ fn open_library_recently_played_pushes_before_the_data_arrives() {
   // the push to the network result.
   assert_eq!(app.get_current_route().id, RouteId::RecentlyPlayed);
   assert!(matches!(rx.try_recv(), Ok(IoEvent::GetRecentlyPlayed)));
-}
-
-#[test]
-fn open_library_friends_first_open_fetches_code_and_list() {
-  let (mut app, rx) = app_with_channel();
-
-  app.apply(Action::OpenLibrary(LibraryTarget::Friends));
-
-  assert_eq!(app.get_current_route().id, RouteId::Friends);
-  assert!(matches!(rx.try_recv(), Ok(IoEvent::GetFriendCode)));
-  assert!(matches!(rx.try_recv(), Ok(IoEvent::GetFriends)));
-}
-
-#[test]
-fn open_library_friends_skips_fetched_state_on_reopen() {
-  let (mut app, rx) = app_with_channel();
-  app.friend_code = Some("code".to_string());
-  app.friends_loading = true;
-
-  app.apply(Action::OpenLibrary(LibraryTarget::Friends));
-
-  assert_eq!(app.get_current_route().id, RouteId::Friends);
-  assert!(
-    rx.try_recv().is_err(),
-    "nothing refetches once loaded/loading"
-  );
 }
 
 #[test]

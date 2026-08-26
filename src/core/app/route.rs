@@ -204,15 +204,6 @@ impl App {
   /// only), and only Spotify needs a `me/player/devices` fetch: an
   /// unauthenticated or offline session must not surface a spurious error.
   pub(crate) fn open_source_device_picker(&mut self) {
-    self.view.source_list_index = Source::ALL
-      .iter()
-      .position(|s| *s == self.active_source)
-      .unwrap_or(0);
-    self.view.source_device_focus = if self.active_source == Source::Spotify {
-      SourceFocus::Devices
-    } else {
-      SourceFocus::Source
-    };
     self.push_navigation_stack(RouteId::SelectedDevice, ActiveBlock::SelectDevice);
     if self.active_source == Source::Spotify {
       self.dispatch(IoEvent::GetDevices);
