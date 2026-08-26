@@ -154,7 +154,6 @@ impl Runtime {
     let boot = rt.block_on(super::bootstrap::boot(
       &super::bootstrap::BootOptions {
         config_path: None,
-        tick_rate_milliseconds: None,
         reconfigure_auth: false,
         // No console prompt may fire from an embedded boot.
         ui_launch: false,

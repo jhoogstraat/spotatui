@@ -26,16 +26,6 @@ pub(super) fn build_clap_app() -> ClapApp {
       "Client authentication settings are stored in the spotatui config directory (use --reconfigure-auth to update them)",
     )
     .arg(
-      Arg::new("tick-rate")
-        .short('t')
-        .long("tick-rate")
-        .help("Set the normal UI tick rate in milliseconds.")
-        .long_help(
-          "Specify the normal UI tick rate in milliseconds. Lower values refresh non-animated \
-screens more often and cost more CPU. Animation-heavy views keep their separate animation tick rate.",
-        ),
-    )
-    .arg(
       Arg::new("config")
         .short('c')
         .long("config")
