@@ -349,7 +349,7 @@ fn build_snapshot(app: &App) -> Snapshot {
     position_ms: app.playback_position_ms().map(|p| p as u64),
     queue_upcoming: app.native_queue.clone(),
     search_tracks: search.tracks,
-    search_loading: app.is_loading,
+    search_loading: app.search_loading,
     spotify_connected: app.spotify_connected,
     notice: app.status_message.clone(),
     notice_is_error: app.status_message_is_error,

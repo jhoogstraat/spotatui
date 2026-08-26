@@ -577,6 +577,7 @@ impl Network {
           .await;
         let mut app = self.app.lock().await;
         app.is_loading = false;
+        app.search_loading = false;
         if pending_playlist_id
           .as_deref()
           .is_some_and(|id| app.pending_playlist_open.as_deref() == Some(id))
@@ -999,6 +1000,7 @@ impl Network {
     {
       let mut app = self.app.lock().await;
       app.is_loading = false;
+      app.search_loading = false;
     }
   }
 

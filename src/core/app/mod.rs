@@ -317,6 +317,11 @@ pub struct App {
   pub active_source: Source,
   pub clipboard: Option<Clipboard>,
   pub is_loading: bool,
+  /// True while a catalog-search fetch is in flight. Scoped to search
+  /// IoEvents only, unlike the global [`Self::is_loading`] spinner, which
+  /// every dispatched event sets — embedders must not read global spinner
+  /// churn (playback polls, refreshes) as "a search is running".
+  pub search_loading: bool,
   /// Change bell for frontends without a render loop of their own: poked
   /// after every `apply`, every pump iteration, and every tick, so a
   /// snapshot publisher can rebuild and diff-publish without polling.
@@ -590,6 +595,17 @@ impl App {
   pub fn dispatch(&mut self, action: IoEvent) {
     // `is_loading` will be set to false again after the async action has finished in network.rs
     self.is_loading = true;
+    // Search events additionally raise the search-scoped flag; cleared with
+    // `is_loading` at the end of the network handler.
+    if matches!(
+      action,
+      IoEvent::GetSearchResults(..)
+        | IoEvent::GetSubsonicSearchResults(_)
+        | IoEvent::GetRadioSearchResults(_)
+        | IoEvent::GetYouTubeSearchResults(_)
+    ) {
+      self.search_loading = true;
+    }
     if let Some(io_tx) = &self.io_tx {
       if let Err(e) = io_tx.send(action) {
         self.is_loading = false;
