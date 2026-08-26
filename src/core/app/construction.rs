@@ -5,7 +5,6 @@ impl Default for App {
     App {
       spectrum_data: None,
       audio_capture_active: false,
-      view: ViewState::default(),
       album_table_context: AlbumTableContext::Full,
       discover_top_tracks: vec![],
       discover_artists_mix: vec![],
@@ -74,8 +73,6 @@ impl Default for App {
       active_playlist_track_filter: None,
       pending_playlist_track_search: None,
       playlists: None,
-      recommendations_context: None,
-      recommendations_seed: "".to_string(),
       search_results: SearchResult {
         hovered_block: SearchResultBlock::SongSearch,
         selected_block: SearchResultBlock::Empty,
@@ -116,8 +113,6 @@ impl Default for App {
       spotify_token_expiry: None,
       spotify_connected: false,
       auth_refresh_in_progress: false,
-      pending_keybinding_persist: None,
-      keybinding_runtime: KeybindingRuntimeState::default(),
 
       active_announcement: None,
       pending_announcements: Vec::new(),
@@ -215,11 +210,6 @@ impl Default for App {
       theme_transition: None,
       #[cfg(feature = "dj-core")]
       dj: crate::infra::dj::DjState::default(),
-      friends: Vec::new(),
-      friends_loading: false,
-      friend_code: None,
-      friend_user_search_results: Vec::new(),
-      last_friends_refresh_at: Instant::now(),
       create_playlist_tracks: Vec::new(),
       create_playlist_search_results: Vec::new(),
       pending_plugin_commands: Vec::new(),

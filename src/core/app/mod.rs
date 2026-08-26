@@ -1,4 +1,3 @@
-use crate::core::geometry::Viewport;
 use crate::core::input::Key;
 use crate::core::pagination::{CursorPaged, Paged};
 use crate::core::plugin_api::{
@@ -9,7 +8,7 @@ use crate::core::source::Source;
 use crate::core::state::{
   PersistedRuntimeState, RadioStationAddOutcome, RadioStationConfig, RuntimeState,
 };
-use crate::core::user_config::{color_to_string, normalize_tick_rate_milliseconds, UserConfig};
+use crate::core::user_config::{color_to_string, UserConfig};
 use crate::infra::history::{RecapPeriod, StatsData, StreakSummary};
 use crate::infra::network::sync::{PartySession, PartyStatus};
 use crate::infra::network::IoEvent;
@@ -29,7 +28,6 @@ use rspotify::{
   },
   prelude::*, // Adds Id trait for .id() method
 };
-use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 // Bare `Arc` here is only ever named by the streaming player, the MPRIS manager,
@@ -48,7 +46,6 @@ use std::{
   collections::HashSet,
   time::{Duration, Instant, SystemTime},
 };
-use unicode_width::UnicodeWidthStr;
 
 use arboard::Clipboard;
 #[cfg(any(test, feature = "streaming"))]
@@ -77,13 +74,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::mpsc::channel;
 
-mod album_theme;
 mod construction;
-mod discover;
-mod dj;
-mod friends;
-mod help;
-mod keybindings;
 mod library;
 mod lyrics;
 mod models;
@@ -101,22 +92,16 @@ mod queue_suspend;
 mod route;
 mod scrollable_pages;
 mod seek;
-mod settings_apply;
 mod settings_schema;
 mod shuffle_repeat;
 mod status;
 mod tick;
 mod transport;
-mod view;
 mod volume;
 
 #[cfg(test)]
 mod test_support;
 
-pub use discover::*;
-pub use friends::*;
-pub use help::*;
-pub use keybindings::*;
 pub use library::*;
 pub use lyrics::*;
 pub use models::*;
@@ -134,7 +119,6 @@ pub use scrollable_pages::*;
 pub use seek::*;
 pub use settings_schema::*;
 pub use status::*;
-pub use view::*;
 
 pub struct App {
   /// What the user actually wants the volume to be. We keep this around until
@@ -152,7 +136,6 @@ pub struct App {
   /// buffers, focus, popups, terminal geometry). See [`ViewState`]: handlers and
   /// draw functions write it freely; nothing outside `tui/` and these `App`
   /// methods should.
-  pub view: ViewState,
   pub user_config: UserConfig,
   pub runtime_state: RuntimeState,
   pub state_path: Option<PathBuf>,
@@ -261,8 +244,6 @@ pub struct App {
   pub recently_played: SpotifyResultAndSelectedIndex<
     Option<crate::core::pagination::CursorPaged<crate::core::plugin_api::TrackInfo>>,
   >,
-  pub recommendations_seed: String,
-  pub recommendations_context: Option<RecommendationsContext>,
   pub search_results: SearchResult,
   pub selected_album_simplified: Option<SelectedAlbum>,
   pub selected_album_full: Option<SelectedFullAlbum>,
@@ -339,8 +320,6 @@ pub struct App {
   /// free-source launch doesn't spam "connect Spotify" messages.
   pub spotify_connected: bool,
   pub auth_refresh_in_progress: bool,
-  pub pending_keybinding_persist: Option<PendingKeybindingPersist>,
-  pub keybinding_runtime: KeybindingRuntimeState,
 
   pub active_announcement: Option<Announcement>,
   pub pending_announcements: Vec<Announcement>,
@@ -545,18 +524,6 @@ pub struct App {
   /// Reference to MPRIS manager for emitting Seeked signals after native seeks
   #[cfg(all(feature = "mpris", target_os = "linux"))]
   pub mpris_manager: Option<Arc<crate::infra::mpris::MprisManager>>,
-
-  // Friends screen state
-  /// All friends fetched from spotatui.com (follows list)
-  pub friends: Vec<FriendEntry>,
-  /// Whether friends are currently loading from the API
-  pub friends_loading: bool,
-  /// Own friend code fetched from spotatui.com
-  pub friend_code: Option<String>,
-  /// Results from searching users by name
-  pub friend_user_search_results: Vec<FriendSearchResult>,
-  /// Timestamp of the last time friends were refreshed (for periodic polling)
-  pub last_friends_refresh_at: Instant,
 
   // Create Playlist form state
   pub create_playlist_tracks: Vec<TrackInfo>,

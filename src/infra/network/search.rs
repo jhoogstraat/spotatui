@@ -224,7 +224,6 @@ impl SearchNetwork for Network {
 
     let mut app = self.app.lock().await;
     app.create_playlist_search_results = tracks;
-    app.view.create_playlist_selected_result = 0;
   }
 }
 

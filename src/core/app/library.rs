@@ -17,7 +17,6 @@ pub fn library_options() -> &'static [&'static str] {
     let mut options = vec![
       "Discover",
       "Recently Played",
-      "Friends",
       "Stats",
       "Liked Songs",
       "Albums",
@@ -173,17 +172,6 @@ impl App {
         self.recently_played.index = 0;
         self.dispatch(IoEvent::GetRecentlyPlayed);
         self.push_navigation_stack(RouteId::RecentlyPlayed, ActiveBlock::RecentlyPlayed);
-      }
-      LibraryTarget::Friends => {
-        self.push_navigation_stack(RouteId::Friends, ActiveBlock::Friends);
-        // Load friend code + friends list on first open (or if empty)
-        if self.friend_code.is_none() {
-          self.dispatch(IoEvent::GetFriendCode);
-        }
-        if self.friends.is_empty() && !self.friends_loading {
-          self.dispatch(IoEvent::GetFriends);
-        }
-        self.last_friends_refresh_at = std::time::Instant::now();
       }
       LibraryTarget::Stats => {
         self.stats_loading = true;
@@ -348,7 +336,7 @@ impl App {
       }
       ActiveBlock::AlbumList => {
         if let Some(albums) = self.library.saved_albums.get_results(None) {
-          if let Some(selected_album) = albums.items.get(self.view.album_list_index) {
+          if let Some(selected_album) = albums.items.first() {
             if let Some(id) = selected_album.album.id.as_deref() {
               self.dispatch(IoEvent::CurrentUserSavedAlbumDelete(id.to_string()));
             }
@@ -459,7 +447,7 @@ impl App {
         if let Some(artists) = self.library.saved_artists.get_results(None) {
           if let Some(id) = artists
             .items
-            .get(self.view.artists_list_index)
+            .first()
             .and_then(|selected_artist| selected_artist.id.as_deref())
           {
             self.dispatch(IoEvent::UserUnfollowArtists(vec![id.to_string()]));
@@ -558,7 +546,7 @@ impl App {
           .library
           .saved_shows
           .get_results(None)
-          .and_then(|shows| shows.items.get(self.view.shows_list_index))
+          .and_then(|shows| shows.items.first())
           .and_then(|selected_show| selected_show.id.as_deref())
         {
           self.dispatch(IoEvent::CurrentUserSavedShowDelete(id.to_string()));

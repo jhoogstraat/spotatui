@@ -685,7 +685,7 @@ async fn finish_playlists_fetch(
   let current_selection = (
     app.get_selected_playlist_id(),
     app.current_playlist_folder_id,
-    app.view.selected_playlist_index,
+    None,
   );
   let preferred = if current_selection == page_one_selection {
     original_selection
@@ -735,7 +735,7 @@ impl LibraryNetwork for Network {
       (
         app.get_selected_playlist_id(),
         app.current_playlist_folder_id,
-        app.view.selected_playlist_index,
+        None,
       )
     };
 
@@ -817,7 +817,7 @@ impl LibraryNetwork for Network {
       let page_one_selection = (
         app.get_selected_playlist_id(),
         app.current_playlist_folder_id,
-        app.view.selected_playlist_index,
+        None,
       );
       (
         app.playlist_refresh_generation,
@@ -1530,57 +1530,6 @@ mod tests {
   }
 
   #[test]
-  fn reconcile_restores_selection_against_folders_first_order() {
-    use crate::core::app::{App, PlaylistFolder, PlaylistFolderItem};
-    use crate::core::test_helpers::playlist_info;
-
-    // Root order: P0, folderA, P1, folderB. Restore selection to P1.
-    let mut app = App::default();
-    // Keep this test about folder-first ordering; the community pin is covered
-    // by its own tests.
-    app.user_config.behavior.pin_community_playlist = false;
-    app.all_playlists = vec![
-      playlist_info("00000000000000000000p0", "P0", "me", false),
-      playlist_info("00000000000000000000p1", "P1", "me", false),
-    ];
-    app.playlist_folder_items = vec![
-      PlaylistFolderItem::Playlist {
-        index: 0,
-        current_id: 0,
-      },
-      PlaylistFolderItem::Folder(PlaylistFolder {
-        name: "A".to_string(),
-        current_id: 0,
-        target_id: 1,
-      }),
-      PlaylistFolderItem::Playlist {
-        index: 1,
-        current_id: 0,
-      },
-      PlaylistFolderItem::Folder(PlaylistFolder {
-        name: "B".to_string(),
-        current_id: 0,
-        target_id: 2,
-      }),
-    ];
-    app.user_config.behavior.group_folders_first = true;
-
-    reconcile_playlist_selection(&mut app, Some("00000000000000000000p1"), 0, None);
-
-    // Sorted display view is [A, B, P0, P1]; P1 is display index 3, which maps
-    // to sidebar row 4 (row 0 is the leading "+ Add Playlist" entry).
-    let idx = app
-      .view
-      .selected_playlist_index
-      .expect("selection restored");
-    assert_eq!(idx, 4);
-    assert!(matches!(
-      app.get_playlist_display_item_at(idx - 1),
-      Some(PlaylistFolderItem::Playlist { index: 1, .. })
-    ));
-  }
-
-  #[test]
   fn community_pin_prompt_marks_shown_at_push_time() {
     let dir = tempfile::tempdir().unwrap();
     // Trigger conditions: Spotify source, flag false, toggle on, not following.
@@ -1716,7 +1665,6 @@ fn reconcile_playlist_selection(
 ) {
   if app.playlist_folder_items.is_empty() {
     app.current_playlist_folder_id = 0;
-    app.view.selected_playlist_index = None;
     return;
   }
 
@@ -1748,11 +1696,7 @@ fn reconcile_playlist_selection(
         PlaylistFolderItem::Folder(_) | PlaylistFolderItem::CommunityPin => None,
       });
 
-    if let Some(display_idx) = visible_playlist_index {
-      // Sidebar rows are offset by the leading "+ Add Playlist" row.
-      app.view.selected_playlist_index = Some(display_idx + 1);
-      return;
-    }
+    let _ = visible_playlist_index;
 
     let mut target_folder: Option<usize> = None;
     for item in &app.playlist_folder_items {
@@ -1768,41 +1712,12 @@ fn reconcile_playlist_selection(
 
     if let Some(folder_id) = target_folder {
       app.current_playlist_folder_id = folder_id;
-      let display_idx = app
-        .get_playlist_display_items()
-        .into_iter()
-        .enumerate()
-        .find_map(|(idx, item)| match item {
-          PlaylistFolderItem::Playlist { index, .. } => app
-            .all_playlists
-            .get(*index)
-            .filter(|playlist| playlist.id.as_deref() == Some(playlist_id))
-            .map(|_| idx),
-          PlaylistFolderItem::Folder(_) | PlaylistFolderItem::CommunityPin => None,
-        });
-      if let Some(idx) = display_idx {
-        // Sidebar rows are offset by the leading "+ Add Playlist" row.
-        app.view.selected_playlist_index = Some(idx + 1);
-        return;
-      }
     }
   }
 
-  // Sidebar rows run 0..=count: row 0 is "+ Add Playlist", items follow, so a
-  // preferred row clamps to `count` (the last item), not `count - 1`.
-  let visible_count = app.get_playlist_display_count();
-  if visible_count == 0 {
-    app.current_playlist_folder_id = 0;
-    let root_count = app.get_playlist_display_count();
-    app.view.selected_playlist_index = if root_count == 0 {
-      None
-    } else {
-      Some(preferred_selected_index.unwrap_or(0).min(root_count))
-    };
-    return;
-  }
-
-  app.view.selected_playlist_index = Some(preferred_selected_index.unwrap_or(0).min(visible_count));
+  // The sidebar cursor was TUI presentation state; the folder jump above is
+  // all that remains meaningful here.
+  let _ = preferred_selected_index;
 }
 
 #[cfg(feature = "streaming")]

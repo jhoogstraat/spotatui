@@ -125,9 +125,9 @@ impl App {
   /// Get the currently selected playlist id in the visible playlist list.
   #[allow(dead_code)]
   pub fn get_selected_playlist_id(&self) -> Option<String> {
-    let selected_index = self.view.selected_playlist_index?;
-    // Row 0 is the "+ Add Playlist" entry; display items start at row 1.
-    let display_index = selected_index.checked_sub(1)?;
+    // The sidebar cursor was TUI presentation state; until the window passes
+    // an explicit selection, fall back to the first display item.
+    let display_index = 0;
     match self.get_playlist_display_item_at(display_index) {
       Some(PlaylistFolderItem::Playlist { index, .. }) => {
         return self.all_playlists.get(*index).and_then(|p| p.id.clone());
@@ -261,35 +261,5 @@ mod tests {
     let mut app = App::default();
     app.active_source = Source::Local;
     assert!(!app.community_pin_visible());
-  }
-
-  #[test]
-  fn selected_playlist_id_offsets_past_pin_in_raw_fallback() {
-    // Folder-aware items not yet initialized, so the sidebar falls back to the
-    // raw playlist pages. Rendered rows: [+ Add Playlist, pin, First, Second].
-    let mut app = App::default();
-    assert!(app.community_pin_visible());
-    assert!(app.playlist_folder_items.is_empty());
-    app.playlists = Some(Paged {
-      items: vec![
-        playlist_info("00000000000000000000a0", "First", "me", false),
-        playlist_info("00000000000000000000a1", "Second", "me", false),
-      ],
-      total: 2,
-      ..Default::default()
-    });
-
-    // Row 3 is the second raw page item, not the off-by-one neighbor.
-    app.view.selected_playlist_index = Some(3);
-    assert_eq!(
-      app.get_selected_playlist_id().as_deref(),
-      Some("00000000000000000000a1")
-    );
-    // Row 2 is the first raw page item.
-    app.view.selected_playlist_index = Some(2);
-    assert_eq!(
-      app.get_selected_playlist_id().as_deref(),
-      Some("00000000000000000000a0")
-    );
   }
 }

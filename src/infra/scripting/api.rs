@@ -3,7 +3,7 @@ use std::rc::Rc;
 use mlua::{Lua, LuaSerdeExt, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::core::action::{Action, NavTarget, RepeatSetting};
+use crate::core::action::{EngineAction, NavTarget, RepeatSetting};
 use crate::core::app::PluginDataKind;
 use crate::core::plugin_api::{self, PluginPopup, PopupLine};
 use crate::core::theme::ThemeField;
@@ -107,15 +107,17 @@ pub(super) fn install_api(
   }
 
   // Actions: queue for the engine's next drain into `App::apply`.
-  install_action(lua, &tbl, shared, "play", || Action::Play)?;
-  install_action(lua, &tbl, shared, "pause", || Action::Pause)?;
-  install_action(lua, &tbl, shared, "next", || Action::NextTrack)?;
-  install_action(lua, &tbl, shared, "previous", || Action::PreviousTrack)?;
+  install_action(lua, &tbl, shared, "play", || EngineAction::Play)?;
+  install_action(lua, &tbl, shared, "pause", || EngineAction::Pause)?;
+  install_action(lua, &tbl, shared, "next", || EngineAction::NextTrack)?;
+  install_action(lua, &tbl, shared, "previous", || {
+    EngineAction::PreviousTrack
+  })?;
 
   {
     let shared = shared.clone();
     let seek = lua.create_function(move |_, ms: u32| {
-      shared.effects.borrow_mut().push(Action::SeekTo(ms));
+      shared.effects.borrow_mut().push(EngineAction::SeekTo(ms));
       Ok(())
     })?;
     tbl.set("seek", seek)?;
@@ -125,7 +127,10 @@ pub(super) fn install_api(
     let shared = shared.clone();
     let set_volume = lua.create_function(move |_, pct: i64| {
       let clamped = pct.clamp(0, 100) as u8;
-      shared.effects.borrow_mut().push(Action::SetVolume(clamped));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::SetVolume(clamped));
       Ok(())
     })?;
     tbl.set("set_volume", set_volume)?;
@@ -134,7 +139,10 @@ pub(super) fn install_api(
   {
     let shared = shared.clone();
     let shuffle = lua.create_function(move |_, on: bool| {
-      shared.effects.borrow_mut().push(Action::SetShuffle(on));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::SetShuffle(on));
       Ok(())
     })?;
     tbl.set("shuffle", shuffle)?;
@@ -143,7 +151,10 @@ pub(super) fn install_api(
   {
     let shared = shared.clone();
     let search = lua.create_function(move |_, query: String| {
-      shared.effects.borrow_mut().push(Action::Search(query));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::Search(query));
       Ok(())
     })?;
     tbl.set("search", search)?;
@@ -155,7 +166,7 @@ pub(super) fn install_api(
       shared
         .effects
         .borrow_mut()
-        .push(Action::Notify(msg, ttl.unwrap_or(4)));
+        .push(EngineAction::Notify(msg, ttl.unwrap_or(4)));
       Ok(())
     })?;
     tbl.set("notify", notify)?;
@@ -274,7 +285,7 @@ pub(super) fn install_api(
       shared
         .effects
         .borrow_mut()
-        .push(Action::SetPlaybarSegment { plugin, text });
+        .push(EngineAction::SetPlaybarSegment { plugin, text });
       Ok(())
     })?;
     tbl.set("set_playbar", set_playbar)?;
@@ -288,7 +299,7 @@ pub(super) fn install_api(
       shared
         .effects
         .borrow_mut()
-        .push(Action::ShowPopup(PluginPopup { title, lines }));
+        .push(EngineAction::ShowPopup(PluginPopup { title, lines }));
       Ok(())
     })?;
     tbl.set("popup", popup)?;
@@ -313,7 +324,10 @@ pub(super) fn install_api(
         })?;
         pairs.push((theme_field, color));
       }
-      shared.effects.borrow_mut().push(Action::SetTheme(pairs));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::SetTheme(pairs));
       Ok(())
     })?;
     tbl.set("set_theme", set_theme)?;
@@ -414,19 +428,24 @@ pub(super) fn install_api(
           )));
         }
       };
-      shared.effects.borrow_mut().push(Action::SetRepeat(setting));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::SetRepeat(setting));
       Ok(())
     })?;
     tbl.set("set_repeat", set_repeat)?;
   }
 
-  install_action(lua, &tbl, shared, "cycle_repeat", || Action::CycleRepeat)?;
+  install_action(lua, &tbl, shared, "cycle_repeat", || {
+    EngineAction::CycleRepeat
+  })?;
 
   install_string_action(lua, &tbl, shared, "transfer_playback", |device_id| {
     // `persist: false`: a plugin-initiated transfer must not overwrite the
     // user's saved device preference (only the interactive device picker
     // persists).
-    Action::TransferPlayback {
+    EngineAction::TransferPlayback {
       device_id,
       persist: false,
     }
@@ -437,12 +456,12 @@ pub(super) fn install_api(
     let shared = shared.clone();
     let play_uri = lua.create_function(move |_, uri: String| {
       let action = if uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:") {
-        Action::PlayUris {
+        EngineAction::PlayUris {
           uris: vec![uri],
           offset: None,
         }
       } else if is_context_uri(&uri) {
-        Action::PlayContext { uri, offset: None }
+        EngineAction::PlayContext { uri, offset: None }
       } else {
         return Err(mlua::Error::RuntimeError(format!(
           "spotatui.play_uri: expected a spotify:track/episode/album/playlist/artist/show uri, got '{uri}'"
@@ -467,13 +486,13 @@ pub(super) fn install_api(
       shared
         .effects
         .borrow_mut()
-        .push(Action::PlayContext { uri, offset });
+        .push(EngineAction::PlayContext { uri, offset });
       Ok(())
     })?;
     tbl.set("play_context", play_context)?;
   }
 
-  install_string_action(lua, &tbl, shared, "add_to_queue", Action::AddToQueue)?;
+  install_string_action(lua, &tbl, shared, "add_to_queue", EngineAction::AddToQueue)?;
 
   // spotatui.create_playlist(name, uris?)
   {
@@ -491,10 +510,13 @@ pub(super) fn install_api(
             track_ids.push(uri?);
           }
         }
-        shared.effects.borrow_mut().push(Action::CreatePlaylist {
-          name,
-          track_uris: track_ids,
-        });
+        shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::CreatePlaylist {
+            name,
+            track_uris: track_ids,
+          });
         Ok(())
       })?;
     tbl.set("create_playlist", create_playlist)?;
@@ -510,7 +532,7 @@ pub(super) fn install_api(
         shared
           .effects
           .borrow_mut()
-          .push(Action::AddTrackToPlaylist { playlist, track });
+          .push(EngineAction::AddTrackToPlaylist { playlist, track });
         Ok(())
       })?;
     tbl.set("playlist_add_track", playlist_add_track)?;
@@ -531,7 +553,7 @@ pub(super) fn install_api(
         shared
           .effects
           .borrow_mut()
-          .push(Action::RemoveTrackFromPlaylist {
+          .push(EngineAction::RemoveTrackFromPlaylist {
             playlist,
             track,
             position,
@@ -541,27 +563,45 @@ pub(super) fn install_api(
     tbl.set("playlist_remove_track", playlist_remove_track)?;
   }
 
-  install_string_action(lua, &tbl, shared, "follow_playlist", Action::FollowPlaylist)?;
+  install_string_action(
+    lua,
+    &tbl,
+    shared,
+    "follow_playlist",
+    EngineAction::FollowPlaylist,
+  )?;
   install_string_action(
     lua,
     &tbl,
     shared,
     "unfollow_playlist",
-    Action::UnfollowPlaylist,
+    EngineAction::UnfollowPlaylist,
   )?;
   install_string_action(
     lua,
     &tbl,
     shared,
     "toggle_save_track",
-    Action::ToggleSaveTrack,
+    EngineAction::ToggleSaveTrack,
   )?;
-  install_string_action(lua, &tbl, shared, "save_album", Action::SaveAlbum)?;
-  install_string_action(lua, &tbl, shared, "unsave_album", Action::UnsaveAlbum)?;
-  install_string_action(lua, &tbl, shared, "save_show", Action::SaveShow)?;
-  install_string_action(lua, &tbl, shared, "unsave_show", Action::UnsaveShow)?;
-  install_string_action(lua, &tbl, shared, "follow_artist", Action::FollowArtist)?;
-  install_string_action(lua, &tbl, shared, "unfollow_artist", Action::UnfollowArtist)?;
+  install_string_action(lua, &tbl, shared, "save_album", EngineAction::SaveAlbum)?;
+  install_string_action(lua, &tbl, shared, "unsave_album", EngineAction::UnsaveAlbum)?;
+  install_string_action(lua, &tbl, shared, "save_show", EngineAction::SaveShow)?;
+  install_string_action(lua, &tbl, shared, "unsave_show", EngineAction::UnsaveShow)?;
+  install_string_action(
+    lua,
+    &tbl,
+    shared,
+    "follow_artist",
+    EngineAction::FollowArtist,
+  )?;
+  install_string_action(
+    lua,
+    &tbl,
+    shared,
+    "unfollow_artist",
+    EngineAction::UnfollowArtist,
+  )?;
 
   // Timers. Fired from the engine's tick pass, so the effective resolution is
   // the UI tick rate (behavior.tick_rate_milliseconds).
@@ -601,13 +641,13 @@ pub(super) fn install_api(
       shared
         .effects
         .borrow_mut()
-        .push(Action::Navigate(nav_target));
+        .push(EngineAction::Navigate(nav_target));
       Ok(())
     })?;
     tbl.set("navigate", navigate)?;
   }
 
-  install_action(lua, &tbl, shared, "back", || Action::Back)?;
+  install_action(lua, &tbl, shared, "back", || EngineAction::Back)?;
 
   {
     let shared = shared.clone();
@@ -666,10 +706,13 @@ pub(super) fn install_api(
     let set_screen = lua.create_function(move |_, (name, widgets): (String, mlua::Table)| {
       let title = verify_screen_owner(&lua_inner, &shared, "spotatui.set_screen", &name)?;
       let widgets = parse_screen_widgets(widgets)?;
-      shared.effects.borrow_mut().push(Action::SetScreenContent {
-        name,
-        content: plugin_api::PluginScreenContent { title, widgets },
-      });
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::SetScreenContent {
+          name,
+          content: plugin_api::PluginScreenContent { title, widgets },
+        });
       Ok(())
     })?;
     tbl.set("set_screen", set_screen)?;
@@ -680,7 +723,10 @@ pub(super) fn install_api(
     let shared = shared.clone();
     let show_screen = lua.create_function(move |_, name: String| {
       verify_screen_owner(&lua_inner, &shared, "spotatui.show_screen", &name)?;
-      shared.effects.borrow_mut().push(Action::ShowScreen(name));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::ShowScreen(name));
       Ok(())
     })?;
     tbl.set("show_screen", show_screen)?;
@@ -691,7 +737,10 @@ pub(super) fn install_api(
     let shared = shared.clone();
     let close_screen = lua.create_function(move |_, name: String| {
       verify_screen_owner(&lua_inner, &shared, "spotatui.close_screen", &name)?;
-      shared.effects.borrow_mut().push(Action::CloseScreen(name));
+      shared
+        .effects
+        .borrow_mut()
+        .push(EngineAction::CloseScreen(name));
       Ok(())
     })?;
     tbl.set("close_screen", close_screen)?;

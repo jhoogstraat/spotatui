@@ -98,6 +98,16 @@ impl App {
     self.status_message_is_error = true;
   }
 
+  /// The one real dismissal of the current notice (if any). Replaces the
+  /// old `NotifyError("", 0)` hack, which exploited the expiry machinery
+  /// to clear a blocking error. Errors retire through `clear_api_error`
+  /// and their TTL backstop; plain notices expire or are replaced.
+  pub fn dismiss_status_message(&mut self) {
+    self.status_message = None;
+    self.status_message_expires_at = None;
+    self.status_message_is_error = false;
+  }
+
   /// Scale a status-message TTL by `status_message_ttl_percent` (default 100
   /// == 1.0×). Applied here at the single sink so the ~66 call sites keep
   /// their relative per-severity TTLs.

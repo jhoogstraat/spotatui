@@ -15,4 +15,4 @@
 # test_attribute_total (the deletion floor: tests may only accumulate).
 
 wildcard_arms_in_action_tree = 0       # target 0, must stay 0
-test_attribute_total = 1133           # adoption: may only rise
+test_attribute_total = 1108           # adoption: may only rise

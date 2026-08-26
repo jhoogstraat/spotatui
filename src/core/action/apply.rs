@@ -9,34 +9,34 @@ use crate::core::app::{ActiveBlock, App, RouteId};
 use crate::core::plugin_api;
 use crate::infra::network::IoEvent;
 
-use super::{Action, ActionOutcome, NavTarget, RepeatSetting};
+use super::{ActionOutcome, EngineAction, NavTarget, RepeatSetting};
 
 impl App {
   /// Apply one frontend-neutral action. See the module doc for the rules
   /// every arm follows.
-  pub fn apply(&mut self, action: Action) -> ActionOutcome {
+  pub fn apply(&mut self, action: EngineAction) -> ActionOutcome {
     match action {
-      Action::Play => {
+      EngineAction::Play => {
         if !effective_is_playing(self) {
           self.toggle_playback();
         }
       }
-      Action::Pause => {
+      EngineAction::Pause => {
         if effective_is_playing(self) {
           self.toggle_playback();
         }
       }
-      Action::TogglePlayback => self.toggle_playback(),
-      Action::NextTrack => self.next_track(),
-      Action::PreviousTrack => self.previous_track(),
-      Action::ForcePreviousTrack => self.force_previous_track(),
-      Action::SeekTo(ms) => self.seek_to(ms),
-      Action::SeekForward => self.seek_forwards(),
-      Action::SeekBackward => self.seek_backwards(),
-      Action::SetVolume(v) => self.set_volume_percent(v),
-      Action::VolumeUp => self.increase_volume(),
-      Action::VolumeDown => self.decrease_volume(),
-      Action::SetShuffle(desired) => {
+      EngineAction::TogglePlayback => self.toggle_playback(),
+      EngineAction::NextTrack => self.next_track(),
+      EngineAction::PreviousTrack => self.previous_track(),
+      EngineAction::ForcePreviousTrack => self.force_previous_track(),
+      EngineAction::SeekTo(ms) => self.seek_to(ms),
+      EngineAction::SeekForward => self.seek_forwards(),
+      EngineAction::SeekBackward => self.seek_backwards(),
+      EngineAction::SetVolume(v) => self.set_volume_percent(v),
+      EngineAction::VolumeUp => self.increase_volume(),
+      EngineAction::VolumeDown => self.decrease_volume(),
+      EngineAction::SetShuffle(desired) => {
         let current = plugin_api::playback_state(self)
           .map(|p| p.shuffle)
           .unwrap_or(false);
@@ -44,9 +44,9 @@ impl App {
           self.shuffle();
         }
       }
-      Action::ToggleShuffle => self.shuffle(),
-      Action::CycleRepeat => self.repeat(),
-      Action::SetRepeat(setting) => {
+      EngineAction::ToggleShuffle => self.shuffle(),
+      EngineAction::CycleRepeat => self.repeat(),
+      EngineAction::SetRepeat(setting) => {
         use rspotify::model::RepeatState;
         let state = match setting {
           RepeatSetting::Off => RepeatState::Off,
@@ -55,25 +55,25 @@ impl App {
         };
         self.dispatch(IoEvent::Repeat(state));
       }
-      Action::PlayUris { uris, offset } => self.start_playback_uris(uris, offset),
-      Action::PlayContext { uri, offset } => self.start_playback_context(uri, offset),
-      Action::PlayTrackInContext { context, track } => {
+      EngineAction::PlayUris { uris, offset } => self.start_playback_uris(uris, offset),
+      EngineAction::PlayContext { uri, offset } => self.start_playback_context(uri, offset),
+      EngineAction::PlayTrackInContext { context, track } => {
         self.start_playback_track_in_context(context, track);
       }
-      Action::TransferPlayback { device_id, persist } => {
+      EngineAction::TransferPlayback { device_id, persist } => {
         self.dispatch(IoEvent::TransferPlaybackToDevice(device_id, persist));
       }
-      Action::AddToQueue(uri) => self.dispatch(IoEvent::AddItemToQueue(uri)),
-      Action::EnqueueNative(track) => self.add_track_to_native_queue(track),
-      Action::RemoveNativeQueued(index) => self.remove_native_queued(index),
-      Action::MoveNativeQueued { index, up } => self.move_native_queued(index, up),
-      Action::ClearNativeQueue => self.clear_native_queue(),
-      Action::BeginSpotifyLogin => self.dispatch(IoEvent::BeginSpotifyLogin),
-      Action::Search(query) => {
+      EngineAction::AddToQueue(uri) => self.dispatch(IoEvent::AddItemToQueue(uri)),
+      EngineAction::EnqueueNative(track) => self.add_track_to_native_queue(track),
+      EngineAction::RemoveNativeQueued(index) => self.remove_native_queued(index),
+      EngineAction::MoveNativeQueued { index, up } => self.move_native_queued(index, up),
+      EngineAction::ClearNativeQueue => self.clear_native_queue(),
+      EngineAction::BeginSpotifyLogin => self.dispatch(IoEvent::BeginSpotifyLogin),
+      EngineAction::Search(query) => {
         let country = self.get_user_country();
         self.dispatch(IoEvent::GetSearchResults(query, country));
       }
-      Action::SearchActiveSource(query) => match self.active_source {
+      EngineAction::SearchActiveSource(query) => match self.active_source {
         crate::core::source::Source::Subsonic => {
           self.dispatch(IoEvent::GetSubsonicSearchResults(query));
         }
@@ -90,18 +90,18 @@ impl App {
           self.dispatch(IoEvent::GetSearchResults(query, country));
         }
       },
-      Action::SearchPlaylistTracks { playlist_id, query } => {
+      EngineAction::SearchPlaylistTracks { playlist_id, query } => {
         self.pending_playlist_track_search = Some(query.clone());
         self.set_status_message(format!("Searching playlist for \"{query}\"..."), 60);
         self.dispatch(IoEvent::SearchPlaylistTracks(playlist_id, query));
       }
-      Action::CreatePlaylist { name, track_uris } => {
+      EngineAction::CreatePlaylist { name, track_uris } => {
         self.dispatch(IoEvent::CreateNewPlaylist(name, track_uris));
       }
-      Action::AddTrackToPlaylist { playlist, track } => {
+      EngineAction::AddTrackToPlaylist { playlist, track } => {
         self.dispatch(IoEvent::AddTrackToPlaylist(playlist, track));
       }
-      Action::RemoveTrackFromPlaylist {
+      EngineAction::RemoveTrackFromPlaylist {
         playlist,
         track,
         position,
@@ -110,7 +110,7 @@ impl App {
           playlist, track, position,
         ));
       }
-      Action::FollowPlaylist(playlist) => {
+      EngineAction::FollowPlaylist(playlist) => {
         // The network handler ignores the owner-id parameter; "unknown"
         // mirrors the fallback the built-in follow flow uses.
         self.dispatch(IoEvent::UserFollowPlaylist(
@@ -119,7 +119,7 @@ impl App {
           None,
         ));
       }
-      Action::UnfollowPlaylist(playlist_id) => {
+      EngineAction::UnfollowPlaylist(playlist_id) => {
         let user_id = self.user.as_ref().map(|u| u.id.clone());
         if let Some(user_id) = user_id {
           self.dispatch(IoEvent::UserUnfollowPlaylist(user_id, playlist_id));
@@ -130,24 +130,25 @@ impl App {
           );
         }
       }
-      Action::ToggleSaveTrack(uri) => self.dispatch(IoEvent::ToggleSaveTrack(uri)),
-      Action::SaveAlbum(id) => self.dispatch(IoEvent::CurrentUserSavedAlbumAdd(id)),
-      Action::UnsaveAlbum(id) => self.dispatch(IoEvent::CurrentUserSavedAlbumDelete(id)),
-      Action::SaveShow(id) => self.dispatch(IoEvent::CurrentUserSavedShowAdd(id)),
-      Action::UnsaveShow(id) => self.dispatch(IoEvent::CurrentUserSavedShowDelete(id)),
-      Action::FollowArtist(id) => self.dispatch(IoEvent::UserFollowArtists(vec![id])),
-      Action::UnfollowArtist(id) => self.dispatch(IoEvent::UserUnfollowArtists(vec![id])),
-      Action::Notify(msg, ttl) => self.set_status_message(msg, ttl),
-      Action::NotifyError(msg, ttl) => self.set_error_status_message(msg, ttl),
-      Action::Navigate(target) => apply_navigate(self, target),
-      Action::Back => {
+      EngineAction::ToggleSaveTrack(uri) => self.dispatch(IoEvent::ToggleSaveTrack(uri)),
+      EngineAction::SaveAlbum(id) => self.dispatch(IoEvent::CurrentUserSavedAlbumAdd(id)),
+      EngineAction::UnsaveAlbum(id) => self.dispatch(IoEvent::CurrentUserSavedAlbumDelete(id)),
+      EngineAction::SaveShow(id) => self.dispatch(IoEvent::CurrentUserSavedShowAdd(id)),
+      EngineAction::UnsaveShow(id) => self.dispatch(IoEvent::CurrentUserSavedShowDelete(id)),
+      EngineAction::FollowArtist(id) => self.dispatch(IoEvent::UserFollowArtists(vec![id])),
+      EngineAction::UnfollowArtist(id) => self.dispatch(IoEvent::UserUnfollowArtists(vec![id])),
+      EngineAction::DismissNotice => self.dismiss_status_message(),
+      EngineAction::Notify(msg, ttl) => self.set_status_message(msg, ttl),
+      EngineAction::NotifyError(msg, ttl) => self.set_error_status_message(msg, ttl),
+      EngineAction::Navigate(target) => apply_navigate(self, target),
+      EngineAction::Back => {
         self.pop_navigation_stack();
       }
-      Action::LoadMore(target) => match target {
+      EngineAction::LoadMore(target) => match target {
         super::ListTarget::PlaylistTracks => self.get_playlist_tracks_next(),
         super::ListTarget::SavedTracks => self.get_current_user_saved_tracks_next(),
       },
-      Action::Open(target) => match target {
+      EngineAction::Open(target) => match target {
         super::OpenTarget::Album(id) => self.dispatch(IoEvent::GetAlbum(id)),
         super::OpenTarget::Artist { id, name } => self.get_artist(id, name),
         super::OpenTarget::Playlist { id, from_search } => {
@@ -166,16 +167,15 @@ impl App {
           self.dispatch(IoEvent::GetAlbumForTrack(track_id));
         }
       },
-      Action::OpenLibrary(target) => self.open_library_section(target),
-      Action::SelectSource(source) => self.set_active_source(source),
-      Action::OpenAddTrackDialog => self.begin_add_track_to_playlist_flow_from_selection(),
-      Action::OpenRemoveTrackDialog => self.begin_remove_track_from_playlist_flow(),
-      Action::JumpToAlbum => self.jump_to_album(),
-      Action::JumpToArtist => self.jump_to_artist_album(),
-      Action::JumpToContext => self.jump_to_context(),
-      Action::GenerateRecap => self.generate_recap(),
-      Action::RecommendFromTrack(track) => self.load_recommendations_for_track(track),
-      Action::SetPlaybarSegment { plugin, text } => match text {
+      EngineAction::OpenLibrary(target) => self.open_library_section(target),
+      EngineAction::SelectSource(source) => self.set_active_source(source),
+      EngineAction::OpenAddTrackDialog => self.begin_add_track_to_playlist_flow_from_selection(),
+      EngineAction::OpenRemoveTrackDialog => self.begin_remove_track_from_playlist_flow(),
+      EngineAction::JumpToAlbum => self.jump_to_album(),
+      EngineAction::JumpToArtist => self.jump_to_artist_album(),
+      EngineAction::JumpToContext => self.jump_to_context(),
+      EngineAction::GenerateRecap => self.generate_recap(),
+      EngineAction::SetPlaybarSegment { plugin, text } => match text {
         Some(t) => {
           self.plugin_playbar_segments.insert(plugin, t);
         }
@@ -183,23 +183,23 @@ impl App {
           self.plugin_playbar_segments.remove(&plugin);
         }
       },
-      Action::ShowPopup(popup) => self.show_plugin_popup(popup),
-      Action::ClosePopup => self.close_plugin_popup(),
-      Action::SetTheme(pairs) => {
+      EngineAction::ShowPopup(popup) => self.show_plugin_popup(popup),
+      EngineAction::ClosePopup => self.close_plugin_popup(),
+      EngineAction::SetTheme(pairs) => {
         for (field, color) in pairs {
           self.user_config.theme.set(field, color);
         }
       }
-      Action::SetScreenContent { name, content } => {
+      EngineAction::SetScreenContent { name, content } => {
         self.plugin_screens.insert(name, content);
       }
-      Action::ShowScreen(name) => self.open_plugin_screen(name),
-      Action::CloseScreen(name) => {
+      EngineAction::ShowScreen(name) => self.open_plugin_screen(name),
+      EngineAction::CloseScreen(name) => {
         if self.get_current_route().id == RouteId::PluginScreen(name) {
           self.pop_navigation_stack();
         }
       }
-      Action::QueueTracks(tracks) => {
+      EngineAction::QueueTracks(tracks) => {
         #[cfg(feature = "dj-core")]
         {
           return ActionOutcome::Queued {
@@ -212,7 +212,7 @@ impl App {
           return ActionOutcome::Queued { accepted: 0 };
         }
       }
-      Action::SetDjVibe(vibe) => {
+      EngineAction::SetDjVibe(vibe) => {
         #[cfg(feature = "dj-core")]
         {
           // A new standing direction invalidates any refill already in

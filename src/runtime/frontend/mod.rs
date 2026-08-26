@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 
-pub use crate::core::action::{Action, ActionOutcome, LibraryTarget};
+pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget};
 pub use crate::core::onboarding::Onboarding;
 pub use crate::core::plugin_api::{PlaybackState, PlaylistInfo, TrackInfo};
 pub use crate::core::source::Source;
@@ -108,13 +108,21 @@ impl Options {
   }
 }
 
-/// An embedded Spotatui runtime: shared service startup, a tick loop driving
-/// `Driver::tick`, a snapshot publisher, and the quit sequence.
+use super::engine::{Changed, EngineCommand, EngineEvent, Spine};
+
+pub use super::engine::EngineCommand as FrontendEngineCommand;
+
+/// An embedded Spotatui runtime: shared service startup, the driver loop on
+/// its own thread, an event-spine-fed snapshot publisher, and the quit
+/// sequence. The engine emits [`EngineEvent`]s through its [`Spine`]; the
+/// publisher folds them into deduplicated immutable snapshots (ADR 0016
+/// stage 2). No bell rings without an event behind it.
 pub struct Runtime {
   rt: tokio::runtime::Runtime,
   app: Arc<Mutex<App>>,
   snapshot_tx: watch::Sender<Snapshot>,
   shutdown_tx: watch::Sender<bool>,
+  spine: Spine,
   tick_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
@@ -157,13 +165,15 @@ impl Runtime {
     let app = Arc::clone(&services.app);
     let (snapshot_tx, _snapshot_rx) = watch::channel(Snapshot::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // Snapshot publisher: rebuild on every bell, dedup by equality.
+    // The event spine: every producer emits here; the publisher folds.
+    let (spine, events_rx) = Spine::open(Default::default());
+    // Snapshot publisher: wakes ONLY when the driver loop / apply path say
+    // state moved (the change bell), rebuilds once, and equality-dedups the
+    // publication. One writer, one dedup point.
     {
       let app = Arc::clone(&app);
       let tx = snapshot_tx.clone();
       rt.spawn(async move {
-        // Clone the bell out of `App` once so the wait below never holds the
-        // App lock (a poke happens under that same lock).
         let notify = Arc::clone(&app.lock().await.change_notify);
         loop {
           if tx.is_closed() {
@@ -197,6 +207,7 @@ impl Runtime {
       let app = Arc::clone(&app);
       let shared_position = services.shared_position_for_ui;
       let history_collector = services.history_collector;
+      let driver_events_rx = events_rx;
       std::thread::Builder::new()
         .name("spotatui-frontend-tick".to_string())
         .spawn(move || {
@@ -205,7 +216,14 @@ impl Runtime {
             .build()
             .expect("frontend tick runtime");
           tick_rt.block_on(async move {
-            tick_loop(app, shutdown_rx, shared_position, history_collector).await;
+            driver_loop(
+              app,
+              shutdown_rx,
+              shared_position,
+              history_collector,
+              driver_events_rx,
+            )
+            .await;
           });
           let _ = tick_done_tx.send(());
         })
@@ -217,6 +235,7 @@ impl Runtime {
       app,
       snapshot_tx,
       shutdown_tx,
+      spine,
       tick_done_rx: Some(tick_done_rx),
     })
   }
@@ -226,15 +245,49 @@ impl Runtime {
     self.snapshot_tx.subscribe()
   }
 
+  /// The engine's spine handle: producers inside this process emit events
+  /// here instead of poking shared state.
+  pub fn spine(&self) -> &Spine {
+    &self.spine
+  }
+
+  /// Execute one external command. Returns `false` when it cannot be
+  /// dispatched (no session for it). Commands funnel through `App::apply`'s
+  /// ownership-aware arms; completion arrives later as state on the watch.
+  pub fn execute(&self, command: EngineCommand) -> bool {
+    let action = match command {
+      EngineCommand::PlayUris { uris, offset } => EngineAction::PlayUris { uris, offset },
+      EngineCommand::Pause => EngineAction::Pause,
+      EngineCommand::Resume => EngineAction::Play,
+      EngineCommand::Seek(ms) => EngineAction::SeekTo(u32::try_from(ms).unwrap_or(u32::MAX)),
+      EngineCommand::NextTrack => EngineAction::NextTrack,
+      EngineCommand::PreviousTrack => EngineAction::PreviousTrack,
+      EngineCommand::Volume(percent) => EngineAction::SetVolume(percent.min(100)),
+      EngineCommand::EnqueueNative(track) => EngineAction::EnqueueNative(track),
+      EngineCommand::RemoveNativeQueued(index) => EngineAction::RemoveNativeQueued(index),
+      EngineCommand::MoveNativeQueued { index, up } => EngineAction::MoveNativeQueued { index, up },
+      EngineCommand::ClearNativeQueue => EngineAction::ClearNativeQueue,
+      EngineCommand::SearchActiveSource(query) => EngineAction::SearchActiveSource(query),
+      EngineCommand::Browse(target) => EngineAction::OpenLibrary(target),
+      EngineCommand::Reauthenticate => EngineAction::BeginSpotifyLogin,
+      EngineCommand::DismissNotice => EngineAction::DismissNotice,
+    };
+    self.apply(action);
+    true
+  }
+
   /// Apply one action synchronously. Infallible at accept time: failures
   /// arrive later as notices in a published snapshot.
-  pub fn apply(&self, action: Action) -> ActionOutcome {
+  pub fn apply(&self, action: EngineAction) -> ActionOutcome {
     self.rt.block_on(async {
-      let mut app = self.app.lock().await;
-      let outcome = app.apply(action);
-      drop(app);
-      // Apply already bells internally; poke again so a publisher that raced
-      // ahead of the wake permit still sees this change.
+      let outcome = {
+        let mut app = self.app.lock().await;
+        app.apply(action)
+      };
+      // Event-spine wake: one StateChanged covers any mutation apply made.
+      self.spine.emit_now(EngineEvent::changed(Changed::Session));
+      // Legacy bell as well while internal producers still rely on it;
+      // later ADR 0016 stages remove it with the mega-mutex.
       self.app.lock().await.change_notify.notify_one();
       outcome
     })
@@ -269,11 +322,38 @@ impl Runtime {
   }
 }
 
-async fn tick_loop(
+/// Activity classes that decide the driver's wake cadence. The old loop ran
+/// `Driver::tick` every 250 ms unconditionally; this loop runs it *when
+/// something happens* plus a slow backstop for the few duties still sized in
+/// wall-clock time (API poll resync, watchdog, notice expiry — each becomes a
+/// dedicated timer in stage 3, shrinking the backstop further).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DriverWake {
+  /// Playback state says audio is advancing; position/keepalive cadence.
+  Playing,
+  /// Nothing playing but a session exists (poll resync, watchdog rearm).
+  Idle,
+}
+
+impl DriverWake {
+  fn backstop(self) -> Duration {
+    match self {
+      // While playing the position advances under events from librespot;
+      // this backstop just bounds worst-case stall if events starve.
+      DriverWake::Playing => Duration::from_millis(250),
+      // Idle: only the Web-API resync poll (5 s default) and the watchdog
+      // need wall-clock attention between real events.
+      DriverWake::Idle => Duration::from_secs(2),
+    }
+  }
+}
+
+async fn driver_loop(
   app: Arc<Mutex<App>>,
   mut shutdown_rx: watch::Receiver<bool>,
   shared_position: Option<Arc<std::sync::atomic::AtomicU64>>,
   history_collector: crate::infra::history::HistoryCollectorHandle,
+  mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
 ) {
   use crate::core::driver::{DiscordRpcHandle, MprisHandle};
   #[cfg(all(feature = "mpris", target_os = "linux"))]
@@ -287,12 +367,7 @@ async fn tick_loop(
   let mut driver =
     crate::core::driver::Driver::new(shared_position, mpris_manager, discord_rpc_manager);
 
-  let tick_rate_ms = app.lock().await.user_config.behavior.tick_rate_milliseconds;
-  let mut interval = tokio::time::interval(Duration::from_millis(tick_rate_ms));
-  interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-  // The startup dispatch fires here rather than after a first frame: there is
-  // no frame to wait for.
+  // The startup dispatch fires at boot, not on a timer.
   {
     let mut app = app.lock().await;
     driver.dispatch_startup(&mut app);
@@ -300,34 +375,52 @@ async fn tick_loop(
 
   let mut last_tick_at = Instant::now();
   loop {
+    // Pick the backstop from live playback state; nothing wakes without an
+    // event or this (long) deadline.
+    let wake = {
+      let app = app.lock().await;
+      if app.playback_position_ms().is_some() && app.native_is_playing.unwrap_or(false) {
+        DriverWake::Playing
+      } else {
+        DriverWake::Idle
+      }
+    };
+    let backstop = tokio::time::sleep(wake.backstop());
+    tokio::pin!(backstop);
     tokio::select! {
-      _ = interval.tick() => {
-        let elapsed = last_tick_at.elapsed();
-        last_tick_at = Instant::now();
-        {
-          let mut app = app.lock().await;
-          driver.tick(
-            &mut app,
-            elapsed,
-            crate::core::driver::TickEnv {
-              now: Instant::now(),
-              #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-              viz_bars: None,
-              #[cfg(feature = "art-decode")]
-              cover_art_full_image_support: false,
-            },
-          );
-          app.change_notify.notify_one();
-        }
-        if *shutdown_rx.borrow_and_update() {
-          break;
+      _ = &mut backstop => {}
+      event = events_rx.recv() => {
+        match event {
+          Some(EngineEvent::StateChanged(_)) => {}
+          None => break, // spine closed
         }
       }
       changed = shutdown_rx.changed() => {
         if changed.is_err() || *shutdown_rx.borrow() {
           break;
         }
+        continue;
       }
+    }
+    let elapsed = last_tick_at.elapsed();
+    last_tick_at = Instant::now();
+    {
+      let mut app = app.lock().await;
+      driver.tick(
+        &mut app,
+        elapsed,
+        crate::core::driver::TickEnv {
+          now: Instant::now(),
+          #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
+          viz_bars: None,
+          #[cfg(feature = "art-decode")]
+          cover_art_full_image_support: false,
+        },
+      );
+      app.change_notify.notify_one();
+    }
+    if *shutdown_rx.borrow_and_update() {
+      break;
     }
   }
 
