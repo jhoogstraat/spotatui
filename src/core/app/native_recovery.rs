@@ -731,3 +731,112 @@ mod tests {
     assert!(!app.native_raw_list_playback_exhausted("second"));
   }
 }
+
+// ── Streaming domain interface (ADR 0016 stage 3, ticket 09) ────────────────
+//
+// The recovery/watchdog mechanics above are the *implementation*. This module
+// tail defines the domain's test seam: a pure decision function over scripted
+// event sequences, so recovery behavior is exercisable without librespot, the
+// network layer, or the rest of the app.
+
+/// A scripted input to [`streaming_recovery_decision`]: what the streaming
+/// domain observes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamingObservation {
+  /// A load was issued for this track (arms the watchdog).
+  LoadIssued { track_uri: String },
+  /// A Playing/Paused event arrived (disarms; confirms restore if pending).
+  TransportConfirmed { track_uri: String, playing: bool },
+  /// The watchdog fired: no transport confirmation within its window.
+  WatchdogFired,
+  /// The session was torn down by an external disconnect.
+  SessionDisconnected,
+}
+
+/// Whether a recovery attempt should fire and how many remain afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryDecision {
+  pub force_recovery: bool,
+  pub attempts_remaining: u8,
+}
+
+/// Maximum automatic recovery attempts per load/restore generation (mirrors
+/// the tick watchdog's MAX_RECOVERY_ATTEMPTS).
+pub const STREAMING_MAX_RECOVERY_ATTEMPTS: u8 = 2;
+
+/// Pure state machine over one load/restore generation.
+#[cfg(feature = "streaming")]
+pub fn streaming_recovery_decision(
+  attempts_used: u8,
+  observation: StreamingObservation,
+) -> RecoveryDecision {
+  match observation {
+    StreamingObservation::WatchdogFired => {
+      let remaining = STREAMING_MAX_RECOVERY_ATTEMPTS.saturating_sub(attempts_used);
+      RecoveryDecision {
+        force_recovery: attempts_used < STREAMING_MAX_RECOVERY_ATTEMPTS,
+        attempts_remaining: remaining,
+      }
+    }
+    StreamingObservation::TransportConfirmed { .. } => RecoveryDecision {
+      force_recovery: false,
+      attempts_remaining: STREAMING_MAX_RECOVERY_ATTEMPTS,
+    },
+    // A load resets nothing about the attempt counter by itself; a fresh
+    // user-initiated load arrives as `LoadIssued` with `attempts_used` 0.
+    StreamingObservation::LoadIssued { .. } | StreamingObservation::SessionDisconnected => {
+      RecoveryDecision {
+        force_recovery: false,
+        attempts_remaining: STREAMING_MAX_RECOVERY_ATTEMPTS.saturating_sub(attempts_used),
+      }
+    }
+  }
+}
+
+#[cfg(test)]
+mod streaming_domain_tests {
+  use super::*;
+
+  #[test]
+  fn first_watchdog_fire_recovers_with_one_attempt_spent() {
+    let d = streaming_recovery_decision(0, StreamingObservation::WatchdogFired);
+    assert!(d.force_recovery);
+    assert_eq!(d.attempts_remaining, 2);
+    let d = streaming_recovery_decision(1, StreamingObservation::WatchdogFired);
+    assert!(d.force_recovery);
+    assert_eq!(d.attempts_remaining, 1);
+  }
+
+  #[test]
+  fn after_two_failed_attempts_the_request_is_dropped_not_retried() {
+    let d = streaming_recovery_decision(2, StreamingObservation::WatchdogFired);
+    assert!(!d.force_recovery, "drop instead of looping forever");
+    assert_eq!(d.attempts_remaining, 0);
+  }
+
+  #[test]
+  fn transport_confirmation_disarms_and_resets_attempts() {
+    let d = streaming_recovery_decision(
+      1,
+      StreamingObservation::TransportConfirmed {
+        track_uri: "spotify:track:x".into(),
+        playing: true,
+      },
+    );
+    assert!(!d.force_recovery);
+    assert_eq!(d.attempts_remaining, 2, "full budget restored");
+  }
+
+  #[test]
+  fn loads_and_disconnects_never_force_recovery_by_themselves() {
+    for obs in [
+      StreamingObservation::LoadIssued {
+        track_uri: String::new(),
+      },
+      StreamingObservation::SessionDisconnected,
+    ] {
+      let d = streaming_recovery_decision(0, obs);
+      assert!(!d.force_recovery);
+    }
+  }
+}
