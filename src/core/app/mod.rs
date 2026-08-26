@@ -320,6 +320,10 @@ pub struct App {
   /// free-source launch doesn't spam "connect Spotify" messages.
   pub spotify_connected: bool,
   pub auth_refresh_in_progress: bool,
+  /// The auth domain's owned state (ticket 08): transitions flow through
+  /// [`crate::core::auth::AuthState::transition`]. The three fields above are
+  /// legacy mirrors kept until ticket 11 deletes the shared struct itself.
+  pub auth_state: crate::core::auth::AuthState,
 
   pub active_announcement: Option<Announcement>,
   pub pending_announcements: Vec<Announcement>,

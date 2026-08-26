@@ -113,6 +113,7 @@ impl Default for App {
       spotify_token_expiry: None,
       spotify_connected: false,
       auth_refresh_in_progress: false,
+      auth_state: crate::core::auth::AuthState::default(),
 
       active_announcement: None,
       pending_announcements: Vec::new(),

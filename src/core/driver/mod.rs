@@ -21,7 +21,6 @@ mod plan;
 mod presence;
 
 use crate::core::app::{App, RouteId};
-use crate::core::auth;
 #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
 use crate::infra::audio;
 #[cfg(feature = "discord-rpc")]
@@ -247,11 +246,11 @@ impl Driver {
     // token expiry and must not schedule refreshes. This lives on the tick so
     // every frontend gets it: one that skipped it would work for exactly one
     // token lifetime and then 401 forever.
-    if let Some(expiry) = app.spotify_token_expiry {
-      if auth::should_refresh_token_at(expiry, SystemTime::now()) && !app.auth_refresh_in_progress {
-        app.auth_refresh_in_progress = true;
-        app.dispatch(IoEvent::RefreshAuthentication);
-      }
+    if app.auth_state.needs_refresh(SystemTime::now()) {
+      app.auth_state.refresh_in_progress = true;
+      // Legacy mirror (deleted with App in ticket 11).
+      app.auth_refresh_in_progress = true;
+      app.dispatch(IoEvent::RefreshAuthentication);
     }
 
     app.update_on_tick(elapsed);
