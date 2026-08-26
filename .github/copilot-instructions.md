@@ -9,8 +9,8 @@ This file is maintained as three near-identical copies: `CLAUDE.md`, `AGENTS.md`
 # Full build (native streaming + audio viz + Lua scripting + OS integrations)
 cargo run
 
-# Slim build - no librespot/audio/scripting; fastest iteration, one of CI's six legs
-cargo run --no-default-features --features telemetry,tui
+# Slim build - no librespot/audio/scripting; fastest iteration, one of CI's legs
+cargo run --no-default-features --features telemetry
 
 # With the free alternative sources (Local/Subsonic/Radio/YouTube). These are NOT
 # in `default`, so a plain `cargo run` is Spotify-only; use the `all-sources` alias
@@ -22,22 +22,25 @@ cargo run --features all-sources
 
 ```bash
 cargo fmt --all
-cargo clippy --no-default-features --features telemetry,tui -- -D warnings
-cargo test --no-default-features --features telemetry,tui
+cargo clippy --no-default-features --features telemetry -- -D warnings
+cargo test --no-default-features --features telemetry
 ```
 
 These slim commands are the *fast local gate*, not the full picture. GitHub Actions
 (`.github/workflows/ci.yml`, on `ubuntu-latest`) runs `check`, `test`, and `clippy`
-across a **six-leg** feature matrix:
+across a feature matrix:
 
 | Leg | Features |
 |-----|----------|
 | `default` | a plain `cargo test`: streaming + audio-viz-cpal + scripting + self-update + OS integrations |
 | `all-sources` | the **Linux** release feature set from `cd.yml` (adds cover-art, mcp-server, ai-dj, audio-viz, all four sources) |
-| `mcp-only` | `telemetry,tui,mcp-server` |
-| `ai-dj-only` | `telemetry,tui,ai-dj` |
-| `slim` | `telemetry,tui` |
-| `headless` | `telemetry` - the only leg without `tui`. `mod tui` is feature-gated, so this leg turns any `crate::tui` import from core/infra/cli into a compile error - what keeps a second frontend from silently re-coupling to the terminal one |
+| `mcp-only` | `telemetry,mcp-server` |
+| `ai-dj-only` | `telemetry,ai-dj` |
+| `slim` | `telemetry` |
+
+> The terminal UI was deleted in ticket 01 of ADR 0016 (`morph/delete-terminal-ui`);
+> this product is a GPUI-windowed music player embedding the core as its playback
+> engine. The former headless-vs-tui leg distinction is gone with it.
 
 - `mcp-only` and `ai-dj-only` matter more than their size suggests: both enable
   `dj-core` **without** `streaming` (a combination nothing else covers), and each
@@ -57,17 +60,16 @@ across a **six-leg** feature matrix:
   (macOS releases ship a smaller set - no decoded sources).
 - A pull_request-only `Gates ratchet` job diffs `tools/gates.count` against the
   merge-base (`tools/check_gates_ratchet.sh`): coupling counters may only fall;
-  the two adoption counters (`test_attribute_total`,
-  `action_refs_in_tui_handlers`) may only rise. `src/gates.rs` pins every value
-  exactly, so move the baseline in the same PR that moves the number, in the
-  ratchet's direction only.
+  the adoption counter (`test_attribute_total`) may only rise. `src/gates.rs`
+  pins every value exactly, so move the baseline in the same PR that moves the
+  number, in the ratchet's direction only.
 
 ## Run a Single Test
 
 ```bash
-cargo test --no-default-features --features telemetry,tui <test_name>
+cargo test --no-default-features --features telemetry <test_name>
 # Example:
-cargo test --no-default-features --features telemetry,tui global_shift_w_adds_current_track_from_anywhere
+cargo test --no-default-features --features telemetry global_shift_w_adds_current_track_from_anywhere
 ```
 
 A filter that matches nothing still exits 0 - when running feature-gated tests in
@@ -85,32 +87,26 @@ units under `src/`:
 |------|------|
 | `core/` | Centralized state (`App`), the frontend-neutral tick scheduler (`driver/`), the shared action vocabulary (`action/`), config/state persistence, and the rspotify-free domain types (`plugin_api`, `pagination`, `source`) |
 | `infra/` | Spotify Web API (`network/`), native librespot streaming (`player/`), alternative sources (`local/`, `subsonic/`, `radio/`, `youtube/`, `queue/`), audio viz (`audio/`), Lua scripting (`scripting/`), AI DJ + MCP (`dj/`, `mcp/`), OS integrations (Discord RPC, MPRIS, macOS/Windows media) |
-| `tui/` | Terminal UI: the event/render loop (`runner.rs`), key plumbing (`event/`), per-block input handlers (`handlers/`), immutable draw fns (`ui/`) |
 | `cli/` | clap subcommands: playback control, listening history, self-update, MCP relay, plugin management |
-| `runtime/` | `mod.rs::run_cli` (entry point + CLI dispatch), `bootstrap.rs::boot` (frontend-neutral config/auth/`App` construction, `run_cli` its sole caller), `cli.rs` (clap assembly + self-update), `pump.rs::start_tokio` (the IoEvent pump), `startup.rs` (the UI-launch half, gated on `tui`) |
+| `runtime/` | `mod.rs::run_cli` (entry point + CLI dispatch), `bootstrap.rs::boot` (frontend-neutral config/auth/`App` construction, `run_cli` its sole caller), `cli.rs` (clap assembly + self-update), `pump.rs::start_tokio` (the IoEvent pump), `startup.rs` (shared service startup), `frontend/` (the embedded runtime seam) |
 
 ### Data flow
 
 ```text
-crossterm thread (tui/event/) → runner.rs loop (draws the frame, then reads one event)
-  → runner::dispatch_key   - exit prompt, ActiveBlock::Input, the configurable back key
-  → handlers::handle_app   - plugin popup modal → help filter → global keybindings
-  → handle_block_events    - dispatches to the per-screen handler
+frontend (runtime/frontend/) — the windowed GPUI app applies Actions and subscribes
+  to snapshots; the embedded tick loop drives driver::Driver
+  → app.apply(Action)      - shared action vocabulary (see core/action/)
   → app.dispatch(IoEvent)  - hands async work to the pump in runtime/pump.rs
        → source routers by URI scheme, then infra/network/ (Spotify)
-       → mutates App state; tui/ui/ re-renders from App on the next frame
+       → mutates App state; change_notify bells → snapshot publisher → watch channel
 ```
 
-`tui/event/` is only the crossterm→`Key` plumbing; the event loop itself is
-`tui/runner.rs::start_ui`. Everything on a timer lives in `core/driver/`
-(`Driver::tick`): the playback tick + debounced flushes, OAuth refresh,
-Discord/MPRIS presence sync, the window title, lyrics + cover-art scheduling,
-native-queue and decoded-source auto-advance, and `last_session.yml`
-persistence. The runner draws frames, reads events, and calls `driver.tick`
-with a `TickEnv` carrying the frontend-geometry inputs (visualizer bar count,
-cover-art pixel support). A frontend that stops ticking is loud, not silent:
-`App::playback_position_ms()` reads stale after 2s and the playbar says so.
-Mouse input enters via `handlers::mouse_handler`.
+Everything on a timer lives in `core/driver/` (`Driver::tick`): the playback tick +
+debounced flushes, OAuth refresh, Discord/MPRIS presence sync, native-queue and
+decoded-source auto-advance, and `last_session.yml` persistence. The terminal
+runner that used to drive all of this from crossterm keystrokes was deleted in
+ticket 01 of ADR 0016; the windowed `runtime/frontend/` drives the driver on its
+own tick, which stages 2–5 of ADR 0016 replace with an event spine.
 
 ### The IoEvent pump: source routing, two lanes, an auth gate
 
@@ -167,12 +163,12 @@ Rules when working in here:
 - New `impl App` methods go to the concern module that owns that state, not `mod.rs`.
 - **Presentation state lives in `App.view: ViewState`** (`core/app/view.rs`): cursor
   and selection indices, scroll offsets, edit buffers, focus, popup flags, the help
-  pager, the terminal viewport. Handlers and draw functions write `app.view.<field>`
-  freely and the handler-write ratchet skips those chains. A producer outside `tui/`
-  and `core/app/` (a network or source handler, a script effect, the CLI) that
-  resets or clamps a cursor is counted by `view_writes_outside_tui`, which may only
-  fall. A new field goes in `view` only if it is presentation state; a pending
-  operation, or anything a second frontend would also need, stays on `App`.
+  pager, the terminal viewport. A producer outside `core/app/` (a network or source
+  handler, a script effect, the CLI) that resets or clamps a cursor is a coupling
+  smell the deleted ratchet used to count; with the TUI gone this surface is due for
+  wholesale removal in ticket 02 of ADR 0016. A new field goes in `view` only if it
+  is presentation state; a pending operation, or anything a second frontend would
+  also need, stays on `App`.
 - `dispatch` pins the global loading spinner; long work with its own progress
   surface uses `dispatch_without_spinner`.
 
@@ -384,24 +380,22 @@ never config:
 
 ### Feature flags
 
-- `default` = `telemetry, tui, streaming, audio-viz-cpal, macos-media,
+- `default` = `telemetry, streaming, audio-viz-cpal, macos-media,
   windows-media, mpris, discord-rpc, self-update, scripting`. Notably **not**
   in default: `cover-art` (so a plain `cargo run` has no album art, though
   every shipped binary enables it), the four sources, and the DJ features.
-- `tui` gates `mod tui` and owns the terminal-only crates (ratatui, crossterm,
-  tui-bar-graph, colorgrad - the last also pulled by `art-decode` for the
-  adaptive-theme HSV math). `gui` is a reserved placeholder that only gates the
-  `spotatui-gui` bin shim.
+- The terminal frontend's `tui` feature and its crates (ratatui, crossterm,
+  tui-bar-graph) were deleted in ADR 0016 ticket 01. `gui` remains a reserved
+  placeholder that only gates the `spotatui-gui` bin shim.
 - Cover art is two features: `art-decode` is the frontend-agnostic decode half
   (`dep:image`, fills `core::art::CoverArtStore`, feeds the adaptive theme;
-  never enabled by hand); `cover-art` layers the ratatui-image terminal
-  rendering on top and keeps its pre-split meaning for users and CI.
+  never enabled by hand); `cover-art` now adds only the ratatui-image-free
+  rendering plumbing and keeps its historical name for users and CI.
 - `audio-viz` (PipeWire, Linux-only) and `audio-viz-cpal` are **visualizer
   capture** backends, not playback. The librespot *playback* backend is chosen by
   `[target.'cfg(...)']` dependency blocks in Cargo.toml, not by the `*-backend`
   features: linux-gnu→alsa, linux-musl→rodio, Windows→rodio, macOS→portaudio -
-  the non-default picks avoid librespot's `pipe` sink writing raw audio to stdout
-  and destroying the TUI.
+  the non-default picks avoid librespot's `pipe` sink writing raw audio to stdout.
 - `audio-decode` (rodio) is the shared engine pulled in by the sources;
   `all-sources` = `local-files, subsonic, internet-radio, youtube`.
 - `dj-core` is a shared implementation feature pulled in by `mcp-server` and

@@ -4,7 +4,7 @@
 use crate::infra::network::{IoEvent, Network};
 
 // CLI mode never starts the pump; only a frontend launch does.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+#[allow(dead_code)] // TEMPORARY (ticket 01): the windowed frontend still drives this pump.
 pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Network) {
   // Bridge the sync dispatch channel onto the async runtime: a dedicated
   // thread does blocking recv() and forwards into a tokio channel the pump can

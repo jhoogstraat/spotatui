@@ -127,8 +127,6 @@ pub(super) fn install_panic_hook() {
       return;
     }
 
-    #[cfg(feature = "tui")]
-    ratatui::restore();
     let panic_log_path =
       crate::core::paths::app_state_dir().map(|dir| dir.join("spotatui_panic.log"));
 
@@ -346,7 +344,7 @@ pub(super) struct Boot {
   /// Consumed by the IoEvent pump. CLI mode holds it (unread) for the length
   /// of the command so an `App::dispatch` during CLI handling is silently
   /// queued rather than logged as a send error.
-  #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(super) sync_io_rx: std::sync::mpsc::Receiver<IoEvent>,
   pub(super) user_config: UserConfig,
   pub(super) client_config: ClientConfig,
@@ -355,15 +353,15 @@ pub(super) struct Boot {
   /// Read after boot only by the deferred native-streaming startup.
   #[cfg_attr(not(feature = "streaming"), allow(dead_code))]
   pub(super) runtime_state: RuntimeState,
-  #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+  #[allow(dead_code)] // TEMPORARY (ticket 01): read by the deleted TUI runner; ticket 02 re-homes.
   pub(super) restore_playback: Option<crate::core::persisted_playback::PersistedPlayback>,
-  #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(super) restore_queue: Vec<crate::core::plugin_api::TrackInfo>,
-  #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(super) initial_shuffle_enabled: bool,
-  #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(super) initial_startup_behavior: StartupBehavior,
-  #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(super) client_id_notice_message: Option<String>,
   /// Read after boot only by the streaming credential flow.
   #[cfg_attr(not(feature = "streaming"), allow(dead_code))]

@@ -134,10 +134,12 @@ pub enum VisualizerStyle {
 }
 
 impl VisualizerStyle {
+  #[allow(dead_code)] // TEMPORARY (ticket 01): settings-screen UI was TUI-only.
   pub fn all() -> &'static [VisualizerStyle] {
     &[VisualizerStyle::Cava, VisualizerStyle::BarGraph]
   }
 
+  #[allow(dead_code)] // TEMPORARY (ticket 01): settings-screen UI was TUI-only.
   pub fn name(&self) -> &'static str {
     match self {
       VisualizerStyle::Cava => "Cava",
@@ -145,6 +147,7 @@ impl VisualizerStyle {
     }
   }
 
+  #[allow(dead_code)]
   pub fn next(&self) -> Self {
     let styles = Self::all();
     let current_idx = styles.iter().position(|s| s == self).unwrap_or(0);
@@ -298,6 +301,7 @@ fn check_reserved_keys(key: Key) -> Result<()> {
 }
 
 /// Public version of check_reserved_keys for use in handlers
+#[allow(dead_code)] // TEMPORARY (ticket 01): handler consumers were TUI-only.
 pub fn check_reserved_keys_public(key: Key) -> Result<()> {
   check_reserved_keys(key)
 }
@@ -2278,6 +2282,7 @@ impl UserConfig {
 
     Ok(())
   }
+  #[allow(dead_code)] // TEMPORARY (ticket 01): track-table icons were TUI-only.
   pub fn padded_liked_icon(&self) -> String {
     format!("{} ", self.behavior.liked_icon)
   }
@@ -2285,6 +2290,7 @@ impl UserConfig {
   /// The configured `playing_icon` followed by a single trailing space, for
   /// prepending to the title cell of the currently-playing row. Width-2
   /// (the icon is validated to one column at load time).
+  #[allow(dead_code)]
   pub fn padded_playing_icon(&self) -> String {
     format!("{} ", self.behavior.playing_icon)
   }

@@ -600,11 +600,11 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
 }
 
 /// What a running set of shared services hands to the frontend that started
-/// them. Every frontend consumes the same handles; the terminal runner and
-/// the windowed `frontend` module each drive their own loop on top.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+/// them. Every frontend consumes the same handles; the windowed `frontend`
+/// module drives its own loop on top.
 pub(super) struct Services {
   pub app: Arc<Mutex<App>>,
+  #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub user_config: UserConfig,
   /// Real-time position updates from the native player event handler;
   /// `None` in builds where nothing produces one.
@@ -616,6 +616,7 @@ pub(super) struct Services {
   #[cfg(not(all(feature = "mpris", target_os = "linux")))]
   #[allow(dead_code)]
   pub mpris_for_ui: MprisHandle,
+  #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub discord_rpc_manager: DiscordRpcHandle,
   pub history_collector: crate::infra::history::HistoryCollectorHandle,
 }
@@ -1110,37 +1111,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     discord_rpc_manager,
     history_collector,
   })
-}
-
-/// Launch the terminal UI: shared service startup, then the blocking
-/// terminal event loop.
-#[cfg(feature = "tui")]
-pub(super) async fn launch_ui(boot: Boot) -> Result<()> {
-  let services = start_services(boot).await?;
-  // The UI must run in the "main" thread
-  info!("starting terminal ui event loop");
-  let ui_result = crate::tui::runner::start_ui(
-    services.user_config,
-    &services.app,
-    services.shared_position_for_ui,
-    services.mpris_for_ui,
-    services.discord_rpc_manager,
-    services.history_collector,
-  )
-  .await;
-  // Unpublish the control file on the way out, whether the UI exited cleanly
-  // or not: leaving it behind sends the next `spotatui mcp` at a port nothing
-  // is listening on, which reads as a broken MCP server rather than an absent
-  // one.
-  #[cfg(feature = "mcp-server")]
-  crate::infra::mcp::clear_handshake();
-  if ui_result.is_err() {
-    let mut app = services.app.lock().await;
-    app.flush_state_save(true);
-  }
-  ui_result?;
-
-  Ok(())
 }
 
 /// Pause native playback on the way out so the Connect device does not keep

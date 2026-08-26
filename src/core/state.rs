@@ -158,6 +158,7 @@ impl RuntimeState {
     Ok(Some(self.radio_stations.remove(index)))
   }
 
+  #[allow(dead_code)] // TEMPORARY (ticket 01): announcement UI was TUI-only; ticket 02 decides.
   pub fn mark_announcement_seen(&mut self, announcement_id: impl Into<String>) {
     let id = announcement_id.into();
     if id.is_empty() {
@@ -225,6 +226,7 @@ impl PersistedRuntimeState {
     }
   }
 
+  #[allow(dead_code)] // TEMPORARY (ticket 01): TUI-only persisted-state builders; ticket 02 decides.
   pub fn announcements(
     seen_announcement_ids: &[String],
     dismissed_announcements: &[String],
@@ -236,6 +238,7 @@ impl PersistedRuntimeState {
     }
   }
 
+  #[allow(dead_code)]
   pub fn sidebar_width_percent(sidebar_width_percent: u8) -> Self {
     Self {
       sidebar_width_percent: Some(sidebar_width_percent.min(100)),
@@ -243,6 +246,7 @@ impl PersistedRuntimeState {
     }
   }
 
+  #[allow(dead_code)]
   pub fn playbar_height_rows(playbar_height_rows: u16) -> Self {
     Self {
       playbar_height_rows: Some(playbar_height_rows.min(MAX_PLAYBAR_ROWS)),
@@ -250,6 +254,7 @@ impl PersistedRuntimeState {
     }
   }
 
+  #[allow(dead_code)]
   pub fn library_height_percent(library_height_percent: u8) -> Self {
     Self {
       library_height_percent: Some(library_height_percent.min(100)),
@@ -257,6 +262,7 @@ impl PersistedRuntimeState {
     }
   }
 
+  #[allow(dead_code)]
   pub fn layout(
     sidebar_width_percent: u8,
     playbar_height_rows: u16,

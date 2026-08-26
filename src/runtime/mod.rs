@@ -2,8 +2,8 @@
 //!
 //! `run_cli()` is the console entry point: it wires logging, parses the
 //! command line, runs the shared `bootstrap::boot()` sequence (config, state,
-//! auth, `App`), and then either executes one CLI subcommand or launches the
-//! terminal UI. The IoEvent pump every frontend drives lives in `pump`.
+//! auth, `App`), and then executes one CLI subcommand. The IoEvent pump lives
+//! in `pump`; the windowed frontend embeds via `frontend`.
 
 mod bootstrap;
 mod cli;
@@ -19,16 +19,14 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Console implementation of the first-launch surface for builds without the
-/// terminal frontend. CLI subcommands can still reach the Spotify auth wizard
-/// (`ClientConfig::load_config`), whose prompts are plain stdin/stdout;
-/// mirrors `ConsoleOnboarding` minus the interactive source picker, which is
-/// unreachable here (the picker only runs on a UI launch, and headless builds
-/// bail out before boot in that case).
-#[cfg(not(feature = "tui"))]
+/// Console implementation of the first-launch surface. CLI subcommands can
+/// still reach the Spotify auth wizard (`ClientConfig::load_config`), whose
+/// prompts are plain stdin/stdout; mirrors the historical `ConsoleOnboarding`
+/// minus the interactive source picker, which is unreachable here (the picker
+/// only runs on a UI launch, and this build bails out before boot in that
+/// case).
 struct HeadlessOnboarding;
 
-#[cfg(not(feature = "tui"))]
 impl crate::core::onboarding::Onboarding for HeadlessOnboarding {
   fn info(&self, text: &str) {
     println!("{text}");
@@ -124,22 +122,12 @@ pub async fn run_cli() -> Result<()> {
     return Ok(());
   }
 
-  // Without the terminal frontend there is no interactive UI to launch; only
-  // the CLI subcommands work. Bail before any first-run prompt would fire.
-  #[cfg(not(feature = "tui"))]
+  // Without any UI, a bare invocation has nothing to launch; only the CLI
+  // subcommands work. Bail before any first-run prompt would fire.
   if matches.subcommand_name().is_none() {
-    return Err(anyhow!(
-      "this spotatui build has no terminal UI (compiled without the `tui` feature); run a CLI subcommand instead"
-    ));
+    return Err(anyhow!("no UI in this build; run a CLI subcommand instead"));
   }
 
-  // The console implementation of the first-launch surface; core and infra
-  // only ever see the `Onboarding` trait. `Arc` so the blocking streaming
-  // credential task in the UI launch can hold its own handle.
-  #[cfg(feature = "tui")]
-  let onboarding: Arc<dyn crate::core::onboarding::Onboarding> =
-    Arc::new(crate::tui::onboarding::ConsoleOnboarding);
-  #[cfg(not(feature = "tui"))]
   let onboarding: Arc<dyn crate::core::onboarding::Onboarding> = Arc::new(HeadlessOnboarding);
 
   let boot = bootstrap::boot(
@@ -183,12 +171,6 @@ pub async fn run_cli() -> Result<()> {
     // Safe, because we checked if the subcommand is present at runtime
     let m = matches.subcommand_matches(cmd).unwrap();
     cli::run_subcommand(boot, cmd, m).await?;
-  // Launch the UI (async)
-  } else {
-    #[cfg(feature = "tui")]
-    startup::launch_ui(boot).await?;
-    #[cfg(not(feature = "tui"))]
-    unreachable!("headless builds reject a UI launch before boot");
   }
 
   Ok(())
