@@ -5,6 +5,7 @@
 //! state so `core/` carries no terminal-toolkit types.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)] // TEMPORARY (ticket 02): consumed only by the deleted ViewState.
 pub struct Viewport {
   pub width: u16,
   pub height: u16,

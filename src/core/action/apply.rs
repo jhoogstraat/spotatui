@@ -174,7 +174,6 @@ impl App {
       Action::JumpToArtist => self.jump_to_artist_album(),
       Action::JumpToContext => self.jump_to_context(),
       Action::GenerateRecap => self.generate_recap(),
-      Action::RecommendFromTrack(track) => self.load_recommendations_for_track(track),
       Action::SetPlaybarSegment { plugin, text } => match text {
         Some(t) => {
           self.plugin_playbar_segments.insert(plugin, t);

@@ -58,9 +58,6 @@ impl App {
   pub fn update_on_tick(&mut self, elapsed: Duration) {
     self.last_tick_at = Instant::now();
 
-    // Increment global animation tick (wraps after ~9.4 quintillion ticks, effectively never)
-    self.view.animation_tick = self.view.animation_tick.wrapping_add(1);
-
     // Advance an adaptive-theme fade. Real elapsed time, not tick count, so
     // the fade speed is independent of the configured tick rates.
     #[cfg(feature = "art-decode")]
@@ -77,25 +74,6 @@ impl App {
       }
     }
 
-    // Periodic party sync: host broadcasts state about every 2 seconds.
-    // Keep this before early-return paths so sync still happens during native-streaming fast paths.
-    if self.party_status == PartyStatus::Hosting
-      && self.last_party_sync_at.elapsed() >= Duration::from_secs(2)
-    {
-      self.last_party_sync_at = Instant::now();
-      self.dispatch(IoEvent::SyncPlayback);
-    }
-
-    // Periodic friends refresh: re-fetch when the Friends screen is active, every 30 seconds.
-    if self.get_current_route().id == RouteId::Friends
-      && self.last_friends_refresh_at.elapsed() >= Duration::from_secs(30)
-      && !self.friends_loading
-      && self.user_config.behavior.sync_token.is_some()
-    {
-      self.last_friends_refresh_at = Instant::now();
-      self.dispatch(IoEvent::GetFriends);
-    }
-
     if let Some(expires_at) = self.status_message_expires_at {
       if Instant::now() >= expires_at {
         self.status_message = None;
@@ -107,16 +85,6 @@ impl App {
     // Must stay above the early returns further down this fn, or the backstop
     // would silently stop running during playback.
     self.expire_api_error();
-
-    if let Some(frame) = self.view.liked_song_animation_frame {
-      if frame > 0 {
-        self.view.liked_song_animation_frame = Some(frame - 1);
-      } else {
-        self.view.liked_song_animation_frame = None;
-      }
-    }
-
-    self.advance_lyrics_scroll(elapsed);
 
     // Load watchdog: a native load that produces no Playing/TrackChanged
     // event within the window means the session is a zombie (passes

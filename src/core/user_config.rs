@@ -45,6 +45,7 @@ pub fn validate_tick_rate_milliseconds(value: u64, label: &str) -> Result<u64> {
   }
 }
 
+#[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted settings screen.
 pub fn normalize_tick_rate_milliseconds(value: i64) -> u64 {
   value.clamp(1, MAX_TICK_RATE_MILLISECONDS as i64) as u64
 }
@@ -186,6 +187,7 @@ impl StartupBehavior {
     &["Continue", "Play", "Pause"]
   }
 
+  #[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted settings screen.
   pub fn from_name(name: &str) -> Self {
     match name {
       "Play" => StartupBehavior::Play,
@@ -272,6 +274,7 @@ fn parse_key(key: String) -> Result<Key> {
 }
 
 /// Public version of parse_key for use in app.rs
+#[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted keybinding UI.
 pub fn parse_key_public(key: String) -> Result<Key> {
   parse_key(key)
 }

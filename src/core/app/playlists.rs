@@ -47,14 +47,9 @@ impl App {
   pub fn clear_playlist_track_dialog_state(&mut self) {
     self.pending_playlist_track_add = None;
     self.pending_playlist_track_removal = None;
-    self.view.playlist_picker_selected_index = 0;
-    self.view.playlist_picker_folder_id = 0;
   }
 
   pub fn clear_dialog_state(&mut self) {
-    self.view.dialog = None;
-    self.view.confirm = false;
-    self.pending_keybinding_persist = None;
     self.clear_playlist_track_dialog_state();
   }
 
@@ -101,18 +96,12 @@ impl App {
       .playlist_folder_items
       .iter()
       .filter_map(|item| match item {
-        PlaylistFolderItem::Folder(f) if f.current_id == self.view.playlist_picker_folder_id => {
-          Some(PlaylistPickerRow::Folder(f))
-        }
-        PlaylistFolderItem::Playlist { index, current_id }
-          if *current_id == self.view.playlist_picker_folder_id =>
-        {
-          self
-            .all_playlists
-            .get(*index)
-            .filter(|playlist| self.playlist_is_editable(playlist))
-            .map(PlaylistPickerRow::Playlist)
-        }
+        PlaylistFolderItem::Folder(f) if f.current_id == 0 => Some(PlaylistPickerRow::Folder(f)),
+        PlaylistFolderItem::Playlist { index, current_id } if *current_id == 0 => self
+          .all_playlists
+          .get(*index)
+          .filter(|playlist| self.playlist_is_editable(playlist))
+          .map(PlaylistPickerRow::Playlist),
         _ => None,
       })
       .collect();
@@ -345,11 +334,10 @@ impl App {
 
   pub fn user_unfollow_playlist(&mut self) {
     info!("unfollowing playlist");
-    if let (Some(selected_index), Some(user)) = (self.view.selected_playlist_index, &self.user) {
-      // Row 0 is the "+ Add Playlist" entry; display items start at row 1.
-      if let Some(PlaylistFolderItem::Playlist { index, .. }) = selected_index
-        .checked_sub(1)
-        .and_then(|i| self.get_playlist_display_item_at(i))
+    if let Some(user) = &self.user {
+      // The sidebar cursor was TUI presentation state; until the window passes
+      // an explicit selection, offer the first display item.
+      if let Some(PlaylistFolderItem::Playlist { index, .. }) = self.get_playlist_display_item_at(0)
       {
         // Pass the stored string ids straight through to the IoEvent.
         let ids = self.all_playlists.get(*index).and_then(|playlist| {

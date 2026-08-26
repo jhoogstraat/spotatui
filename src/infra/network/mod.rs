@@ -1,6 +1,5 @@
 #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
 pub mod dj;
-pub mod friends;
 pub mod ids;
 pub mod library;
 pub mod mapping;
@@ -179,9 +178,7 @@ pub enum IoEvent {
   FetchAnnouncements,
   GetLyrics(String, Vec<String>, f64),
   /// Get user's top tracks for Discover feature (with time range)
-  GetUserTopTracks(crate::core::app::DiscoverTimeRange),
   /// Get Top Artists Mix - fetches top artists and their top tracks
-  GetTopArtistsMix,
   /// Fetch all playlist tracks and apply sorting
   FetchAllPlaylistTracksAndSort(String),
   /// Start hosting a listening party
@@ -205,17 +202,11 @@ pub enum IoEvent {
   /// Create a new playlist: playlist name, track ids/URIs.
   CreateNewPlaylist(String, Vec<String>),
   /// Fetch the current user's own friend code from spotatui.com
-  GetFriendCode,
   /// Fetch the current user's friends list from spotatui.com
-  GetFriends,
   /// Add a friend by their 6-character friend code
-  AddFriendByCode(String),
   /// Add a friend by their spotatui.com user ID
-  AddFriendByUserId(String),
   /// Unfollow a friend by their spotatui.com user ID
-  UnfollowFriend(String),
   /// Search spotatui.com users by display name or friend code
-  SearchFriendUsers(String),
   /// Aggregate local listening history for the Stats screen
   LoadListeningStats(crate::infra::history::RecapPeriod),
   /// Export the shareable HTML recap and open it in the browser
@@ -486,12 +477,6 @@ impl Network {
         | IoEvent::FetchAnnouncements
         | IoEvent::GetLyrics(..)
         | IoEvent::UpdateSearchLimits(..)
-        | IoEvent::GetFriendCode
-        | IoEvent::GetFriends
-        | IoEvent::AddFriendByCode(_)
-        | IoEvent::AddFriendByUserId(_)
-        | IoEvent::UnfollowFriend(_)
-        | IoEvent::SearchFriendUsers(_)
         | IoEvent::LoadListeningStats(_)
         | IoEvent::GenerateRecap(_)
         | IoEvent::StartParty(_)
@@ -543,12 +528,6 @@ impl Network {
         | IoEvent::IncrementGlobalSongCount
         | IoEvent::FetchAnnouncements
         | IoEvent::GetLyrics(..)
-        | IoEvent::GetFriendCode
-        | IoEvent::GetFriends
-        | IoEvent::AddFriendByCode(_)
-        | IoEvent::AddFriendByUserId(_)
-        | IoEvent::UnfollowFriend(_)
-        | IoEvent::SearchFriendUsers(_)
         | IoEvent::LoadListeningStats(_)
         | IoEvent::GenerateRecap(_)
     )
@@ -904,12 +883,6 @@ impl Network {
       IoEvent::DjIndexLibrary => {
         self.dj_index_library().await;
       }
-      IoEvent::GetUserTopTracks(time_range) => {
-        self.get_user_top_tracks(time_range).await;
-      }
-      IoEvent::GetTopArtistsMix => {
-        self.get_top_artists_mix().await;
-      }
       IoEvent::FetchAllPlaylistTracksAndSort(playlist_id) => {
         if let Some(id) = ids::playlist_id(&playlist_id) {
           self.fetch_all_playlist_tracks_and_sort(id).await;
@@ -940,24 +913,6 @@ impl Network {
         self
           .create_new_playlist(name, ids::track_ids(&track_ids))
           .await;
-      }
-      IoEvent::GetFriendCode => {
-        friends::handle_get_friend_code(self).await;
-      }
-      IoEvent::GetFriends => {
-        friends::handle_get_friends(self).await;
-      }
-      IoEvent::AddFriendByCode(code) => {
-        friends::handle_add_friend_by_code(self, code).await;
-      }
-      IoEvent::AddFriendByUserId(user_id) => {
-        friends::handle_add_friend_by_user_id(self, user_id).await;
-      }
-      IoEvent::UnfollowFriend(user_id) => {
-        friends::handle_unfollow_friend(self, user_id).await;
-      }
-      IoEvent::SearchFriendUsers(query) => {
-        friends::handle_search_friend_users(self, query).await;
       }
       IoEvent::LoadListeningStats(period) => {
         self.load_listening_stats(period).await;
@@ -1703,12 +1658,6 @@ mod tests {
       IoEvent::IncrementGlobalSongCount,
       IoEvent::FetchAnnouncements,
       IoEvent::GetLyrics(String::new(), Vec::new(), 0.0),
-      IoEvent::GetFriendCode,
-      IoEvent::GetFriends,
-      IoEvent::AddFriendByCode(String::new()),
-      IoEvent::AddFriendByUserId(String::new()),
-      IoEvent::UnfollowFriend(String::new()),
-      IoEvent::SearchFriendUsers(String::new()),
       IoEvent::LoadListeningStats(RecapPeriod::SevenDays),
       IoEvent::GenerateRecap(RecapPeriod::SevenDays),
     ];

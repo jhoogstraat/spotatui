@@ -217,7 +217,6 @@ pub enum Action {
   /// Seed the track-radio recommendations flow from one track. The full
   /// snapshot rides along because the results table prepends it as the
   /// context row.
-  RecommendFromTrack(TrackInfo),
   /// Set or clear a playbar segment for a plugin (keyed by plugin name).
   SetPlaybarSegment {
     plugin: String,
@@ -356,7 +355,6 @@ pub enum OpenTarget {
 pub enum LibraryTarget {
   Discover,
   RecentlyPlayed,
-  Friends,
   Stats,
   LikedSongs,
   Albums,
@@ -371,10 +369,9 @@ pub enum LibraryTarget {
 impl LibraryTarget {
   /// Every target, in the stable subset order of `library_options()`
   /// (feature-gated rows are appended there and matched by name).
-  pub const ALL: [LibraryTarget; 10] = [
+  pub const ALL: [LibraryTarget; 9] = [
     LibraryTarget::Discover,
     LibraryTarget::RecentlyPlayed,
-    LibraryTarget::Friends,
     LibraryTarget::Stats,
     LibraryTarget::LikedSongs,
     LibraryTarget::Albums,
@@ -389,7 +386,6 @@ impl LibraryTarget {
     match self {
       LibraryTarget::Discover => "Discover",
       LibraryTarget::RecentlyPlayed => "Recently Played",
-      LibraryTarget::Friends => "Friends",
       LibraryTarget::Stats => "Stats",
       LibraryTarget::LikedSongs => "Liked Songs",
       LibraryTarget::Albums => "Albums",
