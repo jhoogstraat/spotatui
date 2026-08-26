@@ -134,9 +134,6 @@ pub async fn run_cli() -> Result<()> {
   let boot = bootstrap::boot(
     &bootstrap::BootOptions {
       config_path: matches.get_one::<String>("config").map(PathBuf::from),
-      tick_rate_milliseconds: matches
-        .get_one::<String>("tick-rate")
-        .and_then(|tick_rate| tick_rate.parse().ok()),
       reconfigure_auth: matches.get_flag("reconfigure-auth"),
       ui_launch: matches.subcommand_name().is_none(),
       cli_subcommand: matches.subcommand_name().is_some(),

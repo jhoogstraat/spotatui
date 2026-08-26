@@ -13,9 +13,7 @@ use crate::core::migrations::{
 };
 use crate::core::onboarding::Onboarding;
 use crate::core::state::{PersistedRuntimeState, RuntimeState};
-use crate::core::user_config::{
-  validate_tick_rate_milliseconds, BehaviorConfig, StartupBehavior, UserConfig, UserConfigPaths,
-};
+use crate::core::user_config::{BehaviorConfig, StartupBehavior, UserConfig, UserConfigPaths};
 use crate::infra::network::IoEvent;
 use anyhow::Result;
 use backtrace::Backtrace;
@@ -380,7 +378,6 @@ pub(super) struct BootOptions {
   pub config_path: Option<PathBuf>,
   /// Tick rate override in milliseconds (`--tick-rate`). Validated here so
   /// every consumer gets the same bounds.
-  pub tick_rate_milliseconds: Option<u64>,
   /// Re-run the client authentication wizard (`--reconfigure-auth`).
   pub reconfigure_auth: bool,
   /// The interactive terminal launch: enables the first-run source picker,
@@ -510,11 +507,6 @@ pub(super) async fn boot(options: &BootOptions, onboarding: Arc<dyn Onboarding>)
     Some(s) => (s.playback, s.queue),
     None => (None, Vec::new()),
   };
-
-  if let Some(tick_rate) = options.tick_rate_milliseconds {
-    user_config.behavior.tick_rate_milliseconds =
-      validate_tick_rate_milliseconds(tick_rate, "Tick rate")?;
-  }
 
   // Global song counter opt-in (interactive TUI only). Asked before the source
   // picker so the choice applies no matter which source(s) the user sets up.
