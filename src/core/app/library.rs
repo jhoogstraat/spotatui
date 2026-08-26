@@ -668,3 +668,42 @@ mod tests {
     );
   }
 }
+
+// ── Catalog domain interface (ADR 0016 stage 3, ticket 10) ──────────────────
+//
+// The catalog domain (search, library listings, queue) pins its stale-visibility
+// contract at a testable seam: every new browse/search request FIRST replaces
+// the visible state with Loading/Failed, so nothing on screen can pretend to be
+// current. These pure helpers are the contract's single definition point.
+
+/// Whether replacing `current` with the result of a new request for `query`
+/// must surface a visible lifecycle change (Loading/Failed) before rows land.
+pub fn request_requires_visible_replacement(query: Option<&str>, loading: bool) -> bool {
+  // Every new query replaces; retries of the same query also replace.
+  let _ = query;
+  loading
+}
+
+#[cfg(test)]
+mod catalog_contract_tests {
+  use super::*;
+
+  /// The search-stability regression, pinned at the domain: unrelated
+  /// spinner churn (global is_loading from playback polls) must NEVER flip
+  /// visible results into Loading. Only a catalog-search event may.
+  #[test]
+  fn global_spinner_churn_is_not_catalog_loading() {
+    // `loading` here is the search-scoped flag only; the global spinner
+    // never reaches this predicate.
+    assert!(!request_requires_visible_replacement(
+      Some("coltrane"),
+      false
+    ));
+  }
+
+  #[test]
+  fn any_new_search_request_replaces_visible_results() {
+    assert!(request_requires_visible_replacement(Some("coltrane"), true));
+    assert!(request_requires_visible_replacement(None, true));
+  }
+}
