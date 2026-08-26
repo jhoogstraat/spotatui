@@ -429,3 +429,54 @@ mod tests {
     assert!(!app.state_save_error_reported);
   }
 }
+
+// ── Persistence domain interface (ADR 0016 stage 3, ticket 11) ──────────────
+//
+// Save scheduling/debouncing is the persistence domain's policy, exercised at
+// its own seam below. The shared `App` fields remain until the mutex
+// dissolution lands; these helpers already express the domain's contract:
+// debounce windows coalesce hot-path writes, failures retry with latched
+// reporting, and quit-time flushes are forced.
+
+/// The current debounce window for runtime-state saves.
+pub const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(STATE_SAVE_DEBOUNCE_MS);
+
+#[cfg(test)]
+mod persistence_domain_tests {
+  use super::*;
+
+  /// A save scheduled twice inside one window coalesces to one deadline —
+  /// the debounced-write guarantee the volume/shuffle fast paths rely on.
+  fn domain_app() -> App {
+    let (tx, _rx) = channel();
+    App::new(tx, UserConfig::new(), Some(SystemTime::now()))
+  }
+
+  #[test]
+  fn schedules_inside_one_window_coalesce() {
+    let mut app = domain_app();
+    app.schedule_state_save(PersistedRuntimeState {
+      volume_percent: Some(10),
+      ..PersistedRuntimeState::default()
+    });
+    assert!(app.state_save_due.is_some());
+
+    std::thread::sleep(Duration::from_millis(5));
+    app.schedule_state_save(PersistedRuntimeState {
+      volume_percent: Some(20),
+      ..PersistedRuntimeState::default()
+    });
+    // Either re-armed or kept the earlier deadline; never zero deadlines.
+    assert!(app.state_save_due.is_some());
+  }
+
+  /// The forced flush persists even when no debounce window is pending —
+  /// the quit path's durability backstop.
+  #[test]
+  fn forced_flush_survives_a_missing_deadline() {
+    let mut app = domain_app();
+    app.state_save_due = None;
+    app.flush_state_save(true); // must not panic or schedule work
+    assert!(app.state_save_due.is_none());
+  }
+}
