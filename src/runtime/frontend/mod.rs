@@ -31,7 +31,7 @@ pub struct LibrarySnapshot {
 
 /// One published runtime state. Composed from the existing snapshot builders;
 /// equality-deduplicated before publication so a quiet tick publishes nothing.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
   /// Current playback state from `plugin_api::playback_state`.
   pub playback: Option<PlaybackState>,
@@ -39,6 +39,9 @@ pub struct Snapshot {
   pub library: LibrarySnapshot,
   /// Authoritative position at publish time (`None` while stale).
   pub position_ms: Option<u64>,
+  /// When this snapshot was folded from engine state; a frontend projects
+  /// position forward from `position_ms` using this timestamp.
+  pub as_of: std::time::Instant,
   /// The native queue's upcoming items, in order.
   pub queue_upcoming: Vec<TrackInfo>,
   /// Track rows of the latest catalog search.
@@ -447,9 +450,35 @@ async fn driver_loop(
   info!("frontend runtime shut down cleanly");
 }
 
+impl Default for Snapshot {
+  fn default() -> Self {
+    Snapshot {
+      playback: None,
+      library: LibrarySnapshot::default(),
+      position_ms: None,
+      as_of: Instant::now(),
+      queue_upcoming: Vec::new(),
+      search_tracks: Vec::new(),
+      search_loading: false,
+      spotify_connected: false,
+      notice: None,
+      notice_is_error: false,
+      #[cfg(feature = "streaming")]
+      audio_ready: false,
+      #[cfg(not(feature = "streaming"))]
+      audio_ready: false,
+      #[cfg(feature = "streaming")]
+      audio_pending: false,
+      #[cfg(not(feature = "streaming"))]
+      audio_pending: false,
+    }
+  }
+}
+
 fn build_snapshot(app: &App) -> Snapshot {
   let search = crate::core::plugin_api::search_results_snapshot(app);
   Snapshot {
+    as_of: Instant::now(),
     playback: crate::core::plugin_api::playback_state(app),
     library: LibrarySnapshot {
       liked_songs: (!app.library.saved_tracks.pages.is_empty())
