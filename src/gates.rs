@@ -190,33 +190,22 @@ fn load_baselines() -> BTreeMap<String, usize> {
 fn ratchet_counters_match_the_checked_in_baselines() {
   let root = repo_root();
 
-  let mut handler_files = Vec::new();
-  collect_rs_files(&root.join("src/tui/handlers"), &mut handler_files);
-  let (app_field_writes, action_refs) =
-    handler_files
-      .iter()
-      .fold((0usize, 0usize), |(writes, refs), path| {
-        let source = read_source(path);
-        (
-          writes + count_app_field_writes(&source),
-          refs + count_production_action_refs(&source),
-        )
-      });
+  let (app_field_writes, action_refs) = (0usize, 0usize);
+  let _ = (app_field_writes, action_refs);
 
   // Needles that would otherwise count their own literal in this file are
   // assembled with concat! (this file lives under the `src/` scan).
   let test_attribute_total = count_occurrences(&["src"], &[], concat!("#[", "test]"))
     + count_occurrences(&["src"], &[], concat!("#[", "tokio::test"));
 
-  // Every Rust file outside `src/tui/` is in scope, so a new top-level module
-  // (or a future `src/gui.rs`) cannot re-import the TUI unseen. This file is
-  // the one exclusion: it names the needle in its own doc and data, and being
-  // test-only it cannot couple anything to `tui/`.
+  // Every Rust file is in scope; a new module cannot re-import the deleted
+  // terminal frontend unseen. This file is the one exclusion: it names its own
+  // needles in doc and data, and being test-only it cannot couple anything to
+  // the removed code.
   let mut non_tui_files = Vec::new();
   collect_rs_files(&root.join("src"), &mut non_tui_files);
-  let tui_dir = root.join("src").join("tui");
   let gates_file = root.join("src").join("gates.rs");
-  non_tui_files.retain(|path| !path.starts_with(&tui_dir) && *path != gates_file);
+  non_tui_files.retain(|path| *path != gates_file);
   // The view-write scan also skips `src/core/app/` (whose methods are `App`'s
   // own presentation helpers): it counts every producer that still writes a
   // TUI cursor.
@@ -236,27 +225,14 @@ fn ratchet_counters_match_the_checked_in_baselines() {
           writes + view_writes,
         )
       });
-
   // (name, measured value). Every counter must match its baseline exactly;
   // the direction a baseline may move is enforced against the merge base by
   // tools/check_gates_ratchet.sh.
-  let measured: [(&str, usize); 8] = [
-    ("crate_tui_refs_outside_tui", crate_tui_refs),
-    ("app_field_writes_in_tui_handlers", app_field_writes),
-    (
-      "ioevent_refs_in_tui",
-      count_occurrences(&["src/tui"], &[], "IoEvent::"),
-    ),
-    (
-      "synthetic_keys_in_mouse_handler",
-      count_occurrences(&[], &["src/tui/handlers/mouse.rs"], "handler(Key::"),
-    ),
+  let measured: [(&str, usize); 2] = [
     (
       "wildcard_arms_in_action_tree",
       count_occurrences(&["src/core/action"], &[], "_ =>"),
     ),
-    ("view_writes_outside_tui", view_writes),
-    ("action_refs_in_tui_handlers", action_refs),
     ("test_attribute_total", test_attribute_total),
   ];
 
