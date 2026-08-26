@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use spotatui::frontend::{Action, ConsoleOnboarding, Options, Runtime};
+use spotatui::frontend::{ConsoleOnboarding, EngineAction, Options, Runtime};
 
 fn main() -> anyhow::Result<()> {
   let uri = std::env::args()
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
   println!("playing {uri}");
   println!(
     "apply(PlayUris) -> {:?}",
-    runtime.apply(Action::PlayUris {
+    runtime.apply(EngineAction::PlayUris {
       uris: vec![uri],
       offset: None,
     })
@@ -60,11 +60,11 @@ fn main() -> anyhow::Result<()> {
   std::thread::sleep(Duration::from_secs(20));
 
   println!("pausing");
-  println!("apply(Pause) -> {:?}", runtime.apply(Action::Pause));
+  println!("apply(Pause) -> {:?}", runtime.apply(EngineAction::Pause));
   std::thread::sleep(Duration::from_secs(3));
 
   println!("resuming");
-  println!("apply(Play) -> {:?}", runtime.apply(Action::Play));
+  println!("apply(Play) -> {:?}", runtime.apply(EngineAction::Play));
   std::thread::sleep(Duration::from_secs(5));
 
   println!("shutting down");

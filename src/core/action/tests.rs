@@ -10,7 +10,7 @@
 use std::sync::mpsc::{channel, Receiver};
 use std::time::SystemTime;
 
-use super::{Action, NavTarget, RepeatSetting};
+use super::{EngineAction, NavTarget, RepeatSetting};
 use crate::core::app::{App, RouteId, UserInfo};
 use crate::core::theme::{Color, Theme, ThemeField};
 use crate::core::user_config::UserConfig;
@@ -79,7 +79,7 @@ fn play_when_paused_dispatches_start_playback() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(false, false));
 
-  app.apply(Action::Play);
+  app.apply(EngineAction::Play);
 
   assert!(matches!(
     rx.try_recv(),
@@ -92,7 +92,7 @@ fn play_when_already_playing_is_a_noop() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(true, false));
 
-  app.apply(Action::Play);
+  app.apply(EngineAction::Play);
 
   assert!(rx.try_recv().is_err(), "expected no IoEvent dispatched");
 }
@@ -102,7 +102,7 @@ fn pause_when_playing_dispatches_pause_playback() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(true, false));
 
-  app.apply(Action::Pause);
+  app.apply(EngineAction::Pause);
 
   assert!(matches!(rx.try_recv(), Ok(IoEvent::PausePlayback)));
 }
@@ -112,7 +112,7 @@ fn pause_when_already_paused_is_a_noop() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(false, false));
 
-  app.apply(Action::Pause);
+  app.apply(EngineAction::Pause);
 
   assert!(rx.try_recv().is_err(), "expected no IoEvent dispatched");
 }
@@ -121,7 +121,7 @@ fn pause_when_already_paused_is_a_noop() {
 fn next_track_routes_through_the_transport_method() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::NextTrack);
+  app.apply(EngineAction::NextTrack);
 
   assert!(matches!(rx.try_recv(), Ok(IoEvent::NextTrack)));
 }
@@ -130,7 +130,7 @@ fn next_track_routes_through_the_transport_method() {
 fn previous_track_routes_through_the_transport_method() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::PreviousTrack);
+  app.apply(EngineAction::PreviousTrack);
 
   assert!(matches!(rx.try_recv(), Ok(IoEvent::PreviousTrack)));
 }
@@ -140,7 +140,7 @@ fn seek_to_with_a_track_context_dispatches_seek() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context_with_track(true));
 
-  app.apply(Action::SeekTo(30_000));
+  app.apply(EngineAction::SeekTo(30_000));
 
   match rx.try_recv() {
     Ok(IoEvent::Seek(ms)) => assert_eq!(ms, 30_000),
@@ -152,7 +152,7 @@ fn seek_to_with_a_track_context_dispatches_seek() {
 fn set_volume_sets_pending_volume() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::SetVolume(80));
+  app.apply(EngineAction::SetVolume(80));
 
   assert_eq!(app.pending_volume, Some(80));
 }
@@ -162,10 +162,10 @@ fn set_shuffle_dispatches_only_when_state_differs() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(false, false));
 
-  app.apply(Action::SetShuffle(true));
+  app.apply(EngineAction::SetShuffle(true));
   assert!(matches!(rx.try_recv(), Ok(IoEvent::Shuffle(true))));
 
-  app.apply(Action::SetShuffle(false));
+  app.apply(EngineAction::SetShuffle(false));
   assert!(rx.try_recv().is_err(), "same state must not dispatch");
 }
 
@@ -173,7 +173,7 @@ fn set_shuffle_dispatches_only_when_state_differs() {
 fn cycle_repeat_without_playback_context_is_a_noop() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::CycleRepeat);
+  app.apply(EngineAction::CycleRepeat);
 
   assert!(rx.try_recv().is_err(), "expected no IoEvent dispatched");
 }
@@ -187,7 +187,7 @@ fn set_repeat_dispatches_the_absolute_repeat_state() {
     (RepeatSetting::Context, RepeatState::Context),
   ] {
     let (mut app, rx) = app_with_channel();
-    app.apply(Action::SetRepeat(setting));
+    app.apply(EngineAction::SetRepeat(setting));
     match rx.try_recv() {
       Ok(IoEvent::Repeat(state)) => assert_eq!(state, expected),
       _other => panic!("expected Repeat (IoEvent is not Debug)"),
@@ -200,11 +200,11 @@ fn toggle_playback_pauses_when_playing_and_starts_when_paused() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(true, false));
 
-  app.apply(Action::TogglePlayback);
+  app.apply(EngineAction::TogglePlayback);
   assert!(matches!(rx.try_recv(), Ok(IoEvent::PausePlayback)));
 
   app.current_playback_context = Some(playback_context(false, false));
-  app.apply(Action::TogglePlayback);
+  app.apply(EngineAction::TogglePlayback);
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::StartPlayback(None, None, None))
@@ -216,7 +216,7 @@ fn force_previous_track_dispatches_the_force_event() {
   let (mut app, rx) = app_with_channel();
   app.song_progress_ms = 20_000;
 
-  app.apply(Action::ForcePreviousTrack);
+  app.apply(EngineAction::ForcePreviousTrack);
 
   assert!(matches!(rx.try_recv(), Ok(IoEvent::ForcePreviousTrack)));
   assert_eq!(app.song_progress_ms, 0, "a forced previous restarts at 0");
@@ -226,7 +226,10 @@ fn force_previous_track_dispatches_the_force_event() {
 fn seek_actions_move_by_the_configured_step() {
   // Start one step in, so forward lands at `2 * step + 1_000` and backward
   // lands at `1_000`.
-  for (action, forward) in [(Action::SeekForward, true), (Action::SeekBackward, false)] {
+  for (action, forward) in [
+    (EngineAction::SeekForward, true),
+    (EngineAction::SeekBackward, false),
+  ] {
     let (mut app, _rx) = app_with_channel();
     app.current_playback_context = Some(playback_context_with_track(true));
     let step = app.user_config.behavior.seek_milliseconds as u128;
@@ -241,7 +244,10 @@ fn seek_actions_move_by_the_configured_step() {
 
 #[test]
 fn volume_actions_dispatch_the_stepped_volume() {
-  for (action, up) in [(Action::VolumeUp, true), (Action::VolumeDown, false)] {
+  for (action, up) in [
+    (EngineAction::VolumeUp, true),
+    (EngineAction::VolumeDown, false),
+  ] {
     let (mut app, rx) = app_with_channel();
     app.current_playback_context = Some(playback_context(true, false));
 
@@ -261,7 +267,7 @@ fn toggle_shuffle_flips_the_spotify_shuffle_state() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context(true, false));
 
-  app.apply(Action::ToggleShuffle);
+  app.apply(EngineAction::ToggleShuffle);
 
   assert!(matches!(rx.try_recv(), Ok(IoEvent::Shuffle(true))));
 }
@@ -273,7 +279,7 @@ fn jump_to_album_opens_the_current_tracks_album() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context_with_track(false));
 
-  app.apply(Action::JumpToAlbum);
+  app.apply(EngineAction::JumpToAlbum);
 
   match rx.try_recv() {
     Ok(IoEvent::GetAlbumTracks(album)) => assert_eq!(album.name, "Test Album"),
@@ -285,7 +291,7 @@ fn jump_to_album_opens_the_current_tracks_album() {
 fn jump_to_album_without_playback_is_a_noop() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::JumpToAlbum);
+  app.apply(EngineAction::JumpToAlbum);
 
   assert!(rx.try_recv().is_err(), "expected no IoEvent dispatched");
 }
@@ -295,7 +301,7 @@ fn jump_to_artist_opens_the_first_artists_albums() {
   let (mut app, rx) = app_with_channel();
   app.current_playback_context = Some(playback_context_with_track(false));
 
-  app.apply(Action::JumpToArtist);
+  app.apply(EngineAction::JumpToArtist);
 
   match rx.try_recv() {
     Ok(IoEvent::GetArtist(id, name, _country)) => {
@@ -319,7 +325,7 @@ fn jump_to_context_opens_the_playlist_context() {
   });
   app.current_playback_context = Some(ctx);
 
-  app.apply(Action::JumpToContext);
+  app.apply(EngineAction::JumpToContext);
 
   assert_eq!(app.get_current_route().id, RouteId::TrackTable);
   match rx.try_recv() {
@@ -345,7 +351,7 @@ fn generate_recap_resolves_the_period_from_the_current_route() {
       app.push_navigation_stack(RouteId::Stats, ActiveBlock::Stats);
     }
 
-    app.apply(Action::GenerateRecap);
+    app.apply(EngineAction::GenerateRecap);
 
     match rx.try_recv() {
       Ok(IoEvent::GenerateRecap(period)) => assert_eq!(period, expected),
@@ -360,7 +366,7 @@ fn generate_recap_resolves_the_period_from_the_current_route() {
 fn play_uris_dispatches_a_uri_list_start() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::PlayUris {
+  app.apply(EngineAction::PlayUris {
     uris: vec!["spotify:track:abc".to_string()],
     offset: None,
   });
@@ -377,7 +383,7 @@ fn play_uris_dispatches_a_uri_list_start() {
 fn play_uris_carries_the_offset() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::PlayUris {
+  app.apply(EngineAction::PlayUris {
     uris: vec!["spotify:track:abc".to_string()],
     offset: Some(0),
   });
@@ -392,7 +398,7 @@ fn play_uris_carries_the_offset() {
 fn play_context_dispatches_a_context_start() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::PlayContext {
+  app.apply(EngineAction::PlayContext {
     uri: "spotify:playlist:p1".to_string(),
     offset: Some(5),
   });
@@ -410,7 +416,7 @@ fn play_context_dispatches_a_context_start() {
 fn transfer_playback_carries_device_and_persist() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::TransferPlayback {
+  app.apply(EngineAction::TransferPlayback {
     device_id: "dev-1".to_string(),
     persist: false,
   });
@@ -428,7 +434,7 @@ fn transfer_playback_carries_device_and_persist() {
 fn add_to_queue_dispatches_add_item() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::AddToQueue("spotify:track:t1".to_string()));
+  app.apply(EngineAction::AddToQueue("spotify:track:t1".to_string()));
 
   match rx.try_recv() {
     Ok(IoEvent::AddItemToQueue(uri)) => assert_eq!(uri, "spotify:track:t1"),
@@ -460,7 +466,10 @@ fn queue_track(uri: &str, name: &str) -> crate::core::plugin_api::TrackInfo {
 fn enqueue_native_pushes_onto_the_native_queue() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::EnqueueNative(queue_track("subsonic:track:a", "A")));
+  app.apply(EngineAction::EnqueueNative(queue_track(
+    "subsonic:track:a",
+    "A",
+  )));
 
   assert_eq!(app.native_queue.len(), 1);
   assert_eq!(app.native_queue[0].name, "A");
@@ -474,13 +483,13 @@ fn remove_native_queued_deletes_only_the_indexed_upcoming_item() {
     queue_track("subsonic:track:b", "B"),
   ];
 
-  app.apply(Action::RemoveNativeQueued(0));
+  app.apply(EngineAction::RemoveNativeQueued(0));
 
   assert_eq!(app.native_queue.len(), 1);
   assert_eq!(app.native_queue[0].name, "B");
 
   // Out of range is a no-op.
-  app.apply(Action::RemoveNativeQueued(9));
+  app.apply(EngineAction::RemoveNativeQueued(9));
   assert_eq!(app.native_queue.len(), 1);
 }
 
@@ -493,11 +502,11 @@ fn move_native_queued_swaps_with_the_neighbor() {
     queue_track("subsonic:track:c", "C"),
   ];
 
-  app.apply(Action::MoveNativeQueued { index: 1, up: true });
+  app.apply(EngineAction::MoveNativeQueued { index: 1, up: true });
   assert_eq!(app.native_queue[0].name, "B");
   assert_eq!(app.native_queue[1].name, "A");
 
-  app.apply(Action::MoveNativeQueued {
+  app.apply(EngineAction::MoveNativeQueued {
     index: 0,
     up: false,
   });
@@ -505,8 +514,8 @@ fn move_native_queued_swaps_with_the_neighbor() {
   assert_eq!(app.native_queue[1].name, "B");
 
   // Boundary indices are no-ops.
-  app.apply(Action::MoveNativeQueued { index: 0, up: true });
-  app.apply(Action::MoveNativeQueued {
+  app.apply(EngineAction::MoveNativeQueued { index: 0, up: true });
+  app.apply(EngineAction::MoveNativeQueued {
     index: 2,
     up: false,
   });
@@ -532,7 +541,7 @@ fn clear_native_queue_drops_only_upcoming_items() {
     });
   }
 
-  app.apply(Action::ClearNativeQueue);
+  app.apply(EngineAction::ClearNativeQueue);
 
   assert!(app.native_queue.is_empty());
   #[cfg(feature = "streaming")]
@@ -543,7 +552,7 @@ fn clear_native_queue_drops_only_upcoming_items() {
 fn begin_spotify_login_dispatches_begin() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::BeginSpotifyLogin);
+  app.apply(EngineAction::BeginSpotifyLogin);
 
   match rx.try_recv() {
     Ok(IoEvent::BeginSpotifyLogin) => {}
@@ -557,7 +566,7 @@ fn begin_spotify_login_dispatches_begin() {
 fn search_resolves_the_user_country_at_apply_time() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Search("daft punk".to_string()));
+  app.apply(EngineAction::Search("daft punk".to_string()));
 
   match rx.try_recv() {
     Ok(IoEvent::GetSearchResults(query, country)) => {
@@ -572,7 +581,7 @@ fn search_resolves_the_user_country_at_apply_time() {
 fn create_playlist_dispatches_create() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::CreatePlaylist {
+  app.apply(EngineAction::CreatePlaylist {
     name: "Mix".to_string(),
     track_uris: vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()],
   });
@@ -590,7 +599,7 @@ fn create_playlist_dispatches_create() {
 fn add_track_to_playlist_dispatches() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::AddTrackToPlaylist {
+  app.apply(EngineAction::AddTrackToPlaylist {
     playlist: "p1".to_string(),
     track: "t1".to_string(),
   });
@@ -608,7 +617,7 @@ fn add_track_to_playlist_dispatches() {
 fn remove_track_from_playlist_dispatches_with_position() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::RemoveTrackFromPlaylist {
+  app.apply(EngineAction::RemoveTrackFromPlaylist {
     playlist: "p1".to_string(),
     track: "t1".to_string(),
     position: 3,
@@ -628,7 +637,7 @@ fn remove_track_from_playlist_dispatches_with_position() {
 fn follow_playlist_uses_the_unknown_owner_fallback() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::FollowPlaylist("p1".to_string()));
+  app.apply(EngineAction::FollowPlaylist("p1".to_string()));
 
   match rx.try_recv() {
     Ok(IoEvent::UserFollowPlaylist(owner, playlist, public)) => {
@@ -649,7 +658,7 @@ fn unfollow_playlist_resolves_the_current_user() {
     country: None,
   });
 
-  app.apply(Action::UnfollowPlaylist("p1".to_string()));
+  app.apply(EngineAction::UnfollowPlaylist("p1".to_string()));
 
   match rx.try_recv() {
     Ok(IoEvent::UserUnfollowPlaylist(user_id, playlist_id)) => {
@@ -664,7 +673,7 @@ fn unfollow_playlist_resolves_the_current_user() {
 fn unfollow_playlist_without_a_user_sets_an_error_status() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::UnfollowPlaylist("p1".to_string()));
+  app.apply(EngineAction::UnfollowPlaylist("p1".to_string()));
 
   assert!(rx.try_recv().is_err(), "no IoEvent expected");
   assert!(app.status_message_is_error);
@@ -678,28 +687,30 @@ fn unfollow_playlist_without_a_user_sets_an_error_status() {
 fn save_and_follow_actions_dispatch_their_events() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::ToggleSaveTrack("spotify:track:t1".to_string()));
+  app.apply(EngineAction::ToggleSaveTrack(
+    "spotify:track:t1".to_string(),
+  ));
   assert!(matches!(rx.try_recv(), Ok(IoEvent::ToggleSaveTrack(_))));
 
-  app.apply(Action::SaveAlbum("a1".to_string()));
+  app.apply(EngineAction::SaveAlbum("a1".to_string()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::CurrentUserSavedAlbumAdd(_))
   ));
 
-  app.apply(Action::UnsaveAlbum("a1".to_string()));
+  app.apply(EngineAction::UnsaveAlbum("a1".to_string()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::CurrentUserSavedAlbumDelete(_))
   ));
 
-  app.apply(Action::SaveShow("s1".to_string()));
+  app.apply(EngineAction::SaveShow("s1".to_string()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::CurrentUserSavedShowAdd(_))
   ));
 
-  app.apply(Action::UnsaveShow("s1".to_string()));
+  app.apply(EngineAction::UnsaveShow("s1".to_string()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::CurrentUserSavedShowDelete(_))
@@ -710,13 +721,13 @@ fn save_and_follow_actions_dispatch_their_events() {
 fn follow_artist_wraps_the_id_in_a_batch_event() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::FollowArtist("ar1".to_string()));
+  app.apply(EngineAction::FollowArtist("ar1".to_string()));
   match rx.try_recv() {
     Ok(IoEvent::UserFollowArtists(ids)) => assert_eq!(ids, vec!["ar1".to_string()]),
     _other => panic!("expected UserFollowArtists (IoEvent is not Debug)"),
   }
 
-  app.apply(Action::UnfollowArtist("ar1".to_string()));
+  app.apply(EngineAction::UnfollowArtist("ar1".to_string()));
   match rx.try_recv() {
     Ok(IoEvent::UserUnfollowArtists(ids)) => assert_eq!(ids, vec!["ar1".to_string()]),
     _other => panic!("expected UserUnfollowArtists (IoEvent is not Debug)"),
@@ -729,7 +740,7 @@ fn follow_artist_wraps_the_id_in_a_batch_event() {
 fn notify_sets_a_status_message() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::Notify("hello".to_string(), 4));
+  app.apply(EngineAction::Notify("hello".to_string(), 4));
 
   assert_eq!(app.status_message.as_deref(), Some("hello"));
   assert!(!app.status_message_is_error);
@@ -739,8 +750,8 @@ fn notify_sets_a_status_message() {
 fn notify_error_blocks_a_following_notify() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::NotifyError("boom".to_string(), 6));
-  app.apply(Action::Notify("normal".to_string(), 4));
+  app.apply(EngineAction::NotifyError("boom".to_string(), 6));
+  app.apply(EngineAction::Notify("normal".to_string(), 4));
 
   assert_eq!(app.status_message.as_deref(), Some("boom"));
   assert!(app.status_message_is_error);
@@ -751,10 +762,10 @@ fn notify_error_blocks_a_following_notify() {
 #[test]
 fn navigate_home_returns_to_the_home_route() {
   let (mut app, _rx) = app_with_channel();
-  app.apply(Action::Navigate(NavTarget::Queue));
+  app.apply(EngineAction::Navigate(NavTarget::Queue));
   assert_eq!(app.get_current_route().id, RouteId::Queue);
 
-  app.apply(Action::Navigate(NavTarget::Home));
+  app.apply(EngineAction::Navigate(NavTarget::Home));
 
   assert_eq!(app.get_current_route().id, RouteId::Home);
 }
@@ -763,7 +774,7 @@ fn navigate_home_returns_to_the_home_route() {
 fn navigate_queue_pushes_the_route_and_fetches() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::Queue));
+  app.apply(EngineAction::Navigate(NavTarget::Queue));
 
   assert_eq!(app.get_current_route().id, RouteId::Queue);
   assert!(matches!(rx.try_recv(), Ok(IoEvent::GetQueue)));
@@ -773,7 +784,7 @@ fn navigate_queue_pushes_the_route_and_fetches() {
 fn navigate_settings_opens_the_settings_screen() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::Settings));
+  app.apply(EngineAction::Navigate(NavTarget::Settings));
 
   assert_eq!(app.get_current_route().id, RouteId::Settings);
 }
@@ -782,7 +793,7 @@ fn navigate_settings_opens_the_settings_screen() {
 fn navigate_devices_opens_the_device_picker() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::Devices));
+  app.apply(EngineAction::Navigate(NavTarget::Devices));
 
   assert_eq!(app.get_current_route().id, RouteId::SelectedDevice);
   assert!(matches!(rx.try_recv(), Ok(IoEvent::GetDevices)));
@@ -792,13 +803,13 @@ fn navigate_devices_opens_the_device_picker() {
 fn navigate_help_lyrics_and_party_push_their_routes() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::Help));
+  app.apply(EngineAction::Navigate(NavTarget::Help));
   assert_eq!(app.get_current_route().id, RouteId::HelpMenu);
 
-  app.apply(Action::Navigate(NavTarget::Lyrics));
+  app.apply(EngineAction::Navigate(NavTarget::Lyrics));
   assert_eq!(app.get_current_route().id, RouteId::LyricsView);
 
-  app.apply(Action::Navigate(NavTarget::Party));
+  app.apply(EngineAction::Navigate(NavTarget::Party));
   assert_eq!(app.get_current_route().id, RouteId::Party);
 }
 
@@ -806,7 +817,7 @@ fn navigate_help_lyrics_and_party_push_their_routes() {
 fn navigate_recently_played_only_dispatches() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::RecentlyPlayed));
+  app.apply(EngineAction::Navigate(NavTarget::RecentlyPlayed));
 
   // The network handler pushes the route once the data arrives.
   assert_eq!(app.get_current_route().id, RouteId::Home);
@@ -817,7 +828,7 @@ fn navigate_recently_played_only_dispatches() {
 fn navigate_analysis_pushes_the_analysis_route() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::Analysis));
+  app.apply(EngineAction::Navigate(NavTarget::Analysis));
 
   assert_eq!(app.get_current_route().id, RouteId::Analysis);
 }
@@ -826,20 +837,20 @@ fn navigate_analysis_pushes_the_analysis_route() {
 fn navigate_miniplayer_toggles() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::Navigate(NavTarget::MiniPlayer));
+  app.apply(EngineAction::Navigate(NavTarget::MiniPlayer));
   assert_eq!(app.get_current_route().id, RouteId::MiniPlayer);
 
-  app.apply(Action::Navigate(NavTarget::MiniPlayer));
+  app.apply(EngineAction::Navigate(NavTarget::MiniPlayer));
   assert_eq!(app.get_current_route().id, RouteId::Home);
 }
 
 #[test]
 fn back_pops_the_navigation_stack() {
   let (mut app, _rx) = app_with_channel();
-  app.apply(Action::Navigate(NavTarget::Queue));
+  app.apply(EngineAction::Navigate(NavTarget::Queue));
   assert_eq!(app.get_current_route().id, RouteId::Queue);
 
-  app.apply(Action::Back);
+  app.apply(EngineAction::Back);
 
   assert_eq!(app.get_current_route().id, RouteId::Home);
 }
@@ -850,7 +861,7 @@ fn back_pops_the_navigation_stack() {
 fn set_playbar_segment_inserts_and_removes() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::SetPlaybarSegment {
+  app.apply(EngineAction::SetPlaybarSegment {
     plugin: "clock".to_string(),
     text: Some("12:00".to_string()),
   });
@@ -859,7 +870,7 @@ fn set_playbar_segment_inserts_and_removes() {
     Some("12:00")
   );
 
-  app.apply(Action::SetPlaybarSegment {
+  app.apply(EngineAction::SetPlaybarSegment {
     plugin: "clock".to_string(),
     text: None,
   });
@@ -873,7 +884,7 @@ fn show_popup_sets_the_popup() {
   use crate::core::plugin_api::{PluginPopup, PopupLine};
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::ShowPopup(PluginPopup {
+  app.apply(EngineAction::ShowPopup(PluginPopup {
     title: "Hi".to_string(),
     lines: vec![PopupLine {
       text: "line".to_string(),
@@ -899,7 +910,7 @@ fn close_popup_clears_the_popup() {
     lines: Vec::new(),
   });
 
-  app.apply(Action::ClosePopup);
+  app.apply(EngineAction::ClosePopup);
 
   assert!(app.plugin_popup.is_none());
 }
@@ -942,7 +953,7 @@ fn set_theme_writes_every_field() {
       field.name()
     );
 
-    app.apply(Action::SetTheme(vec![(field, sentinel)]));
+    app.apply(EngineAction::SetTheme(vec![(field, sentinel)]));
 
     assert_eq!(
       theme_color(&app.user_config.theme, field),
@@ -974,7 +985,7 @@ fn set_screen_content_inserts() {
   use crate::core::plugin_api::PluginScreenContent;
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::SetScreenContent {
+  app.apply(EngineAction::SetScreenContent {
     name: "stats".to_string(),
     content: PluginScreenContent {
       title: "Stats".to_string(),
@@ -989,7 +1000,7 @@ fn set_screen_content_inserts() {
 fn show_screen_pushes_the_plugin_route_and_close_pops() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::ShowScreen("stats".to_string()));
+  app.apply(EngineAction::ShowScreen("stats".to_string()));
   assert_eq!(
     app.get_current_route().id,
     RouteId::PluginScreen("stats".to_string())
@@ -997,18 +1008,18 @@ fn show_screen_pushes_the_plugin_route_and_close_pops() {
 
   // Showing the already-current screen must not stack a second frame. The
   // scroll reset is pinned by `core/app/plugins.rs` tests.
-  app.apply(Action::ShowScreen("stats".to_string()));
+  app.apply(EngineAction::ShowScreen("stats".to_string()));
 
-  app.apply(Action::CloseScreen("stats".to_string()));
+  app.apply(EngineAction::CloseScreen("stats".to_string()));
   assert_eq!(app.get_current_route().id, RouteId::Home);
 }
 
 #[test]
 fn close_screen_only_pops_when_current() {
   let (mut app, _rx) = app_with_channel();
-  app.apply(Action::ShowScreen("stats".to_string()));
+  app.apply(EngineAction::ShowScreen("stats".to_string()));
 
-  app.apply(Action::CloseScreen("other".to_string()));
+  app.apply(EngineAction::CloseScreen("other".to_string()));
 
   assert_eq!(
     app.get_current_route().id,
@@ -1046,7 +1057,7 @@ mod dj_actions {
   fn queue_tracks_reports_the_accepted_count() {
     let (mut app, _rx) = app_with_channel();
 
-    let outcome = app.apply(Action::QueueTracks(vec![
+    let outcome = app.apply(EngineAction::QueueTracks(vec![
       dj_track(Some("subsonic:track:a"), "A"),
       dj_track(Some("subsonic:track:b"), "B"),
     ]));
@@ -1060,7 +1071,7 @@ mod dj_actions {
   fn queue_tracks_skips_tracks_without_a_uri() {
     let (mut app, _rx) = app_with_channel();
 
-    let outcome = app.apply(Action::QueueTracks(vec![
+    let outcome = app.apply(EngineAction::QueueTracks(vec![
       dj_track(Some("subsonic:track:a"), "A"),
       dj_track(None, "No URI"),
     ]));
@@ -1074,7 +1085,7 @@ mod dj_actions {
     let (mut app, _rx) = app_with_channel();
     let before = app.dj.generation;
 
-    app.apply(Action::SetDjVibe(Some("mellow".to_string())));
+    app.apply(EngineAction::SetDjVibe(Some("mellow".to_string())));
 
     assert_eq!(
       app.dj.generation,
@@ -1087,9 +1098,9 @@ mod dj_actions {
   #[test]
   fn set_dj_vibe_clears_with_none() {
     let (mut app, _rx) = app_with_channel();
-    app.apply(Action::SetDjVibe(Some("mellow".to_string())));
+    app.apply(EngineAction::SetDjVibe(Some("mellow".to_string())));
 
-    app.apply(Action::SetDjVibe(None));
+    app.apply(EngineAction::SetDjVibe(None));
 
     assert_eq!(app.dj.vibe, None);
   }
@@ -1153,7 +1164,7 @@ fn load_more_playlist_tracks_dispatches_the_next_page_fetch() {
   app.playlist_tracks = Some(page.clone());
   app.playlist_track_pages.upsert_page_by_offset(page);
 
-  app.apply(Action::LoadMore(ListTarget::PlaylistTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::PlaylistTracks));
 
   match rx.try_recv() {
     Ok(IoEvent::GetPlaylistItems(id, offset)) => {
@@ -1178,7 +1189,7 @@ fn load_more_playlist_tracks_is_a_noop_under_an_active_filter() {
   app.playlist_track_pages.upsert_page_by_offset(page);
   app.active_playlist_track_filter = Some("query".to_string());
 
-  app.apply(Action::LoadMore(ListTarget::PlaylistTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::PlaylistTracks));
 
   assert!(rx.try_recv().is_err(), "filtered playlists never paginate");
 }
@@ -1193,7 +1204,7 @@ fn load_more_saved_tracks_fetches_the_missing_continuous_page() {
   );
   app.library.saved_tracks.upsert_page_by_offset(page);
 
-  app.apply(Action::LoadMore(ListTarget::SavedTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::SavedTracks));
 
   assert!(matches!(
     rx.try_recv(),
@@ -1207,7 +1218,7 @@ fn load_more_saved_tracks_is_a_noop_at_the_end_of_the_list() {
   let page = track_page(0, &["0000000000000000000001"], false);
   app.library.saved_tracks.upsert_page_by_offset(page);
 
-  app.apply(Action::LoadMore(ListTarget::SavedTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::SavedTracks));
 
   assert!(rx.try_recv().is_err());
 }
@@ -1219,7 +1230,7 @@ fn load_more_does_not_touch_pending_track_table_selection() {
   app.library.saved_tracks.upsert_page_by_offset(page);
   app.pending_track_table_selection = Some(PendingTrackSelection::Index(9));
 
-  app.apply(Action::LoadMore(ListTarget::SavedTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::SavedTracks));
 
   assert_eq!(
     app.pending_track_table_selection,
@@ -1239,7 +1250,7 @@ fn load_more_saved_tracks_does_not_refetch_an_in_flight_page() {
   );
   app.library.saved_tracks.upsert_page_by_offset(page);
 
-  app.apply(Action::LoadMore(ListTarget::SavedTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::SavedTracks));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetCurrentSavedTracks(Some(2)))
@@ -1247,7 +1258,7 @@ fn load_more_saved_tracks_does_not_refetch_an_in_flight_page() {
 
   // The fetch marked offset 2 as in flight; a second apply must not
   // re-dispatch it (the prefetch dedupe the arm inherits).
-  app.apply(Action::LoadMore(ListTarget::SavedTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::SavedTracks));
   assert!(rx.try_recv().is_err());
 }
 
@@ -1264,10 +1275,10 @@ fn load_more_playlist_tracks_does_not_refetch_an_in_flight_page() {
   app.playlist_tracks = Some(page.clone());
   app.playlist_track_pages.upsert_page_by_offset(page);
 
-  app.apply(Action::LoadMore(ListTarget::PlaylistTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::PlaylistTracks));
   assert!(matches!(rx.try_recv(), Ok(IoEvent::GetPlaylistItems(_, 1))));
 
-  app.apply(Action::LoadMore(ListTarget::PlaylistTracks));
+  app.apply(EngineAction::LoadMore(ListTarget::PlaylistTracks));
   assert!(
     rx.try_recv().is_err(),
     "the in-flight page is not refetched"
@@ -1280,7 +1291,7 @@ fn load_more_playlist_tracks_does_not_refetch_an_in_flight_page() {
 fn open_album_dispatches_get_album() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::Album(
+  app.apply(EngineAction::Open(OpenTarget::Album(
     "5gzLOflH95LkKYE6XSXE9k".to_string(),
   )));
 
@@ -1294,7 +1305,7 @@ fn open_album_dispatches_get_album() {
 fn open_artist_resolves_the_country_and_dispatches_get_artist() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::Artist {
+  app.apply(EngineAction::Open(OpenTarget::Artist {
     id: "2ye2Wgw4gimLv2eAKyk1NB".to_string(),
     name: String::new(),
   }));
@@ -1313,7 +1324,7 @@ fn open_artist_resolves_the_country_and_dispatches_get_artist() {
 fn open_track_album_dispatches_get_album_for_track() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::TrackAlbum(
+  app.apply(EngineAction::Open(OpenTarget::TrackAlbum(
     "10igKaIKsSB6ZnWxPxPvKO".to_string(),
   )));
 
@@ -1330,7 +1341,7 @@ fn open_track_album_dispatches_get_album_for_track() {
 fn open_show_dispatches_get_show() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::Show(
+  app.apply(EngineAction::Open(OpenTarget::Show(
     "3aNsrV6lkzmcU1w8u8kA7N".to_string(),
   )));
 
@@ -1347,7 +1358,7 @@ fn open_show_dispatches_get_show() {
 fn open_playlist_opens_the_track_table_in_the_playlists_context() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::Playlist {
+  app.apply(EngineAction::Open(OpenTarget::Playlist {
     id: "37i9dQZF1DX4WYpdgoIcn6".to_string(),
     from_search: false,
   }));
@@ -1374,7 +1385,7 @@ fn open_playlist_opens_the_track_table_in_the_playlists_context() {
 fn open_playlist_from_search_uses_the_search_context() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::Playlist {
+  app.apply(EngineAction::Open(OpenTarget::Playlist {
     id: "37i9dQZF1DX4WYpdgoIcn6".to_string(),
     from_search: true,
   }));
@@ -1389,7 +1400,7 @@ fn open_playlist_from_search_uses_the_search_context() {
 fn open_playlist_with_an_unparseable_id_is_a_silent_noop() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::Open(OpenTarget::Playlist {
+  app.apply(EngineAction::Open(OpenTarget::Playlist {
     id: "not a base62 id!".to_string(),
     from_search: false,
   }));
@@ -1409,15 +1420,15 @@ fn open_playlist_twice_while_pending_open_fetches_only_once() {
     id: "37i9dQZF1DX4WYpdgoIcn6".to_string(),
     from_search: false,
   };
-  app.apply(Action::Open(target.clone()));
+  app.apply(EngineAction::Open(target.clone()));
   assert!(matches!(rx.try_recv(), Ok(IoEvent::GetPlaylistItems(_, 0))));
 
   // Same open already in flight: no second fetch, only the screen shown.
-  app.apply(Action::Open(target));
+  app.apply(EngineAction::Open(target));
   assert!(rx.try_recv().is_err());
 }
 
-// --- SearchActiveSource (Action::Search stays Spotify-only) ---
+// --- SearchActiveSource (EngineAction::Search stays Spotify-only) ---
 
 #[test]
 fn search_active_source_routes_by_the_active_source() {
@@ -1425,28 +1436,28 @@ fn search_active_source_routes_by_the_active_source() {
   let query = "coltrane".to_string();
 
   app.active_source = Source::Subsonic;
-  app.apply(Action::SearchActiveSource(query.clone()));
+  app.apply(EngineAction::SearchActiveSource(query.clone()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetSubsonicSearchResults(q)) if q == "coltrane"
   ));
 
   app.active_source = Source::Radio;
-  app.apply(Action::SearchActiveSource(query.clone()));
+  app.apply(EngineAction::SearchActiveSource(query.clone()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetRadioSearchResults(q)) if q == "coltrane"
   ));
 
   app.active_source = Source::YouTube;
-  app.apply(Action::SearchActiveSource(query.clone()));
+  app.apply(EngineAction::SearchActiveSource(query.clone()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetYouTubeSearchResults(q)) if q == "coltrane"
   ));
 
   app.active_source = Source::Spotify;
-  app.apply(Action::SearchActiveSource(query.clone()));
+  app.apply(EngineAction::SearchActiveSource(query.clone()));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetSearchResults(q, _)) if q == "coltrane"
@@ -1455,7 +1466,7 @@ fn search_active_source_routes_by_the_active_source() {
   // Local falls into the Spotify branch, matching the search input's
   // if-chain, which has no Local branch.
   app.active_source = Source::Local;
-  app.apply(Action::SearchActiveSource(query));
+  app.apply(EngineAction::SearchActiveSource(query));
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetSearchResults(_, None))
@@ -1472,7 +1483,7 @@ fn search_active_source_resolves_a_loaded_users_country() {
   });
   app.active_source = Source::Spotify;
 
-  app.apply(Action::SearchActiveSource("coltrane".to_string()));
+  app.apply(EngineAction::SearchActiveSource("coltrane".to_string()));
 
   assert!(
     matches!(rx.try_recv(), Ok(IoEvent::GetSearchResults(_, Some(_)))),
@@ -1485,7 +1496,7 @@ fn search_stays_on_the_spotify_catalog_when_browsing_other_sources() {
   let (mut app, rx) = app_with_channel();
   app.active_source = Source::YouTube;
 
-  app.apply(Action::Search("daft punk".to_string()));
+  app.apply(EngineAction::Search("daft punk".to_string()));
 
   // Lua spotatui.search contracted the Web API search; browsing scope does
   // not reroute it (only SearchActiveSource does).
@@ -1499,7 +1510,7 @@ fn search_stays_on_the_spotify_catalog_when_browsing_other_sources() {
 fn search_playlist_tracks_records_the_pending_search_and_dispatches() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::SearchPlaylistTracks {
+  app.apply(EngineAction::SearchPlaylistTracks {
     playlist_id: "37i9dQZF1DX4WYpdgoIcn6".to_string(),
     query: "queen rock".to_string(),
   });
@@ -1527,7 +1538,7 @@ fn search_playlist_tracks_records_the_pending_search_and_dispatches() {
 fn play_track_in_context_dispatches_the_combined_start() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::PlayTrackInContext {
+  app.apply(EngineAction::PlayTrackInContext {
     context: "spotify:playlist:p1".to_string(),
     track: "spotify:track:t1".to_string(),
   });
@@ -1548,7 +1559,7 @@ fn play_track_in_context_dispatches_the_combined_start() {
 fn open_add_track_dialog_without_a_selection_is_a_noop() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::OpenAddTrackDialog);
+  app.apply(EngineAction::OpenAddTrackDialog);
 
   assert!(rx.try_recv().is_err());
   assert!(app.pending_playlist_track_add.is_none());
@@ -1565,7 +1576,7 @@ fn open_add_track_dialog_stages_the_selected_row_for_the_picker() {
   app.track_table.tracks = vec![track("0000000000000000000001", "Track 1")];
   app.track_table.selected_index = 0;
 
-  app.apply(Action::OpenAddTrackDialog);
+  app.apply(EngineAction::OpenAddTrackDialog);
 
   assert_eq!(
     app.get_current_route().active_block,
@@ -1589,7 +1600,7 @@ fn open_add_track_dialog_without_destinations_requests_them() {
   app.track_table.tracks = vec![track("0000000000000000000001", "Track 1")];
   app.track_table.selected_index = 0;
 
-  app.apply(Action::OpenAddTrackDialog);
+  app.apply(EngineAction::OpenAddTrackDialog);
 
   // No user profile and no playlists loaded yet: the flow fetches both
   // first and tells the user to retry.
@@ -1617,7 +1628,7 @@ fn open_remove_track_dialog_stages_the_spotify_removal_with_position() {
   app.track_table.selected_index = 0;
   app.playlist_track_positions = Some(vec![7]);
 
-  app.apply(Action::OpenRemoveTrackDialog);
+  app.apply(EngineAction::OpenRemoveTrackDialog);
 
   let pending = app
     .pending_playlist_track_removal
@@ -1651,7 +1662,7 @@ fn open_remove_track_dialog_without_a_position_reports_an_error() {
   app.track_table.tracks = vec![track("0000000000000000000001", "Track 1")];
   app.track_table.selected_index = 0;
 
-  app.apply(Action::OpenRemoveTrackDialog);
+  app.apply(EngineAction::OpenRemoveTrackDialog);
 
   assert_eq!(
     app.status_message.as_deref(),
@@ -1673,7 +1684,7 @@ fn open_remove_track_dialog_youtube_routes_the_local_edit() {
   app.track_table.tracks = vec![track("0000000000000000000001", "Track 1")];
   app.track_table.selected_index = 0;
 
-  app.apply(Action::OpenRemoveTrackDialog);
+  app.apply(EngineAction::OpenRemoveTrackDialog);
 
   let pending = app
     .pending_playlist_track_removal
@@ -1694,7 +1705,7 @@ fn open_remove_track_dialog_youtube_routes_the_local_edit() {
 fn open_library_stats_marks_loading_dispatches_and_pushes() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::OpenLibrary(LibraryTarget::Stats));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::Stats));
 
   assert!(app.stats_loading);
   assert_eq!(app.get_current_route().id, RouteId::Stats);
@@ -1712,7 +1723,7 @@ fn open_library_stats_marks_loading_dispatches_and_pushes() {
 fn open_library_recently_played_pushes_before_the_data_arrives() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::OpenLibrary(LibraryTarget::RecentlyPlayed));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::RecentlyPlayed));
 
   // The row pushes immediately; only the global navigate binding defers
   // the push to the network result.
@@ -1724,25 +1735,25 @@ fn open_library_recently_played_pushes_before_the_data_arrives() {
 fn open_library_rows_push_their_routes_and_fetch() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::OpenLibrary(LibraryTarget::Discover));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::Discover));
   assert_eq!(app.get_current_route().id, RouteId::Discover);
   assert!(rx.try_recv().is_err());
 
-  app.apply(Action::OpenLibrary(LibraryTarget::Albums));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::Albums));
   assert_eq!(app.get_current_route().id, RouteId::AlbumList);
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetCurrentUserSavedAlbums(None))
   ));
 
-  app.apply(Action::OpenLibrary(LibraryTarget::Artists));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::Artists));
   assert_eq!(app.get_current_route().id, RouteId::Artists);
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetFollowedArtists(None))
   ));
 
-  app.apply(Action::OpenLibrary(LibraryTarget::Podcasts));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::Podcasts));
   assert_eq!(app.get_current_route().id, RouteId::Podcasts);
   assert!(matches!(
     rx.try_recv(),
@@ -1755,7 +1766,7 @@ fn open_library_rows_push_their_routes_and_fetch() {
 fn open_library_local_files_pushes_the_browser_route() {
   let (mut app, rx) = app_with_channel();
 
-  app.apply(Action::OpenLibrary(LibraryTarget::LocalFiles));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::LocalFiles));
 
   assert_eq!(app.get_current_route().id, RouteId::LocalBrowser);
   assert!(rx.try_recv().is_err());
@@ -1766,7 +1777,7 @@ fn open_library_local_files_pushes_the_browser_route() {
 fn open_library_ai_dj_opens_the_screen_through_app() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(Action::OpenLibrary(LibraryTarget::AiDj));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::AiDj));
 
   assert_eq!(app.get_current_route().id, RouteId::AiDj);
 }
@@ -1777,7 +1788,7 @@ fn open_library_liked_songs_resets_the_cache_and_fetches() {
   let page = track_page(0, &["0000000000000000000001"], false);
   app.library.saved_tracks.upsert_page_by_offset(page);
 
-  app.apply(Action::OpenLibrary(LibraryTarget::LikedSongs));
+  app.apply(EngineAction::OpenLibrary(LibraryTarget::LikedSongs));
 
   assert_eq!(app.get_current_route().id, RouteId::TrackTable);
   assert!(app.library.saved_tracks.pages.is_empty(), "cache reset");
@@ -1814,7 +1825,7 @@ fn select_source_flips_scope_mirrors_runtime_state_and_persists() {
   let (mut app, rx) = app_with_channel();
   app.state_path = Some(dir.path().join("state.yml"));
 
-  app.apply(Action::SelectSource(Source::Local));
+  app.apply(EngineAction::SelectSource(Source::Local));
 
   assert_eq!(app.active_source, Source::Local);
   assert_eq!(app.runtime_state.active_source, Source::Local);

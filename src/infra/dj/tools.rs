@@ -460,14 +460,14 @@ pub async fn execute_app_only(app: &Arc<Mutex<App>>, call: &DjToolCall) -> Optio
       // (queue slot, decoded sources, suspend-to-queue, native shuffle
       // bookkeeping) applies; the old raw `IoEvent::NextTrack` dispatch missed
       // the App-side branches.
-      app.apply(Action::NextTrack);
+      app.apply(EngineAction::NextTrack);
       Some(ToolOutcome::ok("Skipped to the next track"))
     }
     DjToolCall::SetDjVibe { vibe } => {
       let mut app = app.lock().await;
       // The apply arm bumps the DJ generation exactly once (the adopt-one-bump
       // rule in the turn loop depends on that count).
-      app.apply(Action::SetDjVibe(vibe.clone()));
+      app.apply(EngineAction::SetDjVibe(vibe.clone()));
       Some(ToolOutcome::ok(match vibe.as_deref() {
         Some(vibe) => format!("DJ vibe set to: {vibe}. {}", vibe_effect(&app)),
         None => "DJ vibe cleared".to_string(),

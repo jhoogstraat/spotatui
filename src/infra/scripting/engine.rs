@@ -188,10 +188,14 @@ impl ScriptEngine {
       Ok(s) => s,
       Err(e) => {
         log::error!("[lua] failed to read {}: {}", path.display(), e);
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{name}' failed to load: {e}"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{name}' failed to load: {e}"),
+            6,
+          ));
         return false;
       }
     };
@@ -200,10 +204,14 @@ impl ScriptEngine {
       Err(e) => {
         let fl = first_line(&e.to_string());
         log::error!("[lua] failed to load plugin '{name}': {e}");
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{name}' failed to load: {fl}"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{name}' failed to load: {fl}"),
+            6,
+          ));
         false
       }
     }
@@ -383,10 +391,14 @@ impl ScriptEngine {
       Err(_) => "panic".to_string(),
     };
     log::error!("[lua] plugin '{plugin}': error in screen '{screen}' {field}: {err_msg}");
-    self.shared.effects.borrow_mut().push(Action::NotifyError(
-      format!("plugin '{plugin}': error in screen '{screen}' {field}: {err_msg}"),
-      6,
-    ));
+    self
+      .shared
+      .effects
+      .borrow_mut()
+      .push(EngineAction::NotifyError(
+        format!("plugin '{plugin}': error in screen '{screen}' {field}: {err_msg}"),
+        6,
+      ));
     // One strike: remove the erroring callback so it can't fire again.
     let _ = entry.set(field, Value::Nil);
   }
@@ -460,10 +472,14 @@ impl ScriptEngine {
           "[lua] plugin '{plugin}': error in on_{}: {msg}",
           event.lua_name()
         );
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{plugin}': error in on_{}: {msg}", event.lua_name()),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{plugin}': error in on_{}: {msg}", event.lua_name()),
+            6,
+          ));
         to_remove.push(idx);
       }
     }
@@ -509,10 +525,14 @@ impl ScriptEngine {
       let entry: mlua::Table = match commands.get::<Option<mlua::Table>>(name.clone()) {
         Ok(Some(t)) => t,
         _ => {
-          self.shared.effects.borrow_mut().push(Action::NotifyError(
-            format!("no plugin command named '{name}'"),
-            6,
-          ));
+          self
+            .shared
+            .effects
+            .borrow_mut()
+            .push(EngineAction::NotifyError(
+              format!("no plugin command named '{name}'"),
+              6,
+            ));
           continue;
         }
       };
@@ -529,17 +549,25 @@ impl ScriptEngine {
         Ok(Err(e)) => {
           let msg = first_line(&e.to_string());
           log::error!("[lua] plugin '{plugin}': error in command '{name}': {msg}");
-          self.shared.effects.borrow_mut().push(Action::NotifyError(
-            format!("plugin '{plugin}': error in command '{name}': {msg}"),
-            6,
-          ));
+          self
+            .shared
+            .effects
+            .borrow_mut()
+            .push(EngineAction::NotifyError(
+              format!("plugin '{plugin}': error in command '{name}': {msg}"),
+              6,
+            ));
         }
         Err(_) => {
           log::error!("[lua] plugin '{plugin}': panic in command '{name}'");
-          self.shared.effects.borrow_mut().push(Action::NotifyError(
-            format!("plugin '{plugin}': panic in command '{name}'"),
-            6,
-          ));
+          self
+            .shared
+            .effects
+            .borrow_mut()
+            .push(EngineAction::NotifyError(
+              format!("plugin '{plugin}': panic in command '{name}'"),
+              6,
+            ));
         }
       }
     }
@@ -741,10 +769,14 @@ impl ScriptEngine {
       Err(_) => "panic".to_string(),
     };
     log::error!("[lua] plugin '{plugin}': error in timer callback: {err_msg}");
-    self.shared.effects.borrow_mut().push(Action::NotifyError(
-      format!("plugin '{plugin}': error in timer callback: {err_msg}"),
-      6,
-    ));
+    self
+      .shared
+      .effects
+      .borrow_mut()
+      .push(EngineAction::NotifyError(
+        format!("plugin '{plugin}': error in timer callback: {err_msg}"),
+        6,
+      ));
     if repeating {
       // Remove the interval's registry entry too (one strike).
       if let Ok(callbacks) = self
@@ -845,17 +877,25 @@ impl ScriptEngine {
       Ok(Err(e)) => {
         let msg = first_line(&e.to_string());
         log::error!("[lua] plugin '{plugin}': error in data callback: {msg}");
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{plugin}': error in data callback: {msg}"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{plugin}': error in data callback: {msg}"),
+            6,
+          ));
       }
       Err(_) => {
         log::error!("[lua] plugin '{plugin}': panic in data callback");
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{plugin}': panic in data callback"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{plugin}': panic in data callback"),
+            6,
+          ));
       }
     }
   }
@@ -943,10 +983,14 @@ impl ScriptEngine {
       Err(e) => {
         let msg = first_line(&e.to_string());
         log::error!("[lua] plugin '{plugin}': error preparing http callback: {msg}");
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{plugin}': error preparing http callback: {msg}"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{plugin}': error preparing http callback: {msg}"),
+            6,
+          ));
         return;
       }
     };
@@ -960,17 +1004,25 @@ impl ScriptEngine {
       Ok(Err(e)) => {
         let msg = first_line(&e.to_string());
         log::error!("[lua] plugin '{plugin}': error in http callback: {msg}");
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{plugin}': error in http callback: {msg}"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{plugin}': error in http callback: {msg}"),
+            6,
+          ));
       }
       Err(_) => {
         log::error!("[lua] plugin '{plugin}': panic in http callback");
-        self.shared.effects.borrow_mut().push(Action::NotifyError(
-          format!("plugin '{plugin}': panic in http callback"),
-          6,
-        ));
+        self
+          .shared
+          .effects
+          .borrow_mut()
+          .push(EngineAction::NotifyError(
+            format!("plugin '{plugin}': panic in http callback"),
+            6,
+          ));
       }
     }
   }

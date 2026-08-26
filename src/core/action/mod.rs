@@ -42,10 +42,15 @@ mod tests;
 /// A frontend-neutral state change, applied by `App::apply`.
 ///
 /// Variant payloads are fully resolved except where a value only `App` knows
-/// is needed ([`Action::Search`] resolves the user country and
-/// [`Action::UnfollowPlaylist`] the user id at apply time).
+/// is needed ([`EngineAction::Search`] resolves the user country and
+/// [`EngineAction::UnfollowPlaylist`] the user id at apply time).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Action {
+pub enum EngineAction {
+  /// The one real dismissal of the current notice. Errors retire through
+  /// `App::clear_api_error` plus their TTL backstop; plain notices expire or
+  /// are replaced. Replaces the historic `NotifyError("", 0)` hack that
+  /// abused the expiry machinery to clear a blocking error.
+  DismissNotice,
   /// Start playback if it is not already playing (intent, not a toggle).
   Play,
   /// Pause playback if it is playing (intent, not a toggle).
@@ -57,7 +62,7 @@ pub enum Action {
   PreviousTrack,
   /// Always go to the previous track (or restart the current queue slot),
   /// skipping the ">= 3s restarts the current track" rule of
-  /// [`Action::PreviousTrack`].
+  /// [`EngineAction::PreviousTrack`].
   ForcePreviousTrack,
   /// Seek to an absolute position in the current track, in milliseconds.
   SeekTo(u32),
@@ -136,7 +141,7 @@ pub enum Action {
   /// at apply time. Deliberately source-blind: existing producers (Lua
   /// `spotatui.search`) contracted the Web API search, so browsing scope
   /// does not reroute it. The terminal search box uses
-  /// [`Action::SearchActiveSource`] instead.
+  /// [`EngineAction::SearchActiveSource`] instead.
   Search(String),
   /// Run a search against the active browse source's catalog; falls back to
   /// the Spotify catalog when the active source has no own search (the
@@ -253,7 +258,7 @@ pub enum Action {
 pub enum ActionOutcome {
   /// The action was applied (or routed); nothing further to report.
   Applied,
-  /// [`Action::QueueTracks`]: how many offered tracks entered the queue.
+  /// [`EngineAction::QueueTracks`]: how many offered tracks entered the queue.
   #[cfg_attr(not(feature = "dj-core"), allow(dead_code))]
   Queued { accepted: usize },
 }
@@ -267,7 +272,7 @@ pub enum RepeatSetting {
   Context,
 }
 
-/// Surfaces reachable through [`Action::Navigate`].
+/// Surfaces reachable through [`EngineAction::Navigate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavTarget {
   Home,
@@ -319,7 +324,7 @@ impl NavTarget {
   }
 }
 
-/// A paginated list surface [`Action::LoadMore`] can advance. Grows
+/// A paginated list surface [`EngineAction::LoadMore`] can advance. Grows
 /// additively as later screens adopt continuous pagination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ListTarget {
@@ -329,7 +334,7 @@ pub enum ListTarget {
   SavedTracks,
 }
 
-/// A resource deep-link [`Action::Open`] can address, by id.
+/// A resource deep-link [`EngineAction::Open`] can address, by id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenTarget {
   /// Open an album page.
@@ -347,7 +352,7 @@ pub enum OpenTarget {
   TrackAlbum(String),
 }
 
-/// Library sidebar sections reachable through [`Action::OpenLibrary`].
+/// Library sidebar sections reachable through [`EngineAction::OpenLibrary`].
 /// Deliberately NOT advertised through the Lua `navigate()` API (unlike
 /// [`NavTarget`]): adding rows there would expand the published plugin
 /// surface.

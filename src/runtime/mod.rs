@@ -7,6 +7,7 @@
 
 mod bootstrap;
 mod cli;
+pub mod engine;
 pub mod frontend;
 mod pump;
 pub(crate) mod startup;
