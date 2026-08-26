@@ -622,6 +622,7 @@ async fn handle_player_events(
 
         if let Ok(mut app) = app.try_lock() {
           app.song_progress_ms = position_ms as u128;
+          app.change_notify.notify_one();
 
           if let Some(ref mut ctx) = app.current_playback_context {
             ctx.is_playing = true;
@@ -682,6 +683,7 @@ async fn handle_player_events(
 
         if let Ok(mut app) = app.try_lock() {
           app.song_progress_ms = position_ms as u128;
+          app.change_notify.notify_one();
 
           if let Some(ref mut ctx) = app.current_playback_context {
             ctx.is_playing = false;
@@ -707,6 +709,7 @@ async fn handle_player_events(
 
         if let Ok(mut app) = app.try_lock() {
           app.song_progress_ms = position_ms as u128;
+          app.change_notify.notify_one();
           app.seek_ms = None;
           app.set_native_recovery_position(position_ms);
 
@@ -806,6 +809,7 @@ async fn handle_player_events(
         });
 
         app.song_progress_ms = 0;
+        app.change_notify.notify_one();
         // librespot 0.8's `SpotifyUri` Display is the full `spotify:track:<id>`
         // URI; app-side ids (shuffle index sync, the queue guard,
         // `last_track_id`) are bare base62, so normalize at the event boundary.
@@ -860,6 +864,8 @@ async fn handle_player_events(
             ctx.is_playing = false;
           }
           app.song_progress_ms = 0;
+          app.change_notify.notify_one();
+          app.change_notify.notify_one();
           app.last_track_id = None;
           app.native_track_info = None;
         }
@@ -902,6 +908,8 @@ async fn handle_player_events(
             ctx.is_playing = false;
           }
           app.song_progress_ms = 0;
+          app.change_notify.notify_one();
+          app.change_notify.notify_one();
           app.last_track_id = None;
           app.native_track_info = None;
           if app.user_config.behavior.stop_after_current_track {
@@ -1085,6 +1093,8 @@ async fn handle_player_events(
         {
           let mut app = app.lock().await;
           app.song_progress_ms = 0;
+          app.change_notify.notify_one();
+          app.change_notify.notify_one();
           app.native_track_info = None;
           app.native_load_watchdog = None;
           app.native_restore_pending = None;
