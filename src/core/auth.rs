@@ -970,3 +970,132 @@ mod tests {
     );
   }
 }
+
+// ── Auth domain (ADR 0016 stage 3, ticket 08) ────────────────────────────────
+
+/// Session/auth facts previously scattered as bare `App` fields. One owner:
+/// transitions flow through [`AuthState::transition`] which returns what
+/// changed so producers can emit a single typed event instead of poking
+/// individual booleans.
+/// The old `Disconnected` variant arrives only via logout/logout-equivalents
+/// which nothing in the product triggers yet; kept for ticket 09's streaming
+/// teardown path. Allowed dead until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum AuthTransition {
+  /// A Spotify session now exists (token stored at boot or login completed).
+  Connected,
+  /// The session ended or was never established.
+  Disconnected,
+  /// Only the token freshness bookkeeping moved.
+  TokenRefreshed,
+}
+
+/// Whether an async token refresh is currently in flight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthState {
+  pub connected: bool,
+  pub refresh_in_progress: bool,
+  /// Expiry of the current access token, if a session exists.
+  pub token_expiry: Option<SystemTime>,
+}
+
+impl AuthState {
+  /// Apply a transition, returning whether anything observable moved.
+  pub fn transition(&mut self, t: AuthTransition, new_expiry: Option<SystemTime>) -> bool {
+    match t {
+      AuthTransition::Connected => {
+        let changed = !self.connected || self.token_expiry != new_expiry;
+        self.connected = true;
+        self.refresh_in_progress = false;
+        self.token_expiry = new_expiry;
+        changed
+      }
+      AuthTransition::Disconnected => {
+        let changed = self.connected;
+        self.connected = false;
+        self.refresh_in_progress = false;
+        self.token_expiry = None;
+        changed
+      }
+      AuthTransition::TokenRefreshed => {
+        let changed = self.token_expiry != new_expiry;
+        self.token_expiry = new_expiry;
+        self.refresh_in_progress = false;
+        changed
+      }
+    }
+  }
+
+  /// Whether a refresh should be scheduled right now.
+  pub fn needs_refresh(&self, now: SystemTime) -> bool {
+    self.connected
+      && !self.refresh_in_progress
+      && self
+        .token_expiry
+        .is_some_and(|expiry| should_refresh_token_at(expiry, now))
+  }
+}
+
+#[cfg(test)]
+mod auth_domain_tests {
+  use super::*;
+
+  #[test]
+  fn transition_connected_flips_state_once() {
+    let mut state = AuthState::default();
+    assert!(!state.connected);
+    let changed = state.transition(AuthTransition::Connected, None);
+    assert!(changed, "first connect is a real change");
+    assert!(state.connected);
+    // Same expiry reconnect: no observable change.
+    assert!(!state.transition(AuthTransition::Connected, state.token_expiry));
+    // New expiry: a change (fresh token family).
+    assert!(state.transition(AuthTransition::Connected, Some(SystemTime::now())));
+  }
+
+  #[test]
+  fn disconnected_clears_expiry_and_reports_change_only_when_had_session() {
+    let mut state = AuthState::default();
+    assert!(!state.transition(AuthTransition::Disconnected, None));
+    state.transition(AuthTransition::Connected, Some(SystemTime::now()));
+    assert!(state.transition(AuthTransition::Disconnected, None));
+    assert!(!state.connected);
+    assert_eq!(state.token_expiry, None);
+    assert!(!state.refresh_in_progress);
+  }
+
+  #[test]
+  fn needs_refresh_gates_on_connection_in_flight_and_margin() {
+    let mut state = AuthState::default();
+    assert!(!state.needs_refresh(SystemTime::now()), "no session");
+    state.transition(
+      AuthTransition::Connected,
+      Some(SystemTime::now() - Duration::from_secs(60)),
+    );
+    assert!(state.needs_refresh(SystemTime::now()), "expired token");
+    state.refresh_in_progress = true;
+    assert!(!state.needs_refresh(SystemTime::now()), "refresh in flight");
+    state.refresh_in_progress = false;
+    state.transition(
+      AuthTransition::TokenRefreshed,
+      Some(SystemTime::now() + Duration::from_secs(3600)),
+    );
+    assert!(!state.needs_refresh(SystemTime::now()), "token fresh");
+  }
+
+  #[test]
+  fn token_refreshed_lands_refresh_flag_down() {
+    let mut state = AuthState {
+      connected: true,
+      refresh_in_progress: true,
+      token_expiry: None,
+    };
+    assert!(state.transition(
+      AuthTransition::TokenRefreshed,
+      Some(SystemTime::now() + Duration::from_secs(3600))
+    ));
+    assert!(!state.refresh_in_progress);
+    assert!(state.token_expiry.is_some());
+  }
+}

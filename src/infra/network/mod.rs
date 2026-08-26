@@ -1061,8 +1061,15 @@ impl Network {
     match auth::refresh_token_and_cache(spotify, &self.token_cache_path, force).await {
       Ok(expiry) => {
         let mut app = self.app.lock().await;
-        app.spotify_token_expiry = Some(expiry);
-        app.auth_refresh_in_progress = false;
+        let changed = app
+          .auth_state
+          .transition(auth::AuthTransition::TokenRefreshed, Some(expiry));
+        if changed {
+          app.change_notify.notify_one();
+        }
+        // Legacy mirrors (deleted with App itself in ticket 11).
+        app.spotify_token_expiry = app.auth_state.token_expiry;
+        app.auth_refresh_in_progress = app.auth_state.refresh_in_progress;
         true
       }
       Err(e) => {
@@ -1201,6 +1208,13 @@ impl Network {
     self.token_cache_path = token_cache_path;
     {
       let mut app = self.app.lock().await;
+      let changed = app
+        .auth_state
+        .transition(auth::AuthTransition::Connected, expiry);
+      if changed {
+        app.change_notify.notify_one();
+      }
+      // Legacy mirrors (deleted with App itself in ticket 11).
       app.spotify_token_expiry = expiry;
       app.spotify_connected = true;
       // Load Spotify data now that a session exists.
