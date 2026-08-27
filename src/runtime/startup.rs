@@ -7,6 +7,10 @@ use super::pump::start_tokio;
 use crate::core::app::App;
 #[cfg(feature = "streaming")]
 use crate::core::config::ClientConfig;
+#[cfg_attr(
+  not(all(feature = "mpris", target_os = "linux")),
+  allow(unused_imports)
+)]
 use crate::core::driver::MprisHandle;
 use crate::core::user_config::StartupBehavior;
 use crate::core::user_config::UserConfig;
