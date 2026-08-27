@@ -407,6 +407,8 @@ struct DeferredStreamingContext {
   recovery_tx: tokio::sync::mpsc::UnboundedSender<player::StreamingRecoveryRequest>,
   shared_position: Arc<AtomicU64>,
   shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
+  /// Typed streaming facts from the player event handler go here (ticket 14).
+  spine: crate::runtime::engine::Spine,
   #[cfg(all(feature = "mpris", target_os = "linux"))]
   mpris_manager: Option<Arc<mpris::MprisManager>>,
   #[cfg(all(feature = "macos-media", target_os = "macos"))]
@@ -550,6 +552,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
     app: Arc::clone(&ctx.app),
     shared_position: ctx.shared_position,
     shared_is_playing: ctx.shared_is_playing,
+    spine: ctx.spine.clone(),
     recovery_tx: ctx.recovery_tx,
     #[cfg(all(feature = "mpris", target_os = "linux"))]
     mpris_manager: ctx.mpris_manager,
@@ -604,6 +607,14 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
 /// module drives its own loop on top.
 pub(super) struct Services {
   pub app: Arc<Mutex<App>>,
+  /// The engine's event spine, opened by `start_services` so every producer
+  /// (player events, recovery teardown) shares one channel; the frontend's
+  /// fold task takes the receiving half. Streaming-gated: the producers only
+  /// exist under that feature.
+  #[cfg(feature = "streaming")]
+  pub spine: crate::runtime::engine::Spine,
+  #[cfg(feature = "streaming")]
+  pub spine_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::EngineEvent>,
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub user_config: UserConfig,
   /// Real-time position updates from the native player event handler;
@@ -763,6 +774,10 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   #[cfg(feature = "streaming")]
   let (streaming_recovery_tx, streaming_recovery_rx) =
     tokio::sync::mpsc::unbounded_channel::<player::StreamingRecoveryRequest>();
+  // One spine for the streaming producers (player event handler + recovery
+  // task). The fold task in `frontend` takes the receiving half via Services.
+  #[cfg(feature = "streaming")]
+  let (spine_for_events, spine_rx) = crate::runtime::engine::Spine::open(Default::default());
   #[cfg(feature = "streaming")]
   {
     let mut app_mut = app.lock().await;
@@ -1003,6 +1018,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       },
       initial_shuffle_enabled,
       recovery_tx: streaming_recovery_tx.clone(),
+      spine: spine_for_events.clone(),
       shared_position: shared_position_for_events,
       shared_is_playing: shared_is_playing_for_events,
       #[cfg(all(feature = "mpris", target_os = "linux"))]
@@ -1020,6 +1036,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       app: Arc::clone(&app),
       shared_position: Arc::clone(&shared_position),
       shared_is_playing: Arc::clone(&shared_is_playing),
+      spine: spine_for_events.clone(),
       recovery_rx: streaming_recovery_rx,
       recovery_tx: streaming_recovery_tx.clone(),
       client_config: client_config.clone(),
@@ -1104,6 +1121,12 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let shared_position_for_ui: Option<Arc<AtomicU64>> = None;
 
   Ok(Services {
+    #[cfg(feature = "streaming")]
+    spine: spine_for_events.clone(),
+    // Opened again only to extract the receiver of the channel whose sender
+    // the spine clones share (single producer-side Spine, one receiver).
+    #[cfg(feature = "streaming")]
+    spine_rx,
     app,
     user_config,
     shared_position_for_ui,

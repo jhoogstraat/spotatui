@@ -96,8 +96,7 @@ fn chain_is_written(source: &str, chain_start: usize) -> bool {
   }
   if pos == chain_start {
     return false; // no field name after the prefix
-  }
-  // Only same-line spacing may separate the chain from the operator.
+  } // Only same-line spacing may separate the chain from the operator.
   while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
     pos += 1;
   }
@@ -165,6 +164,48 @@ fn count_production_action_refs(source: &str) -> usize {
     .count()
 }
 
+/// Counts direct writes to the ticket-14 streaming mirror family in the
+/// librespot event handler: `native_is_playing`, `song_progress_ms`,
+/// `last_track_id`, `native_track_info`. After the migration these four may
+/// only be written by the fold task (`core::streaming_apply`); the recovery
+/// teardown keeps its synchronous writes until tickets 15–17 migrate that
+/// task (hence the measured count, not 0 — the counter is the ratchet;
+/// ticket 17 drives it to zero).
+///
+/// The chain passed here starts *after* a known field name, so
+/// [`chain_is_written`]'s "must begin with an ident" guard would misread a
+/// complete `receiver.field` chain as empty; the operator check is inlined
+/// instead, with identical semantics (same-line whitespace, then an
+/// assignment operator that is not `==` or `=>`).
+fn count_handler_mirror_writes(source: &str) -> usize {
+  const FIELDS: [&str; 4] = [
+    "native_is_playing",
+    "song_progress_ms",
+    "last_track_id",
+    "native_track_info",
+  ];
+  // A field access is `receiver.field`: the byte immediately before the
+  // match must be the dot (`app_lock.native_is_playing`). A bare occurrence
+  // preceded by whitespace, `(`, or a string literal is not a write target.
+  source
+    .lines()
+    .map(|line| {
+      FIELDS
+        .iter()
+        .filter(|field| {
+          let field = **field;
+          line.match_indices(field).any(|(pos, _)| {
+            pos > 0 && line.as_bytes()[pos - 1] == b'.' && {
+              let after = line[pos + field.len()..].trim_start_matches([' ', '\t']);
+              after.starts_with('=') && !after[1..].starts_with('=') && !after[1..].starts_with('>')
+            }
+          })
+        })
+        .count()
+    })
+    .sum()
+}
+
 fn load_baselines() -> BTreeMap<String, usize> {
   let path = repo_root().join("tools").join("gates.count");
   let text = read_source(&path);
@@ -228,12 +269,21 @@ fn ratchet_counters_match_the_checked_in_baselines() {
   // (name, measured value). Every counter must match its baseline exactly;
   // the direction a baseline may move is enforced against the merge base by
   // tools/check_gates_ratchet.sh.
-  let measured: [(&str, usize); 2] = [
+  let handler_mirror_writes = {
+    let events_path = root
+      .join("src")
+      .join("infra")
+      .join("player")
+      .join("events.rs");
+    count_handler_mirror_writes(&read_source(&events_path))
+  };
+  let measured: [(&str, usize); 3] = [
     (
       "wildcard_arms_in_action_tree",
       count_occurrences(&["src/core/action"], &[], "_ =>"),
     ),
     ("test_attribute_total", test_attribute_total),
+    ("handler_mirror_writes", handler_mirror_writes),
   ];
 
   let mut baselines = load_baselines();

@@ -128,6 +128,19 @@ pub fn apply_streaming_state(app: &mut App, event: StreamingStateEvent) -> Absor
         }
       }
     }
+    StreamingStateEvent::Teardown => {
+      // Mirror the old teardown clears. `is_streaming_active`,
+      // `native_device_id`, `seek_ms`, recovery fields, and
+      // `current_playback_context` stay owned by the recovery path (they are
+      // routing state), exactly as before.
+      if outcome.position_changed {
+        app.song_progress_ms = 0;
+      }
+      if outcome.info_changed {
+        app.native_track_info = None;
+        app.last_track_id = None;
+      }
+    }
     StreamingStateEvent::PositionChanged { .. } => {
       if outcome.position_changed {
         // Recovery snapshot rides every confirmed position advance.

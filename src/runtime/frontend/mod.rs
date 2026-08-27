@@ -126,6 +126,13 @@ pub struct Runtime {
   snapshot_tx: watch::Sender<Snapshot>,
   shutdown_tx: watch::Sender<bool>,
   spine: Spine,
+  /// Wake handle for the driver backstop loop. External producers that
+  /// mutate App-side pending state (e.g. a scripted volume ramp) can poke
+  /// this so flush duties run promptly instead of waiting out the backstop.
+  /// Currently only the shutdown path reads it, via `self.tick_wake` never
+  /// being poked externally — kept for ticket 16's producer rewiring.
+  #[allow(dead_code)]
+  tick_wake: Arc<tokio::sync::Notify>,
   tick_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
@@ -167,49 +174,57 @@ impl Runtime {
     let app = Arc::clone(&services.app);
     let (snapshot_tx, _snapshot_rx) = watch::channel(Snapshot::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // The event spine: every producer emits here; the publisher folds.
-    let (spine, events_rx) = Spine::open(Default::default());
-    // Snapshot publisher: wakes ONLY when the driver loop / apply path say
-    // state moved (the change bell), rebuilds once, and equality-dedups the
-    // publication. One writer, one dedup point.
+    // The event spine is opened by `start_services` so every producer shares
+    // one channel; this side receives events, the fold reduces them. On legs
+    // without `streaming` no producer exists, so the frontend opens a local
+    // spine just for command-side pokes.
+    #[cfg(not(feature = "streaming"))]
+    let (command_spine, events_rx) = Spine::open(Default::default());
+    #[cfg(feature = "streaming")]
+    let events_rx = services.spine_rx;
+    // The frontend's own spine handle for command-side pokes: on streaming
+    // legs the command path reuses the shared producer spine so ordering with
+    // player events is preserved.
+    #[cfg(feature = "streaming")]
+    let command_spine = services.spine.clone();
+    let spine = command_spine.clone();
+    // The fold task: consumes typed spine events, reduces them into App
+    // (single writer of the streaming mirrors), rebuilds once, and
+    // equality-dedups the publication. Also wakes on the legacy change bell
+    // until every producer is migrated (tickets 15–17 delete it).
     {
       let app = Arc::clone(&app);
       let tx = snapshot_tx.clone();
       rt.spawn(async move {
+        fold_loop(app, tx, events_rx).await;
+      });
+    }
+    // Legacy-bell wake: `apply`, the pump, and remaining direct writers ring
+    // `change_notify`; a small proxy converts those pokes into spine events so
+    // the fold stays the only place that decides when to republish.
+    {
+      let app = Arc::clone(&app);
+      let spine = command_spine.clone();
+      rt.spawn(async move {
         let notify = Arc::clone(&app.lock().await.change_notify);
         loop {
-          if tx.is_closed() {
-            break;
-          }
           notify.notified().await;
-          if tx.is_closed() {
-            break;
-          }
-          let guard = app.lock().await;
-          let next = build_snapshot(&guard);
-          drop(guard);
-          tx.send_if_modified(|current| {
-            if *current == next {
-              false
-            } else {
-              *current = next;
-              true
-            }
-          });
+          spine.emit(EngineEvent::changed(Changed::Session)).await;
         }
       });
     }
 
-    // The tick loop owns `Driver`, which is deliberately `!Send` (the Lua
+    // The tick thread owns `Driver`, which is deliberately `!Send` (the Lua
     // scripting engine is thread-local). Run it on a dedicated OS thread with
     // a current-thread reactor; everything it shares (`Arc<Mutex<App>>`, the
-    // shutdown watch, the notify bell) is `Send`.
+    // shutdown watch, the tick-wake notify) is `Send`.
     let (tick_done_tx, tick_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let tick_wake = Arc::new(tokio::sync::Notify::new());
     {
       let app = Arc::clone(&app);
       let shared_position = services.shared_position_for_ui;
       let history_collector = services.history_collector;
-      let driver_events_rx = events_rx;
+      let tick_wake = Arc::clone(&tick_wake);
       std::thread::Builder::new()
         .name("spotatui-frontend-tick".to_string())
         .spawn(move || {
@@ -223,7 +238,7 @@ impl Runtime {
               shutdown_rx,
               shared_position,
               history_collector,
-              driver_events_rx,
+              tick_wake,
             )
             .await;
           });
@@ -238,6 +253,7 @@ impl Runtime {
       snapshot_tx,
       shutdown_tx,
       spine,
+      tick_wake,
       tick_done_rx: Some(tick_done_rx),
     })
   }
@@ -355,7 +371,7 @@ async fn driver_loop(
   mut shutdown_rx: watch::Receiver<bool>,
   shared_position: Option<Arc<std::sync::atomic::AtomicU64>>,
   history_collector: crate::infra::history::HistoryCollectorHandle,
-  mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
+  tick_wake: Arc<tokio::sync::Notify>,
 ) {
   use crate::core::driver::{DiscordRpcHandle, MprisHandle};
   #[cfg(all(feature = "mpris", target_os = "linux"))]
@@ -373,6 +389,7 @@ async fn driver_loop(
   {
     let mut app = app.lock().await;
     driver.dispatch_startup(&mut app);
+    app.change_notify.notify_one();
   }
 
   let mut last_tick_at = Instant::now();
@@ -391,12 +408,7 @@ async fn driver_loop(
     tokio::pin!(backstop);
     tokio::select! {
       _ = &mut backstop => {}
-      event = events_rx.recv() => {
-        match event {
-          Some(EngineEvent::StateChanged(_)) => {}
-          None => break, // spine closed
-        }
-      }
+      _ = tick_wake.notified() => {}
       changed = shutdown_rx.changed() => {
         if changed.is_err() || *shutdown_rx.borrow() {
           break;
@@ -419,6 +431,9 @@ async fn driver_loop(
           cover_art_full_image_support: false,
         },
       );
+      // Tick-produced changes (poll resync, notice expiry) republish via the
+      // legacy bell; the bell proxy converts that into a spine event for the
+      // fold. Typed streaming events bypass the bell entirely (ticket 14).
       app.change_notify.notify_one();
     }
     if *shutdown_rx.borrow_and_update() {
@@ -470,6 +485,51 @@ impl Default for Snapshot {
       audio_pending: false,
       #[cfg(not(feature = "streaming"))]
       audio_pending: false,
+    }
+  }
+}
+
+/// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
+/// writer of published state. Typed streaming events are reduced through the
+/// domain before the snapshot rebuild; coarse `StateChanged` pokes just
+/// trigger a rebuild.
+async fn fold_loop(
+  app: Arc<Mutex<App>>,
+  tx: watch::Sender<Snapshot>,
+  mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
+) {
+  loop {
+    let event = tokio::select! {
+      event = events_rx.recv() => match event {
+        Some(event) => event,
+        None => break, // spine closed
+      },
+      _ = tx.closed() => break,
+    };
+    if let EngineEvent::Streaming(streaming) = &event {
+      #[cfg(feature = "streaming")]
+      {
+        let mut app = app.lock().await;
+        app.apply_streaming_state(streaming.clone());
+      }
+      #[cfg(not(feature = "streaming"))]
+      {
+        let _ = streaming;
+      }
+    }
+    let guard = app.lock().await;
+    let next = build_snapshot(&guard);
+    drop(guard);
+    tx.send_if_modified(|current| {
+      if *current == next {
+        false
+      } else {
+        *current = next;
+        true
+      }
+    });
+    if tx.is_closed() {
+      break;
     }
   }
 }

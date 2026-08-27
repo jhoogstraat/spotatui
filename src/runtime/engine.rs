@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::core::streaming::StreamingStateEvent;
+
 /// A typed runtime event. Every state mutation a frontend can observe enters
 /// the spine through one of these.
 ///
@@ -37,6 +39,10 @@ pub enum EngineEvent {
   /// differs from what is live. Carries which surface changed so later stages
   /// can shard the fold task without re-plumbing producers.
   StateChanged(Changed),
+  /// A typed streaming-state fact (ticket 14): the fold reduces these through
+  /// `StreamingState::absorb` + `apply_streaming_state` instead of any
+  /// producer touching shared playback fields.
+  Streaming(StreamingStateEvent),
 }
 
 /// Which state surface produced an event. Coarse on purpose: publication
@@ -55,6 +61,20 @@ impl EngineEvent {
   /// Convenience constructor for whole-surface churn.
   pub fn changed(which: Changed) -> Self {
     EngineEvent::StateChanged(which)
+  }
+
+  /// Emit-side result of a typed streaming fact: what the fold will absorb.
+  /// Mirrors [`AbsorbOutcome`] so a producer can decide cheaply whether the
+  /// event it just built is worth pushing (identical positions, duplicate
+  /// loads) before touching the channel.
+  pub fn streaming_is_significant(event: &StreamingStateEvent) -> bool {
+    match event {
+      // Position-only events are cheap and frequent; emit them all — the
+      // fold's floor drops duplicates. Significance here only filters
+      // obviously-unobservable construction, not ordering decisions.
+      StreamingStateEvent::PositionChanged { .. } => true,
+      _ => true,
+    }
   }
 }
 

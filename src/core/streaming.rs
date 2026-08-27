@@ -51,6 +51,12 @@ pub enum StreamingStateEvent {
   },
   /// librespot reported the device volume changed (physical or Connect sync).
   VolumeChanged { volume_percent: u8 },
+  /// The native backend was torn down (session disconnect or full recovery
+  /// rebuild): every playback mirror resets, metadata drops. One event
+  /// replaces the inline clears of the old teardown path (`is_streaming_active`
+  /// and `current_playback_context` stay with the recovery code: they are
+  /// routing state, not published playback facts).
+  Teardown,
   /// Periodic decoder clock: librespot's interstitial position updates.
   PositionChanged { position_ms: u32 },
 }
@@ -66,7 +72,8 @@ impl StreamingStateEvent {
       | StreamingStateEvent::Loading { .. }
       | StreamingStateEvent::TrackChanged { .. }
       | StreamingStateEvent::Stopped
-      | StreamingStateEvent::EndOfTrack { .. } => Surface::Playback,
+      | StreamingStateEvent::EndOfTrack { .. }
+      | StreamingStateEvent::Teardown => Surface::Playback,
       StreamingStateEvent::VolumeChanged { .. } => Surface::Volume,
       // Position refinements do not change any published field shape except
       // progress; they are still Playback-surface work, but the fold treats
@@ -179,27 +186,27 @@ impl StreamingState {
         track_uri,
         position_ms,
       } => {
-        let (new_track, mut outcome) = self.adopt_identity_if_new(track_uri);
+        let (_, mut outcome) = self.adopt_identity_if_new(track_uri);
         if !self.is_playing.unwrap_or(false) {
           self.is_playing = Some(true);
           outcome.play_state_changed = true;
         }
-        // Authoritative across a track boundary or as the first transport
-        // fact after one: mid-track backward jumps are stale duplicates
-        // (connection swap replays).
-        outcome.position_changed = self.advance_position(*position_ms, new_track || !self.anchored);
+        // Decoder truth: always lands (the old handler never staleness-checked
+        // Playing; it is the transport confirming where playback actually is).
+        outcome.position_changed = self.advance_position(*position_ms, true);
         outcome
       }
       StreamingStateEvent::Paused {
         track_uri,
         position_ms,
       } => {
-        let (new_track, mut outcome) = self.adopt_identity_if_new(track_uri);
+        let (_, mut outcome) = self.adopt_identity_if_new(track_uri);
         if self.is_playing.unwrap_or(true) {
           self.is_playing = Some(false);
           outcome.play_state_changed = true;
         }
-        outcome.position_changed = self.advance_position(*position_ms, new_track || !self.anchored);
+        // Decoder truth, same as Playing.
+        outcome.position_changed = self.advance_position(*position_ms, true);
         outcome
       }
       StreamingStateEvent::Seeked { position_ms } => {
@@ -231,6 +238,28 @@ impl StreamingState {
         // the first transport/seek fact for this track arrives.
         outcome.position_changed = self.reset_progress_unanchored();
         self.deanchor();
+        outcome
+      }
+      StreamingStateEvent::Teardown => {
+        // Full reset, identical to the old teardown writes: mirrors drop,
+        // transport reads not-playing, progress zeroes. Idempotent: a second
+        // Teardown against already-clear state is a no-op.
+        let mut outcome = AbsorbOutcome::none();
+        if self.track_info.is_some() || self.track_id.is_some() {
+          self.track_info = None;
+          self.track_id = None;
+          outcome.info_changed = true;
+        }
+        if self.position_ms != 0 {
+          outcome.position_changed = true;
+          self.reset_progress_unanchored();
+        } else if !self.anchored {
+          self.anchored = true;
+        }
+        if self.is_playing != Some(false) {
+          outcome.play_state_changed = true;
+          self.is_playing = Some(false);
+        }
         outcome
       }
       StreamingStateEvent::Stopped => {
@@ -285,19 +314,14 @@ impl StreamingState {
   /// positions are dropped instead of scrubbing the playbar backwards.
   fn advance_position(&mut self, position_ms: u32, authoritative: bool) -> bool {
     let position = u128::from(position_ms);
-    if authoritative {
+    // Authoritative positions re-anchor outright; otherwise the monotonic
+    // floor applies (and rises with every accepted advance, so a later
+    // duplicate cannot exploit an older, lower floor). A de-anchored state
+    // rejects everything until its transport/seek fact arrives.
+    if authoritative || (self.anchored && position >= self.position_floor) {
       self.position_floor = position;
     } else {
-      if !self.anchored {
-        // A boundary event is still waiting for its transport/seek fact:
-        // positions arriving meanwhile belong to the previous track and are
-        // dropped wholesale, whichever direction they point.
-        return false;
-      }
-      if position < self.position_floor {
-        return false;
-      }
-      self.position_floor = position;
+      return false;
     }
     self.anchored = true;
     if self.position_ms == position {
@@ -590,6 +614,89 @@ mod streaming_domain_tests {
     let mut state = StreamingState::default();
     state.absorb(&playing("spotify:track:abc", 8_000));
     let outcome = state.absorb(&StreamingStateEvent::PositionChanged { position_ms: 8_000 });
+    assert!(!outcome.any());
+  }
+
+  // ── Seek-during-load / event-ordering (ticket 14 + ticket 06 semantics) ──
+
+  #[test]
+  fn seek_issued_between_load_and_playback_survives_stale_positions() {
+    // Full sequence: user seeks while a load is pending → librespot emits
+    // Loading → PositionChanged from the OLD track (stale, higher) → Seeking
+    // to the target → Playing confirms at target. The stale position must not
+    // win over the seek.
+    let mut state = StreamingState::default();
+    state.absorb(&playing("spotify:track:first", 100_000));
+    state.absorb(&StreamingStateEvent::Loading {
+      track_uri: "spotify:track:second".to_string(),
+      position_ms: 0,
+    });
+    // Old track's last position, arriving late.
+    let outcome = state.absorb(&StreamingStateEvent::PositionChanged {
+      position_ms: 101_000,
+    });
+    assert!(!outcome.any(), "stale pre-load position rejected");
+    // The user's pending seek confirms.
+    let outcome = state.absorb(&StreamingStateEvent::Seeked {
+      position_ms: 30_000,
+    });
+    assert!(outcome.position_changed);
+    assert_eq!(state.position_ms, 30_000);
+    // Playback resumes from the seek target.
+    let outcome = state.absorb(&playing("spotify:track:second", 30_400));
+    assert!(state.position_ms == 30_400 && outcome.any());
+  }
+
+  #[test]
+  fn event_after_seek_cannot_move_position_backwards_mid_track() {
+    // The classic connection-swap replay: positions were advancing, a seek
+    // lands, then an old duplicate from before the seek arrives.
+    let mut state = StreamingState::default();
+    state.absorb(&playing("spotify:track:abc", 10_000));
+    state.absorb(&StreamingStateEvent::PositionChanged {
+      position_ms: 15_000,
+    });
+    state.absorb(&StreamingStateEvent::Seeked {
+      position_ms: 60_000,
+    });
+    let outcome = state.absorb(&StreamingStateEvent::PositionChanged {
+      position_ms: 15_500,
+    });
+    assert!(!outcome.any());
+    assert_eq!(state.position_ms, 60_000);
+  }
+
+  #[test]
+  fn paused_confirms_a_lower_position_without_being_treated_as_stale() {
+    // A user pauses right after seeking backwards: Paused carries the
+    // decoder's authoritative lower position (the seek lowered the floor,
+    // but the paused position confirms the actual player state).
+    let mut state = StreamingState::default();
+    state.absorb(&playing("spotify:track:abc", 50_000));
+    state.absorb(&StreamingStateEvent::Seeked { position_ms: 5_000 });
+    let outcome = state.absorb(&paused("spotify:track:abc", 4_900));
+    assert_eq!(state.is_playing, Some(false), "pause always lands");
+    assert_eq!(state.position_ms, 4_900, "decoder truth wins over floor");
+  }
+
+  #[test]
+  fn teardown_after_track_changed_clears_everything() {
+    // Session-disconnect ordering: TrackChanged was folded, then the transport
+    // died. Teardown must reset mirrors exactly once.
+    let mut state = StreamingState::default();
+    state.absorb(&StreamingStateEvent::TrackChanged {
+      info: info("Ghost"),
+      track_uri: "spotify:track:ghost".to_string(),
+    });
+    state.absorb(&playing("spotify:track:ghost", 20_000));
+    let outcome = state.absorb(&StreamingStateEvent::Teardown);
+    assert!(outcome.any());
+    assert_eq!(state.track_id, None);
+    assert_eq!(state.track_info, None);
+    assert_eq!(state.position_ms, 0);
+    assert_eq!(state.is_playing, Some(false));
+    // A second teardown is a no-op.
+    let outcome = state.absorb(&StreamingStateEvent::Teardown);
     assert!(!outcome.any());
   }
 
