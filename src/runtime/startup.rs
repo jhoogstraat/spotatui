@@ -7,11 +7,6 @@ use super::pump::start_tokio;
 use crate::core::app::App;
 #[cfg(feature = "streaming")]
 use crate::core::config::ClientConfig;
-#[cfg_attr(
-  not(all(feature = "mpris", target_os = "linux")),
-  allow(unused_imports)
-)]
-use crate::core::driver::MprisHandle;
 use crate::core::user_config::StartupBehavior;
 use crate::core::user_config::UserConfig;
 #[cfg(feature = "discord-rpc")]
@@ -621,13 +616,6 @@ pub(super) struct Services {
   /// Real-time position updates from the native player event handler;
   /// `None` in builds where nothing produces one.
   pub shared_position_for_ui: Option<Arc<AtomicU64>>,
-  // Read only by the terminal runner, and only on Linux + mpris builds.
-  #[cfg_attr(not(all(feature = "mpris", target_os = "linux")), allow(dead_code))]
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  pub mpris_for_ui: Option<Arc<mpris::MprisManager>>,
-  #[cfg(not(all(feature = "mpris", target_os = "linux")))]
-  #[allow(dead_code)]
-  pub mpris_for_ui: MprisHandle,
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub discord_rpc_manager: DiscordRpcHandle,
   pub history_collector: crate::infra::history::HistoryCollectorHandle,
@@ -1120,12 +1108,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     start_tokio(sync_io_rx, &mut network).await;
   });
 
-  // Clone MPRIS manager for the UI loop (to update status on device changes)
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  let mpris_for_ui = mpris_manager.clone();
-  #[cfg(not(all(feature = "mpris", target_os = "linux")))]
-  let mpris_for_ui: MprisHandle = None;
-
   #[cfg(feature = "streaming")]
   let shared_position_for_ui: Option<Arc<AtomicU64>> = Some(shared_position_for_ui);
   #[cfg(not(feature = "streaming"))]
@@ -1137,7 +1119,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     app,
     user_config,
     shared_position_for_ui,
-    mpris_for_ui,
     discord_rpc_manager,
     history_collector,
   })
