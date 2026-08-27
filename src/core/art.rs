@@ -163,6 +163,7 @@ pub struct CoverArtStore {
   pub status: CoverArtStatus,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl CoverArtStore {
   /// The cache-identity key of the stored image (the URL or file URI it was
   /// decoded from), if any art is loaded.

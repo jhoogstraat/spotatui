@@ -7,6 +7,7 @@ use super::cavacore::{
 /// cavacore was written for 16-bit-scale samples (cava's own f32 input path
 /// multiplies by USHRT_MAX); cpal/PipeWire deliver f32 in [-1, 1], so scale up
 /// before the f64 cast or autosens ramps against a mis-scaled noise floor.
+#[cfg_attr(not(test), allow(dead_code))]
 const SAMPLE_SCALE: f64 = 32768.0;
 
 /// Cap on cavacore's autosens gain. Uncapped autosens (cava's behavior)
@@ -16,6 +17,7 @@ const SAMPLE_SCALE: f64 = 32768.0;
 const MAX_AUTOSENS_GAIN: f64 = 6.0;
 
 /// Spectrum data for visualization
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub struct SpectrumData {
   /// Normalized bars (0.0-1.0) in cava's default stereo display order: left
@@ -40,6 +42,7 @@ pub struct AudioAnalyzer {
   spectrum: SpectrumData,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl AudioAnalyzer {
   pub fn new(sample_rate: u32, display_bars: usize) -> Self {
     let sample_rate = clamp_sample_rate(sample_rate);
@@ -167,8 +170,10 @@ fn build_cava(sample_rate: u32, bars_per_channel: usize) -> Cava {
 }
 
 /// Thread-safe wrapper for AudioAnalyzer
+#[cfg_attr(not(test), allow(dead_code))]
 pub type SharedAnalyzer = Arc<Mutex<AudioAnalyzer>>;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn create_shared_analyzer(sample_rate: u32, display_bars: usize) -> SharedAnalyzer {
   Arc::new(Mutex::new(AudioAnalyzer::new(sample_rate, display_bars)))
 }
@@ -176,6 +181,7 @@ pub fn create_shared_analyzer(sample_rate: u32, display_bars: usize) -> SharedAn
 /// Resize to `desired_bars` and read the next frame of spectrum data. Both
 /// capture backends share this so the "resize before you read" ordering is
 /// stated once.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn spectrum_for(analyzer: &SharedAnalyzer, desired_bars: usize) -> Option<SpectrumData> {
   let mut analyzer = analyzer.lock().ok()?;
   analyzer.set_bars(desired_bars);

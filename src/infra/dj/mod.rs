@@ -128,6 +128,8 @@ impl DjSuggestion {
 #[cfg_attr(not(feature = "ai-dj"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DjSpeaker {
+  // Constructed only by the scripting chat path; tests cover it elsewhere.
+  #[allow(dead_code)]
   User,
   Dj,
   /// Machine-generated notes ("queued 5 tracks, 1 not found"), styled apart from
@@ -144,6 +146,7 @@ pub struct DjLine {
 
 #[cfg_attr(not(feature = "ai-dj"), allow(dead_code))]
 impl DjLine {
+  #[allow(dead_code)]
   pub fn user(text: impl Into<String>) -> Self {
     Self {
       speaker: DjSpeaker::User,
@@ -230,10 +233,16 @@ pub struct DjState {
   /// second refill and two batches would land.
   pub turn_seq: u64,
   pub vibe: Option<String>,
+  // Chat input state: written by the deleted TUI chat line, read only in
+  // tests since. Kept so a restored frontend sees identical shape.
+  #[allow(dead_code)]
   pub input: Vec<char>,
+  #[allow(dead_code)]
   pub input_idx: usize,
+  #[allow(dead_code)]
   pub input_cursor: u16,
   /// Scroll offset into the *wrapped* transcript rows, not the message list.
+  #[allow(dead_code)]
   pub scroll: u16,
   /// URIs of the tracks the DJ put into the native queue. A vibe shift drops
   /// exactly these, so the change is audible now rather than six tracks from
@@ -301,6 +310,7 @@ impl DjState {
   /// own: a listener who asked a question and then flipped the toggle is still
   /// owed the answer.
   #[cfg_attr(not(feature = "ai-dj"), allow(dead_code))]
+  #[allow(dead_code)]
   pub fn asked_turn_in_flight(&self) -> bool {
     self.thinking && self.turn_kind == TurnKind::Ask
   }
@@ -331,11 +341,13 @@ impl DjState {
   /// One named dismissal path, so a step and a cursor can never be left
   /// half-finished for the next open to render.
   #[cfg(feature = "ai-dj")]
+  #[allow(dead_code)]
   pub fn close_setup(&mut self) {
     self.setup = None;
   }
 
   #[cfg_attr(not(feature = "ai-dj"), allow(dead_code))]
+  #[allow(dead_code)]
   pub fn take_input(&mut self) -> String {
     let text = self.input.iter().collect::<String>();
     self.input.clear();

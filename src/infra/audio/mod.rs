@@ -48,11 +48,10 @@ pub use capture::AudioCaptureManager;
 #[allow(unused_imports)]
 pub use analyzer::SpectrumData;
 
-// Fallback types when no audio-viz feature is enabled
-#[cfg(not(any(
-  all(feature = "audio-viz", target_os = "linux"),
-  feature = "audio-viz-cpal"
-)))]
+// Fallback types when no audio-viz feature is enabled. The fallback guard
+// must not overlap the analyzer re-export above (both used to be active on
+// linux + audio-viz, E0255).
+#[cfg(not(any(feature = "audio-viz", feature = "audio-viz-cpal")))]
 #[derive(Clone, Default)]
 #[allow(dead_code)]
 pub struct SpectrumData {

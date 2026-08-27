@@ -30,6 +30,8 @@ pub fn clamp_playbar_cover_art_size_percent(value: u16) -> u16 {
 // this, so it follows `cover-art` while its `clamp` sibling stays with the
 // decode half for config loading.
 #[cfg(feature = "cover-art")]
+// TUI-only normalization: the settings row died with the terminal UI.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn normalize_playbar_cover_art_size_percent(value: i64) -> u16 {
   value.clamp(
     MIN_PLAYBAR_COVER_ART_SIZE_PERCENT as i64,

@@ -12,6 +12,8 @@
 //! **Nothing here spawns a process or makes a request.** Detection stats `PATH`;
 //! see [`on_path`].
 
+#![allow(dead_code)] // DJ setup picker UI died with the TUI; data + tests retained.
+
 use crate::core::user_config::BehaviorConfig;
 use std::path::{Path, PathBuf};
 

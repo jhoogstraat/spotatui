@@ -74,6 +74,11 @@ mod construction;
 // wholesale, but three of its methods are production state, not presentation
 // (DJ queue bookkeeping + the AI-DJ screen opener reachable from OpenLibrary).
 mod dj;
+// Cover-art store + adaptive-theme syncing (stage 2a dropped the file with the
+// TUI; the all-sources leg still calls store/clear_cover_art from the network
+// layer and driver).
+#[cfg(feature = "art-decode")]
+mod cover_theme_impl;
 mod library;
 mod lyrics;
 mod models;
