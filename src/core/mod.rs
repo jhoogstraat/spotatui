@@ -8,6 +8,8 @@ pub mod action;
 // lines go with it.
 #[allow(dead_code)]
 pub mod app;
+pub mod streaming;
+
 #[cfg(feature = "art-decode")]
 pub mod art;
 pub mod auth;

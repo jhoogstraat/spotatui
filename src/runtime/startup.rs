@@ -1116,6 +1116,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
 /// Pause native playback on the way out so the Connect device does not keep
 /// reporting this session as playing after the process exits. Shared by the
 /// terminal runner and the `frontend` module.
+#[cfg(feature = "streaming")]
 pub(crate) async fn pause_native_playback_before_exit(app: &Arc<Mutex<App>>) {
   let player = {
     let mut app = app.lock().await;

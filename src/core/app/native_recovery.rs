@@ -765,7 +765,7 @@ pub struct RecoveryDecision {
 pub const STREAMING_MAX_RECOVERY_ATTEMPTS: u8 = 2;
 
 /// Pure state machine over one load/restore generation.
-#[cfg(feature = "streaming")]
+#[cfg_attr(not(feature = "streaming"), allow(dead_code))]
 pub fn streaming_recovery_decision(
   attempts_used: u8,
   observation: StreamingObservation,

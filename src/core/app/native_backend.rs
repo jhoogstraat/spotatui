@@ -20,7 +20,7 @@ pub enum NativeTrackKind {
 
 /// Immediate track info from native player for instant UI updates
 /// Used to display track info immediately when skipping, before API responds
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NativeTrackInfo {
   pub name: String,
   /// Individual credited artist names, in order. Kept structured (not a

@@ -30,16 +30,11 @@ use rspotify::{
 };
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-// Bare `Arc` here is only ever named by the streaming player, the MPRIS manager,
-// and the decoded queue-slot accessors below (whose gate is the queueable
-// sources, not `audio-decode` — a radio-only build has no queue slot).
-#[cfg(any(
-  feature = "streaming",
-  feature = "local-files",
-  feature = "subsonic",
-  feature = "youtube",
-  all(feature = "mpris", target_os = "linux")
-))]
+// Bare `Arc` names the streaming player, the MPRIS manager, and the decoded
+// queue-slot accessors below — plus `change_notify`, which every build
+// publishes, so this import stays unconditional even on legs without any of
+// those features.
+#[allow(unused_imports)]
 use std::sync::Arc;
 use std::{
   cmp::{max, min},
@@ -110,6 +105,8 @@ pub use native_backend::*;
 pub use native_recovery::*;
 #[cfg(feature = "streaming")]
 pub(crate) use native_shuffle::*;
+// The event-boundary URI normalizer the streaming domain reuses (ticket 14).
+pub(crate) use native_shuffle::base62_id_of;
 pub use playlist_folders::*;
 pub use playlists::*;
 pub use plugins::*;
