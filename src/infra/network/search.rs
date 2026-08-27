@@ -42,6 +42,23 @@ pub trait SearchNetwork {
   async fn search_tracks_for_playlist(&mut self, search_term: String);
 }
 
+impl Network {
+  /// Ticket 15: mark a search as finished-with-error so the fold retires the
+  /// loading flag even though no rows landed. Emits a completion carrying no
+  /// rows; per-source error messages continue through `handle_error` unchanged.
+  async fn search_failed_spotify(&mut self, query: &str) {
+    crate::runtime::engine::emit_catalog_event(
+      &self.app,
+      crate::core::catalog::CatalogStateEvent::SearchCompleted {
+        source: crate::core::source::Source::Spotify,
+        query: query.to_string(),
+        tracks: None,
+      },
+    )
+    .await;
+  }
+}
+
 impl SearchNetwork for Network {
   async fn get_search_results(&mut self, search_term: String, country: Option<Country>) {
     // Don't pass market to search - when market is specified, Spotify doesn't return
@@ -80,6 +97,7 @@ impl SearchNetwork for Network {
     let track_result = match track_search {
       Ok(res) => Some(res.tracks),
       Err(e) => {
+        self.search_failed_spotify(&search_term).await;
         self.handle_error(anyhow!(e)).await;
         return;
       }
