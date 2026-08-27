@@ -114,6 +114,7 @@ impl Default for App {
       spotify_connected: false,
       auth_refresh_in_progress: false,
       auth_state: crate::core::auth::AuthState::default(),
+      streaming_state: crate::core::streaming::StreamingState::default(),
 
       active_announcement: None,
       pending_announcements: Vec::new(),

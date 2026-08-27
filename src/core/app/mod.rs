@@ -70,6 +70,10 @@ use std::collections::HashMap;
 use std::sync::mpsc::channel;
 
 mod construction;
+// Restored in the CI repair: stage 2a's presentation purge removed this file
+// wholesale, but three of its methods are production state, not presentation
+// (DJ queue bookkeeping + the AI-DJ screen opener reachable from OpenLibrary).
+mod dj;
 mod library;
 mod lyrics;
 mod models;
@@ -107,6 +111,7 @@ pub use native_recovery::*;
 pub(crate) use native_shuffle::*;
 // The event-boundary URI normalizer the streaming domain reuses (ticket 14).
 pub(crate) use native_shuffle::base62_id_of;
+
 pub use playlist_folders::*;
 pub use playlists::*;
 pub use plugins::*;
@@ -339,6 +344,10 @@ pub struct App {
   pub settings_saved_items: Vec<SettingItem>,
   /// Immediate track info from native player for instant UI updates
   pub native_track_info: Option<NativeTrackInfo>,
+  /// The streaming domain's authoritative playback facts (ticket 14): folded
+  /// in stream order by `core::streaming`; the mirror fields below are written
+  /// only through [`crate::core::streaming::apply_streaming_state`].
+  pub streaming_state: crate::core::streaming::StreamingState,
   /// Whether native streaming is active (disables API-based progress calculation)
   pub is_streaming_active: bool,
   /// Device id for the native streaming device when known

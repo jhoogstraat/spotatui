@@ -8,7 +8,17 @@
 use crate::core::theme::Color;
 use std::time::Duration;
 
-use crate::core::app::ease_in_out_cubic;
+// Restored from the deleted lyrics.rs (stage 2a moved it out with the
+// terminal presentation code; the theme fade still needs the easing curve).
+#[cfg_attr(not(feature = "art-decode"), allow(dead_code))]
+fn ease_in_out_cubic(t: f64) -> f64 {
+  if t < 0.5 {
+    4.0 * t * t * t
+  } else {
+    1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+  }
+}
+
 use crate::core::user_config::Theme;
 
 /// How long a theme fade takes. Long enough to read as a transition, short

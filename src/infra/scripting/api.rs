@@ -930,7 +930,7 @@ fn install_string_action(
   tbl: &mlua::Table,
   shared: &Rc<ScriptShared>,
   name: &'static str,
-  make: fn(String) -> Action,
+  make: fn(String) -> EngineAction,
 ) -> mlua::Result<()> {
   let shared = shared.clone();
   let f = lua.create_function(move |_, value: String| {
@@ -1332,7 +1332,7 @@ pub(super) fn install_action(
   tbl: &mlua::Table,
   shared: &Rc<ScriptShared>,
   name: &str,
-  make: fn() -> Action,
+  make: fn() -> EngineAction,
 ) -> mlua::Result<()> {
   let shared = shared.clone();
   let f = lua.create_function(move |_, ()| {

@@ -111,7 +111,9 @@ fn write_handshake(handshake: &Handshake) -> Result<()> {
 }
 
 /// Remove the published handshake. Called on shutdown so a relay does not chase
-/// a socket that is gone.
+/// a socket that is gone. (Its runtime caller lands with ticket 16's shutdown
+/// rewiring; the test covers it meanwhile.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn clear_handshake() {
   if let Ok(path) = handshake_path() {
     let _ = std::fs::remove_file(path);

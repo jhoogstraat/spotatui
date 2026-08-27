@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::core::action::Action;
+use crate::core::action::EngineAction as Action;
 use crate::core::app::PluginDataKind;
 use crate::core::plugin_api::{
   ConfigSnapshot, DeviceInfo, PlaybackState, PlaylistInfo, QueueSnapshot, SearchResults,

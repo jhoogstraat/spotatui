@@ -9,6 +9,16 @@ pub mod action;
 #[allow(dead_code)]
 pub mod app;
 pub mod streaming;
+#[cfg(feature = "streaming")]
+mod streaming_apply;
+
+// Re-exported for producers/fold; until the handler migration commit in this
+// ticket, no non-test consumer exists on some legs.
+#[allow(unused_imports)]
+pub use streaming::{AbsorbOutcome, StreamingState, StreamingStateEvent};
+#[cfg(feature = "streaming")]
+#[allow(unused_imports)]
+pub use streaming_apply::apply_streaming_state;
 
 #[cfg(feature = "art-decode")]
 pub mod art;

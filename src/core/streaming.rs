@@ -10,9 +10,12 @@
 //!
 //! Until ticket 18 dissolves the mega-mutex, `App` keeps the legacy mirror
 //! fields (`native_is_playing`, `song_progress_ms`, …); only the fold writes
-//! them, and the same reducer runs inside `App`-locked mutation paths via
-//! [`crate::core::app::App::apply_streaming_state`] so those legacy mirrors can
-//! never disagree with the fold's own copy.
+//! them, via [`crate::core::streaming_apply::apply_streaming_state`].
+//!
+//! Producers arrive in this same ticket; until the handler migration commit
+//! lands, CI legs compile this module without a consumer, so dead-code stays
+//! allowed at module scope (deleted when the last consumer wires up).
+#![cfg_attr(any(not(feature = "streaming"), not(test)), allow(dead_code))]
 
 use crate::core::app::NativeTrackInfo;
 
@@ -84,6 +87,8 @@ pub enum Surface {
 /// A seek the fold must issue toward the player because an optimistic UI seek
 /// outran confirmation. Absorbing it records the pending target; the App-level
 /// flush path (existing throttle machinery) owns actually sending it.
+/// Reserved for ticket 16's command-side seek consolidation.
+#[cfg_attr(not(feature = "streaming"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeekIntent {
   pub position_ms: u32,
@@ -127,7 +132,8 @@ pub struct AbsorbOutcome {
 }
 
 impl AbsorbOutcome {
-  fn none() -> Self {
+  /// No published surface moved.
+  pub fn none() -> Self {
     AbsorbOutcome {
       info_changed: false,
       play_state_changed: false,
@@ -205,7 +211,7 @@ impl StreamingState {
         track_uri,
         position_ms: _,
       } => {
-        let (new_track, mut outcome) = self.adopt_identity_if_new(track_uri);
+        let (new_track, outcome) = self.adopt_identity_if_new(track_uri);
         if !new_track {
           // Re-load of the same track: mirrors today's no-op.
           return AbsorbOutcome::none();
