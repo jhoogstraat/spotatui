@@ -35,10 +35,11 @@ use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 
 use super::{track_id_from_uri, SubsonicPlaybackState, SubsonicSource};
-use crate::core::app::{App, SearchResultBlock, TrackTableContext};
+use crate::core::app::{App, TrackTableContext};
+use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
-use crate::core::source::{MediaSource, Searcher};
+use crate::core::source::{MediaSource, Searcher, Source};
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
 use crate::infra::queue::{advance_index, replay_file};
@@ -220,27 +221,39 @@ async fn load_subsonic_tracks(app: &Arc<Mutex<App>>, playlist_uri: &str) {
 /// dispatches rspotify-bound `GetAlbum`/`GetArtist` events that fail for Subsonic
 /// ids, so those blocks are left `None` to avoid dead rows. Album/artist
 /// drill-down is a tracked follow-up.
+/// Run a catalog search and populate the visible rows **through the fold**
+/// (ticket 15): the handler emits typed events; `search_results` is written
+/// by `core::catalog_apply` on the fold task, which enforces the
+/// stale-request contract.
 async fn run_subsonic_search(app: &Arc<Mutex<App>>, query: &str) {
+  crate::runtime::engine::emit_catalog_event(
+    app,
+    CatalogStateEvent::SearchRequested {
+      source: Source::Subsonic,
+      query: query.to_string(),
+      scoped_loading: true,
+    },
+  )
+  .await;
   let Some(source) = build_source(app).await else {
     return;
   };
   match source.search(query).await {
     Ok(results) => {
       let total = results.tracks.len() as u32;
-      let mut app = app.lock().await;
-      app.search_results.tracks = Some(Paged {
-        items: results.tracks,
-        total,
-        ..Default::default()
-      });
-      app.search_results.albums = None;
-      app.search_results.artists = None;
-      app.search_results.playlists = None;
-      app.search_results.shows = None;
-      // Focus the songs block so the first hit is selectable immediately.
-      app.search_results.selected_tracks_index = Some(0);
-      app.search_results.hovered_block = SearchResultBlock::SongSearch;
-      app.search_results.selected_block = SearchResultBlock::Empty;
+      crate::runtime::engine::emit_catalog_event(
+        app,
+        CatalogStateEvent::SearchCompleted {
+          source: Source::Subsonic,
+          query: query.to_string(),
+          tracks: Some(Paged {
+            items: results.tracks,
+            total,
+            ..Default::default()
+          }),
+        },
+      )
+      .await;
     }
     Err(e) => set_error(app, format!("Subsonic search failed: {e}")).await,
   }

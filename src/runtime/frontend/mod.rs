@@ -175,17 +175,11 @@ impl Runtime {
     let (snapshot_tx, _snapshot_rx) = watch::channel(Snapshot::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // The event spine is opened by `start_services` so every producer shares
-    // one channel; this side receives events, the fold reduces them. On legs
-    // without `streaming` no producer exists, so the frontend opens a local
-    // spine just for command-side pokes.
-    #[cfg(not(feature = "streaming"))]
-    let (command_spine, events_rx) = Spine::open(Default::default());
-    #[cfg(feature = "streaming")]
+    // one channel; this side receives events, the fold reduces them.
     let events_rx = services.spine_rx;
     // The frontend's own spine handle for command-side pokes: on streaming
     // legs the command path reuses the shared producer spine so ordering with
     // player events is preserved.
-    #[cfg(feature = "streaming")]
     let command_spine = services.spine.clone();
     let spine = command_spine.clone();
     // The fold task: consumes typed spine events, reduces them into App
@@ -506,16 +500,23 @@ async fn fold_loop(
       },
       _ = tx.closed() => break,
     };
-    if let EngineEvent::Streaming(streaming) = &event {
-      #[cfg(feature = "streaming")]
-      {
+    match &event {
+      EngineEvent::Streaming(streaming) => {
+        #[cfg(feature = "streaming")]
+        {
+          let mut app = app.lock().await;
+          app.apply_streaming_state(streaming.clone());
+        }
+        #[cfg(not(feature = "streaming"))]
+        {
+          let _ = streaming;
+        }
+      }
+      EngineEvent::Catalog(catalog) => {
         let mut app = app.lock().await;
-        app.apply_streaming_state(streaming.clone());
+        crate::core::apply_catalog_state(&mut app, catalog);
       }
-      #[cfg(not(feature = "streaming"))]
-      {
-        let _ = streaming;
-      }
+      EngineEvent::StateChanged(_) => {}
     }
     let guard = app.lock().await;
     let next = build_snapshot(&guard);

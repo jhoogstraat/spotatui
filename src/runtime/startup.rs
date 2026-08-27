@@ -608,12 +608,9 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
 pub(super) struct Services {
   pub app: Arc<Mutex<App>>,
   /// The engine's event spine, opened by `start_services` so every producer
-  /// (player events, recovery teardown) shares one channel; the frontend's
-  /// fold task takes the receiving half. Streaming-gated: the producers only
-  /// exist under that feature.
-  #[cfg(feature = "streaming")]
+  /// (player events, recovery teardown, catalog dispatchers) shares one
+  /// channel; the frontend's fold task takes the receiving half.
   pub spine: crate::runtime::engine::Spine,
-  #[cfg(feature = "streaming")]
   pub spine_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::EngineEvent>,
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub user_config: UserConfig,
@@ -774,10 +771,20 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   #[cfg(feature = "streaming")]
   let (streaming_recovery_tx, streaming_recovery_rx) =
     tokio::sync::mpsc::unbounded_channel::<player::StreamingRecoveryRequest>();
-  // One spine for the streaming producers (player event handler + recovery
-  // task). The fold task in `frontend` takes the receiving half via Services.
-  #[cfg(feature = "streaming")]
+  // One spine for every producer: streaming (player events, recovery) plus
+  // catalog (dispatchers, network layer). The fold task in `frontend` takes
+  // the receiving half via Services.
   let (spine_for_events, spine_rx) = crate::runtime::engine::Spine::open(Default::default());
+  {
+    let mut app_mut = app.lock().await;
+    app_mut.spine = Some(spine_for_events.clone());
+  }
+  // Catalog producers (all five dispatchers + the network layer) emit through
+  // the same spine; they read the handle off App under their existing lock.
+  {
+    let mut app_mut = app.lock().await;
+    app_mut.spine = Some(spine_for_events.clone());
+  }
   #[cfg(feature = "streaming")]
   {
     let mut app_mut = app.lock().await;
@@ -1121,11 +1128,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let shared_position_for_ui: Option<Arc<AtomicU64>> = None;
 
   Ok(Services {
-    #[cfg(feature = "streaming")]
     spine: spine_for_events.clone(),
-    // Opened again only to extract the receiver of the channel whose sender
-    // the spine clones share (single producer-side Spine, one receiver).
-    #[cfg(feature = "streaming")]
     spine_rx,
     app,
     user_config,

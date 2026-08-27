@@ -348,6 +348,13 @@ pub struct App {
   /// in stream order by `core::streaming`; the mirror fields below are written
   /// only through [`crate::core::streaming::apply_streaming_state`].
   pub streaming_state: crate::core::streaming::StreamingState,
+  /// The catalog domain's request sequencing (ticket 15): the fold enforces
+  /// stale-request rejection through it before any catalog mirror write.
+  pub catalog_state: crate::core::catalog::CatalogState,
+  /// Spine handle for catalog producers (dispatchers, network layer): they
+  /// emit typed facts instead of writing shared catalog fields. Unconditional
+  /// in type; populated only where a producer needs it (the fold consumes).
+  pub spine: Option<crate::runtime::engine::Spine>,
   /// Whether native streaming is active (disables API-based progress calculation)
   pub is_streaming_active: bool,
   /// Device id for the native streaming device when known

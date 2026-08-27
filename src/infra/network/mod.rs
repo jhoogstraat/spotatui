@@ -599,6 +599,17 @@ impl Network {
         self.get_current_playback().await;
       }
       IoEvent::GetSearchResults(search_term, country) => {
+        // Ticket 15: register the request with the fold before fetching so a
+        // later superseding request can drop this completion.
+        crate::runtime::engine::emit_catalog_event(
+          &self.app,
+          crate::core::catalog::CatalogStateEvent::SearchRequested {
+            source: crate::core::source::Source::Spotify,
+            query: search_term.clone(),
+            scoped_loading: true,
+          },
+        )
+        .await;
         self.get_search_results(search_term, country).await;
       }
 

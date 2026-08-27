@@ -104,6 +104,9 @@ pub struct YouTubePlaybackState {
 
 impl YouTubePlaybackState {
   /// The currently playing video, if `index` is in range.
+  /// (Reader died with the terminal UI; kept for the upcoming
+  /// `queue_now`-style snapshot accessor. Drop at ticket 18 if still unused.)
+  #[cfg_attr(not(test), allow(dead_code))]
   pub fn current(&self) -> Option<&TrackInfo> {
     self.tracks.get(self.index)
   }

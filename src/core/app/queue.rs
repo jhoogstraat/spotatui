@@ -44,6 +44,7 @@ impl App {
     if self.is_native_streaming_active_for_playback() && !self.queue_owns_playback() {
       self.dispatch(IoEvent::GetQueue);
     }
+    self.emit_queue_mutated();
   }
 
   /// Remove the upcoming native-queue item at `index`. Out-of-range is a
@@ -52,6 +53,7 @@ impl App {
   pub fn remove_native_queued(&mut self, index: usize) {
     if index < self.native_queue.len() {
       self.native_queue.remove(index);
+      self.emit_queue_mutated();
     }
   }
 
@@ -74,6 +76,7 @@ impl App {
       }
       self.native_queue.swap(index, index + 1);
     }
+    self.emit_queue_mutated();
   }
 
   /// Drop every upcoming native-queue item. Nothing that is currently
@@ -81,6 +84,21 @@ impl App {
   /// Playable keeps playing and simply has nothing after it.
   pub fn clear_native_queue(&mut self) {
     self.native_queue.clear();
+    self.emit_queue_mutated();
+  }
+
+  /// Publish the post-mutation queue to the fold (ticket 15). Called from the
+  /// mutation methods themselves — the single write path both commands and
+  /// keyboard flows use — so every reader sees an ordered fact stream. A
+  /// no-op when no spine was installed (tests without a fold).
+  fn emit_queue_mutated(&mut self) {
+    if let Some(spine) = self.spine.as_ref() {
+      spine.emit_now(crate::runtime::engine::EngineEvent::Catalog(
+        crate::core::catalog::CatalogStateEvent::QueueMutated {
+          upcoming: self.native_queue.clone(),
+        },
+      ));
+    }
   }
 
   /// Whether the native queue's playback slot currently owns the output (either a

@@ -115,6 +115,8 @@ impl Default for App {
       auth_refresh_in_progress: false,
       auth_state: crate::core::auth::AuthState::default(),
       streaming_state: crate::core::streaming::StreamingState::default(),
+      catalog_state: crate::core::catalog::CatalogState::default(),
+      spine: None,
 
       active_announcement: None,
       pending_announcements: Vec::new(),

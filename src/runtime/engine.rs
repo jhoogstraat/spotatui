@@ -19,10 +19,14 @@
 //! stage 3 of ADR 0016 dissolves that struct into domain owners. This spine
 //! replaces the *timing model* first: nothing wakes unless an event arrives.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
+use crate::core::app::App;
+#[allow(unused_imports)]
+use crate::core::catalog::CatalogStateEvent;
 use crate::core::streaming::StreamingStateEvent;
 
 /// A typed runtime event. Every state mutation a frontend can observe enters
@@ -43,6 +47,10 @@ pub enum EngineEvent {
   /// `StreamingState::absorb` + `apply_streaming_state` instead of any
   /// producer touching shared playback fields.
   Streaming(StreamingStateEvent),
+  /// A typed catalog fact (ticket 15): search/library/queue mutations from
+  /// the dispatchers and network layer, folded with stale-request
+  /// enforcement.
+  Catalog(crate::core::catalog::CatalogStateEvent),
 }
 
 /// Which state surface produced an event. Coarse on purpose: publication
@@ -117,6 +125,20 @@ pub enum EngineCommand {
 
 pub use crate::core::action::LibraryTarget;
 
+/// Read the producer spine off `App` and emit one catalog event (ticket 15).
+///
+/// Producers run under their own locks; the spine handle lives on `App`
+/// (installed at boot), so emitting is lock-free. `None` in tests that never
+/// installed a spine: callers treat that as "fold absent, nothing to do".
+pub(crate) async fn emit_catalog_event(
+  app: &Arc<Mutex<App>>,
+  event: crate::core::catalog::CatalogStateEvent,
+) {
+  if let Some(spine) = app.lock().await.spine.as_ref() {
+    spine.emit(EngineEvent::Catalog(event)).await;
+  }
+}
+
 /// Channel bounds: the engine never blocks the window on a full channel, but
 /// the bounds keep a misbehaving producer from buffering unbounded copies.
 #[derive(Debug, Clone, Copy)]
@@ -152,7 +174,6 @@ impl Spine {
   pub async fn emit(&self, event: EngineEvent) {
     let _ = self.events_tx.try_send(event);
   }
-
   /// Synchronous fire-and-forget for contexts holding no async reactor
   /// (blocking threads, drop paths). Same lossy-on-overflow contract.
   pub fn emit_now(&self, event: EngineEvent) {

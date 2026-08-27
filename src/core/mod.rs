@@ -8,12 +8,17 @@ pub mod action;
 // lines go with it.
 #[allow(dead_code)]
 pub mod app;
+pub mod catalog;
+mod catalog_apply;
 pub mod streaming;
 #[cfg(feature = "streaming")]
 mod streaming_apply;
 
 // Re-exported for producers/fold; until the handler migration commit in this
 // ticket, no non-test consumer exists on some legs.
+#[allow(unused_imports)]
+pub use catalog::{CatalogOutcome, CatalogState, CatalogStateEvent};
+pub use catalog_apply::apply_catalog_state;
 #[allow(unused_imports)]
 pub use streaming::{AbsorbOutcome, StreamingState, StreamingStateEvent};
 #[cfg(feature = "streaming")]

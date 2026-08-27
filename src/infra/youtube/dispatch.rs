@@ -30,10 +30,11 @@ use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 
 use super::{is_youtube_uri, video_id_from_uri, YouTubePlaybackState, YouTubeSource};
-use crate::core::app::{App, SearchResultBlock};
+use crate::core::app::App;
+use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
-use crate::core::source::Searcher;
+use crate::core::source::{Searcher, Source};
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
 use crate::infra::queue::{advance_index, replay_file};
@@ -162,24 +163,32 @@ pub(crate) async fn build_source(app: &Arc<Mutex<App>>) -> YouTubeSource {
 /// M2 search, only the songs block is populated — each row is a video; Enter
 /// dispatches the `youtube:` URIs back through this module.
 async fn run_youtube_search(app: &Arc<Mutex<App>>, query: &str) {
+  crate::runtime::engine::emit_catalog_event(
+    app,
+    CatalogStateEvent::SearchRequested {
+      source: Source::YouTube,
+      query: query.to_string(),
+      scoped_loading: true,
+    },
+  )
+  .await;
   let source = build_source(app).await;
   match source.search(query).await {
     Ok(results) => {
       let total = results.tracks.len() as u32;
-      let mut app = app.lock().await;
-      app.search_results.tracks = Some(Paged {
-        items: results.tracks,
-        total,
-        ..Default::default()
-      });
-      app.search_results.albums = None;
-      app.search_results.artists = None;
-      app.search_results.playlists = None;
-      app.search_results.shows = None;
-      // Focus the songs block so the first hit is selectable immediately.
-      app.search_results.selected_tracks_index = Some(0);
-      app.search_results.hovered_block = SearchResultBlock::SongSearch;
-      app.search_results.selected_block = SearchResultBlock::Empty;
+      crate::runtime::engine::emit_catalog_event(
+        app,
+        CatalogStateEvent::SearchCompleted {
+          source: Source::YouTube,
+          query: query.to_string(),
+          tracks: Some(Paged {
+            items: results.tracks,
+            total,
+            ..Default::default()
+          }),
+        },
+      )
+      .await;
     }
     Err(e) => set_error(app, format!("YouTube search failed: {e}")).await,
   }

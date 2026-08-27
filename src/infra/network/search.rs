@@ -155,22 +155,45 @@ impl SearchNetwork for Network {
       app.dispatch(IoEvent::CurrentUserSavedShowsContains(show_ids));
     }
 
-    // Convert rspotify pages to domain Paged<T> before storing on App.
-    app.search_results.tracks = track_result
+    // Convert rspotify pages to domain Paged<T> before publishing through the
+    // fold (ticket 15): the completion event carries all five pages; the fold
+    // enforces the stale-request contract before replacing visible rows.
+    let tracks_page = track_result
       .as_ref()
       .map(|p| map_page(p, |t| TrackInfo::from(t)));
-    app.search_results.artists = artist_result
+    let search_term_snapshot = search_term.clone();
+    let artists_page = artist_result
       .as_ref()
       .map(|p| map_page(p, |a| ArtistInfo::from(a)));
-    app.search_results.albums = album_result
+    let albums_page = album_result
       .as_ref()
       .map(|p| map_page(p, |a| AlbumInfo::from(a)));
-    app.search_results.playlists = playlist_result
+    let playlists_page = playlist_result
       .as_ref()
       .map(|p| map_page(p, PlaylistInfo::from_simplified));
-    app.search_results.shows = show_result
+    let shows_page = show_result
       .as_ref()
       .map(|p| map_page(p, |s| ShowInfo::from(s)));
+
+    app.search_results.tracks = tracks_page.clone();
+    app.search_results.artists = artists_page;
+    app.search_results.albums = albums_page;
+    app.search_results.playlists = playlists_page;
+    app.search_results.shows = shows_page;
+
+    // Ticket 15: publish the completion through the spine as well. The
+    // direct writes above remain as the transition-period mirror (deleted
+    // with the mega-mutex in ticket 18); the event ordering is what the
+    // fold's stale-request enforcement keys on.
+    crate::runtime::engine::emit_catalog_event(
+      &self.app,
+      crate::core::catalog::CatalogStateEvent::SearchCompleted {
+        source: crate::core::source::Source::Spotify,
+        query: search_term_snapshot,
+        tracks: tracks_page,
+      },
+    )
+    .await;
 
     // A replaced page can be shorter than the previous one (or empty), which
     // would otherwise leave a stale selected-index pointing past the end of
