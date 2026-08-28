@@ -1,6 +1,6 @@
 use super::mapping::{map_page, playlist_items_page};
 use super::requests::{spotify_api_request_json_for_with_refresh, spotify_get_typed_for};
-use super::{Network};
+use super::Network;
 use crate::core::app::{
   ActiveBlock, App, PlaylistFolder, PlaylistFolderItem, PlaylistFolderNode, PlaylistFolderNodeType,
   RouteId,
@@ -51,10 +51,7 @@ fn populate_liked_song_ids_from_saved_tracks(
 /// Build the saved-tracks page-upsert event (ticket 16 batch 2). The page's
 /// raw track ids ride along: the fold merges them into the liked set, which
 /// is what the old inline write did under the same lock.
-fn saved_tracks_page_event(
-  page: &Page<SavedTrack>,
-  generation: u64,
-) -> CatalogStateEvent {
+fn saved_tracks_page_event(page: &Page<SavedTrack>, generation: u64) -> CatalogStateEvent {
   let mut liked_ids = Vec::with_capacity(page.items.len());
   for item in &page.items {
     if let Some(track_id) = &item.track.id {
@@ -126,7 +123,10 @@ pub async fn run_saved_tracks_prefetch(
     );
     let request_live = matches!(
       spine
-        .query(FoldQuery::LibraryRequestLive { generation, section: LibrarySection::SavedTracks { offset } })
+        .query(FoldQuery::LibraryRequestLive {
+          generation,
+          section: LibrarySection::SavedTracks { offset }
+        })
         .await,
       Ok(FoldAnswer::Bool(true))
     );
@@ -173,7 +173,9 @@ pub async fn run_saved_tracks_prefetch(
     let next_missing = matches!(
       spine
         .query(FoldQuery::NextLibraryOffset {
-          section: LibrarySection::SavedTracks { offset: candidate_next_offset },
+          section: LibrarySection::SavedTracks {
+            offset: candidate_next_offset
+          },
         })
         .await,
       Ok(FoldAnswer::Offset(Some(_)))
@@ -212,13 +214,8 @@ pub async fn prefetch_playlist_tracks_page_task(
 
     let path = format!("playlists/{}/items", playlist_id.id());
     let query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
-    let Ok(page) = spotify_get_typed_for::<Page<PlaylistItem>>(
-      &spotify,
-      &path,
-      &query,
-      &token_cache_path,
-    )
-    .await
+    let Ok(page) =
+      spotify_get_typed_for::<Page<PlaylistItem>>(&spotify, &path, &query, &token_cache_path).await
     else {
       let _ = spine
         .query(FoldQuery::ReleasePlaylistTracksOffset {
@@ -336,18 +333,21 @@ impl Network {
   /// synchronous path. The merge runs through a fold query so the CLI never
   /// locks `App` (ticket 16); failures propagate so the CLI reports them
   /// instead of acting on stale membership.
-  pub(crate) async fn resolve_liked_state_now(&mut self, ids: &[String]) -> anyhow::Result<()> {
+  pub(crate) async fn resolve_liked_state_now(
+    &mut self,
+    ids: &[String],
+  ) -> anyhow::Result<Vec<bool>> {
     let uris: Vec<String> = ids.iter().map(|id| format!("spotify:track:{id}")).collect();
     let is_saved_vec = self.library_contains_uris(&uris).await?;
     if let Some(spine) = self.spine.as_ref() {
       let _ = spine
         .query(FoldQuery::MergeLikedState {
           ids: ids.to_vec(),
-          is_saved: is_saved_vec,
+          is_saved: is_saved_vec.clone(),
         })
         .await;
     }
-    Ok(())
+    Ok(is_saved_vec)
   }
 
   async fn library_save_uris(&self, uris: &[String]) -> anyhow::Result<()> {
@@ -457,10 +457,7 @@ async fn liked_lookup_worker_task(
   loop {
     // Claim a batch in the fold (atomic drain of the pending set + running
     // flag); `None` means the pending set went empty and the worker exits.
-    let Some((batch, epoch)) = (match spine
-      .query(FoldQuery::ClaimLikedLookupBatch)
-      .await
-    {
+    let Some((batch, epoch)) = (match spine.query(FoldQuery::ClaimLikedLookupBatch).await {
       Ok(FoldAnswer::LikedBatch(batch)) => batch,
       _ => None,
     }) else {
@@ -494,9 +491,7 @@ async fn liked_lookup_worker_task(
         // Transient failure: back off and retry from THIS worker, so ids
         // enqueued while the request was in flight (which saw the running
         // flag and did not spawn) are not stranded without a worker.
-        let _ = spine
-          .query(FoldQuery::RependLikedLookup { batch })
-          .await;
+        let _ = spine.query(FoldQuery::RependLikedLookup { batch }).await;
         consecutive_failures += 1;
         tokio::time::sleep(std::time::Duration::from_secs(u64::from(
           2 * consecutive_failures,
@@ -507,9 +502,7 @@ async fn liked_lookup_worker_task(
         // Persistently failing: stop rather than hammer the endpoint. The
         // ids stay pending and the next dispatch restarts the worker.
         let _ = spine.query(FoldQuery::RependLikedLookup { batch }).await;
-        let _ = spine
-          .query(FoldQuery::StopLikedLookupWorker)
-          .await;
+        let _ = spine.query(FoldQuery::StopLikedLookupWorker).await;
         let _ = spine
           .emit(crate::runtime::engine::EngineEvent::Session(
             crate::runtime::engine::SessionFact::Status {
@@ -557,13 +550,8 @@ async fn fetch_all_playlist_tracks_and_sort_task(
       return;
     }
     let query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
-    match spotify_get_typed_for::<Page<PlaylistItem>>(
-      &spotify,
-      &path,
-      &query,
-      &token_cache_path,
-    )
-    .await
+    match spotify_get_typed_for::<Page<PlaylistItem>>(&spotify, &path, &query, &token_cache_path)
+      .await
     {
       Ok(page) => {
         if page.items.is_empty() {
@@ -841,9 +829,7 @@ impl LibraryNetwork for Network {
               .items
               .iter()
               .filter_map(|item| match &item.item {
-                Some(PlayableItem::Track(track)) => {
-                  track.id.as_ref().map(|id| id.id().to_string())
-                }
+                Some(PlayableItem::Track(track)) => track.id.as_ref().map(|id| id.id().to_string()),
                 _ => None,
               })
               .collect(),
@@ -915,7 +901,6 @@ impl LibraryNetwork for Network {
         }
       }
 
-
       if page.next.is_none() {
         break;
       }
@@ -942,7 +927,10 @@ impl LibraryNetwork for Network {
     };
     if applied {
       self
-        .emit_status(format!("{match_count} playlist tracks match \"{query}\""), 3)
+        .emit_status(
+          format!("{match_count} playlist tracks match \"{query}\""),
+          3,
+        )
         .await;
     }
   }
@@ -957,10 +945,7 @@ impl LibraryNetwork for Network {
     let Some(spine) = self.spine.clone() else {
       return;
     };
-    let generation = match spine
-      .query(FoldQuery::SavedTracksGeneration)
-      .await
-    {
+    let generation = match spine.query(FoldQuery::SavedTracksGeneration).await {
       Ok(FoldAnswer::U64(generation)) => generation,
       _ => return,
     };
@@ -1362,9 +1347,7 @@ impl LibraryNetwork for Network {
     };
     let ids: Vec<String> = ids.iter().map(|id| id.id().to_string()).collect();
     let spawn = matches!(
-      spine
-        .query(FoldQuery::EnqueueLikedLookup { ids })
-        .await,
+      spine.query(FoldQuery::EnqueueLikedLookup { ids }).await,
       Ok(FoldAnswer::Bool(true))
     );
     if !spawn {
@@ -1486,7 +1469,9 @@ impl LibraryNetwork for Network {
 
     // Refresh playlists: dispatched from the fold so the spinner semantics
     // stay with the single writer.
-    self.emit_session(SessionFact::DispatchPlaylistRefresh).await;
+    self
+      .emit_session(SessionFact::DispatchPlaylistRefresh)
+      .await;
 
     let status = format!("Playlist \"{}\" created!", name);
     self.show_status_message(status, 4).await;
@@ -1674,7 +1659,6 @@ async fn fetch_rootlist_folders_from(
   let contents = selected.contents.as_ref()?;
   Some(parse_rootlist_items(&contents.items))
 }
-
 
 // NOTE: on the slim leg this helper is only reached through the fold's
 // PublishPlaylistRefresh path, which itself is compiled unconditionally —

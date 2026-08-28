@@ -114,15 +114,15 @@ impl Options {
 use super::engine::{Changed, EngineCommand, EngineEvent, Spine};
 
 use crate::core::app::App;
+use crate::core::catalog::CatalogStateEvent;
 use crate::core::catalog::PlaylistSelection;
 #[cfg(feature = "streaming")]
 use crate::infra::network::library::structurize_playlist_folders;
 use crate::infra::network::library::{
   build_flat_playlist_items, maybe_prompt_community_pin, reconcile_playlist_selection,
 };
-use crate::core::catalog::CatalogStateEvent;
 use crate::infra::network::IoEvent;
-use crate::runtime::engine::{FoldAck, PlaylistRefreshPrevious};
+use crate::runtime::engine::{DeviceList, FoldAck, PlaylistRefreshPrevious};
 
 pub use super::engine::EngineCommand as FrontendEngineCommand;
 
@@ -146,7 +146,6 @@ pub struct Runtime {
   tick_wake: Arc<tokio::sync::Notify>,
   tick_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
-
 
 impl Runtime {
   /// Boot the runtime synchronously. Runs the full shared bootstrap
@@ -502,7 +501,11 @@ impl Default for Snapshot {
 /// trigger a rebuild. Session facts (ticket 16) replay the exact old handler
 /// code under the fold's lock; producer queries are answered here too, so no
 /// producer outside this task ever locks `App`.
-async fn fold_loop(
+/// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
+/// writer of App state outside producers. `pub(super)` so the CLI mode can
+/// run one for its subcommand lifetime (ticket 17: the CLI reads published
+/// state instead of locking App).
+pub(super) async fn fold_loop(
   app: Arc<Mutex<App>>,
   tx: watch::Sender<Snapshot>,
   mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
@@ -728,10 +731,7 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
 
 /// The fold's reducer for session facts (ticket 16). Byte-for-byte parity
 /// with the inline writes each producer used to make under the App lock.
-pub(crate) fn apply_session_fact(
-  app: &mut App,
-  fact: crate::runtime::engine::SessionFact,
-) {
+pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::SessionFact) {
   use crate::runtime::engine::{PostConnectFetch, SessionFact};
   match fact {
     SessionFact::Auth {
@@ -838,9 +838,7 @@ pub(crate) fn answer_query(
         .map(|id| app.liked_song_ids_set.contains(id))
         .collect(),
     ),
-    FoldQuery::UserId => {
-      FoldAnswer::User(app.user.as_ref().map(|user| user.id.clone()))
-    }
+    FoldQuery::UserId => FoldAnswer::User(app.user.as_ref().map(|user| user.id.clone())),
     FoldQuery::PlaylistTrackTableActive { playlist_id } => {
       let active = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
         .ok()
@@ -852,9 +850,7 @@ pub(crate) fn answer_query(
       FoldAnswer::Bool(app.playlist_refresh_generation == generation)
     }
     #[cfg(feature = "streaming")]
-    FoldQuery::StreamingPlayerHandle => {
-      FoldAnswer::StreamingPlayer(app.streaming_player.clone())
-    }
+    FoldQuery::StreamingPlayerHandle => FoldAnswer::StreamingPlayer(app.streaming_player.clone()),
     FoldQuery::PublishPlaylistRefresh {
       generation,
       playlists,
@@ -895,10 +891,18 @@ pub(crate) fn answer_query(
       };
       app.playlist_refresh_generation = app.playlist_refresh_generation.wrapping_add(1);
       app.playlists = Some(first_page);
-      let selected_is_in_first_page = original_selection.playlist_id.as_ref().is_some_and(
-        |selected| first_items.iter().any(|p| p.id.as_deref() == Some(selected.as_str())),
-      );
-      if !had_previous_complete || original_selection.playlist_id.is_none() || selected_is_in_first_page
+      let selected_is_in_first_page =
+        original_selection
+          .playlist_id
+          .as_ref()
+          .is_some_and(|selected| {
+            first_items
+              .iter()
+              .any(|p| p.id.as_deref() == Some(selected.as_str()))
+          });
+      if !had_previous_complete
+        || original_selection.playlist_id.is_none()
+        || selected_is_in_first_page
       {
         app.all_playlists = first_items.clone();
         app
@@ -924,12 +928,24 @@ pub(crate) fn answer_query(
         previous_complete,
       }
     }
+    // Ticket 17: command-surface reads of published state (CLI, DJ tools).
+    // The fold answers under its own lock; the caller never locks App.
+    FoldQuery::PlaybackContext => {
+      FoldAnswer::Playback(app.current_playback_context.clone().map(Box::new))
+    }
+    FoldQuery::Devices => FoldAnswer::Devices(app.devices.as_ref().map(DeviceList::from)),
+    FoldQuery::Playlists => FoldAnswer::Playlists(app.playlists.clone()),
+    FoldQuery::TableTracks => FoldAnswer::Tracks(app.track_table.tracks.clone()),
+    FoldQuery::SearchResults => FoldAnswer::Search(Box::new(app.search_results.clone())),
+    FoldQuery::LastError => FoldAnswer::StatusText(app.api_error.clone()),
+    FoldQuery::FlushStateSave => {
+      app.flush_state_save(true);
+      FoldAnswer::Bool(true)
+    }
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),
     ),
-    FoldQuery::SavedTracksGeneration => {
-      FoldAnswer::U64(app.saved_tracks_prefetch_generation)
-    }
+    FoldQuery::SavedTracksGeneration => FoldAnswer::U64(app.saved_tracks_prefetch_generation),
     FoldQuery::SpotifyConnected => FoldAnswer::Bool(app.spotify_connected),
     FoldQuery::ReleasePlaylistTracksPage {
       playlist_id,
@@ -1013,12 +1029,7 @@ pub(crate) fn answer_query(
         app.liked_lookup_worker_running = false;
         return FoldAnswer::LikedBatch(None);
       }
-      let batch: Vec<String> = app
-        .liked_lookup_pending
-        .iter()
-        .take(40)
-        .cloned()
-        .collect();
+      let batch: Vec<String> = app.liked_lookup_pending.iter().take(40).cloned().collect();
       for id in &batch {
         app.liked_lookup_pending.remove(id);
       }
@@ -1098,15 +1109,13 @@ pub(crate) fn answer_query(
         .ok()
         .map(|id| id.into_static())
         .is_some_and(|id| {
-          app.playlist_tracks_prefetch_generation == app.playlist_tracks_prefetch_generation
-            && app.is_playlist_track_table_active_for(&id)
+          // The old saved-tracks generation check has no playlist-tracks
+          // counterpart (no generation exists there); the claim is
+          // table-active + not already in flight.
+          app.is_playlist_track_table_active_for(&id)
         })
-        && !app
-          .playlist_tracks_prefetch_in_flight
-          .contains(&offset)
-        && app
-          .playlist_tracks_prefetch_in_flight
-          .insert(offset);
+        && !app.playlist_tracks_prefetch_in_flight.contains(&offset)
+        && app.playlist_tracks_prefetch_in_flight.insert(offset);
       FoldAnswer::Bool(claimed)
     }
     FoldQuery::ReleasePlaylistTracksOffset {

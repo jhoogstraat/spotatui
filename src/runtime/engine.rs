@@ -254,17 +254,13 @@ pub enum FoldQuery {
   },
   /// Liked membership for these ids (the like toggle reads it to decide
   /// save-vs-delete; the detached worker used to merge under one lock).
-  LikedState {
-    ids: Vec<String>,
-  },
+  LikedState { ids: Vec<String> },
   /// The current user id, for handlers that need it in a payload (playlist
   /// creation).
   UserId,
   /// Whether a playlist's track table is the active browse surface (the
   /// stale-page contract check `is_playlist_track_table_active_for`).
-  PlaylistTrackTableActive {
-    playlist_id: String,
-  },
+  PlaylistTrackTableActive { playlist_id: String },
   /// Merge a contains-response into the liked set (the CLI's inline resolve
   /// path): each id is inserted or removed per the API's answer.
   MergeLikedState {
@@ -369,6 +365,23 @@ pub enum FoldQuery {
   /// showing this section, and which offset should the user's pending
   /// selection apply to. Replaces the lock-and-branch the handler did.
   SavedTracksViewInfo,
+  // --- Ticket 17 (last readers): command-surface reads of published state.
+  // The CLI and DJ tools stopped locking App; these name the exact decision
+  // each read feeds, per the FoldQuery protocol rule above.
+  /// The current playback context (CLI toggle/seek/mark/status/share).
+  PlaybackContext,
+  /// The device list (CLI device pick + transfer).
+  Devices,
+  /// The sidebar playlist listing (CLI `list playlists`).
+  Playlists,
+  /// The visible track-table rows (CLI `list liked`).
+  TableTracks,
+  /// The latest catalog search results (CLI `play`/`search`).
+  SearchResults,
+  /// The last surfaced API error text (CLI decides success vs. failure).
+  LastError,
+  /// Force the pending state save out to disk now (CLI end-of-command).
+  FlushStateSave,
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -382,6 +395,16 @@ pub enum FoldAnswer {
   User(Option<String>),
   /// A claimed liked-lookup batch plus the epoch it was captured under.
   LikedBatch(Option<(Vec<String>, u64)>),
+  /// The current playback context (or `None` when nothing is playing).
+  Playback(Option<Box<rspotify::model::context::CurrentPlaybackContext>>),
+  /// The device list (or `None` before the first fetch).
+  Devices(Option<DeviceList>),
+  /// The sidebar playlist listing.
+  Playlists(Option<crate::core::pagination::Paged<crate::core::plugin_api::PlaylistInfo>>),
+  /// The visible track-table rows.
+  Tracks(Vec<crate::core::plugin_api::TrackInfo>),
+  /// The latest catalog search results.
+  Search(Box<crate::core::app::SearchResult>),
   /// Status text a fold query computed (the add-to-playlist ack).
   StatusText(String),
   /// The registration result for a playlist refresh (the page-1 install).
@@ -410,6 +433,11 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::Liked(v) => f.debug_tuple("Liked").field(v).finish(),
       FoldAnswer::User(v) => f.debug_tuple("User").field(v).finish(),
       FoldAnswer::LikedBatch(v) => f.debug_tuple("LikedBatch").field(v).finish(),
+      FoldAnswer::Playback(v) => f.debug_tuple("Playback").field(&v.is_some()).finish(),
+      FoldAnswer::Devices(v) => f.debug_tuple("Devices").field(&v.is_some()).finish(),
+      FoldAnswer::Playlists(v) => f.debug_tuple("Playlists").field(&v.is_some()).finish(),
+      FoldAnswer::Tracks(v) => f.debug_tuple("Tracks").field(&v.len()).finish(),
+      FoldAnswer::Search(v) => f.debug_tuple("Search").field(v).finish(),
       FoldAnswer::StatusText(v) => f.debug_tuple("StatusText").field(v).finish(),
       FoldAnswer::PlaylistRefreshRegistered { generation, .. } => f
         .debug_struct("PlaylistRefreshRegistered")
@@ -438,6 +466,37 @@ pub struct PlaylistRefreshPrevious {
   pub playlists: Vec<crate::core::plugin_api::PlaylistInfo>,
   pub folder_nodes: Option<Vec<crate::core::app::PlaylistFolderNode>>,
   pub folder_items: Vec<crate::core::app::PlaylistFolderItem>,
+}
+
+/// Fold-published device summary (ticket 17): rspotify's `DevicePayload`
+/// carries no `Clone`, so the fold answers with the exact fields command
+/// surfaces consume (name, id, volume).
+#[derive(Debug, Clone, Default)]
+pub struct DeviceList {
+  pub devices: Vec<DeviceSummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeviceSummary {
+  pub id: Option<String>,
+  pub name: String,
+  pub volume_percent: Option<u32>,
+}
+
+impl From<&rspotify::model::device::DevicePayload> for DeviceList {
+  fn from(payload: &rspotify::model::device::DevicePayload) -> Self {
+    DeviceList {
+      devices: payload
+        .devices
+        .iter()
+        .map(|d| DeviceSummary {
+          id: d.id.clone(),
+          name: d.name.clone(),
+          volume_percent: d.volume_percent,
+        })
+        .collect(),
+    }
+  }
 }
 
 /// The result of an acked emit: the fold has *applied* the event, and hands
@@ -473,10 +532,7 @@ impl Default for SpineBounds {
 #[derive(Debug, Clone)]
 pub struct Spine {
   events_tx: mpsc::Sender<EngineEvent>,
-  queries_tx: mpsc::Sender<(
-    FoldQuery,
-    oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
-  )>,
+  queries_tx: mpsc::Sender<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
   acks_tx: mpsc::Sender<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>,
 }
 
@@ -531,11 +587,7 @@ impl Spine {
   /// before this one — stream order is preserved, no lock needed.
   pub async fn emit_acked(&self, event: EngineEvent) -> Option<FoldAck> {
     let (tx, rx) = oneshot::channel();
-    self
-      .acks_tx
-      .send((event, tx))
-      .await
-      .ok()?;
+    self.acks_tx.send((event, tx)).await.ok()?;
     rx.await.ok().flatten()
   }
 
@@ -559,16 +611,12 @@ impl Spine {
 
 /// The receive half of the query channel; the fold task drains it between
 /// events. Interior mutability so the fold can hold it beside `events_rx`.
+type QuerySender = oneshot::Sender<Result<FoldAnswer, SpineClosed>>;
+type AckSender = oneshot::Sender<Option<FoldAck>>;
+
 pub struct QueryReceiver {
-  queries_rx: Mutex<
-    Option<
-      mpsc::Receiver<(
-        FoldQuery,
-        oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
-      )>,
-    >,
-  >,
-  acks_rx: Mutex<Option<mpsc::Receiver<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>>>,
+  queries_rx: Mutex<Option<mpsc::Receiver<(FoldQuery, QuerySender)>>>,
+  acks_rx: Mutex<Option<mpsc::Receiver<(EngineEvent, AckSender)>>>,
 }
 
 impl QueryReceiver {
@@ -583,7 +631,10 @@ impl QueryReceiver {
       .blocking_lock()
       .take()
       .map(|rx| FoldAcks { rx });
-    Some(FoldHandles { queries: queries?, acks: acks? })
+    Some(FoldHandles {
+      queries: queries?,
+      acks: acks?,
+    })
   }
 }
 
@@ -595,10 +646,7 @@ pub struct FoldHandles {
 
 /// Drain helper: `recv().await` / `try_recv()` on the taken receiver.
 pub struct FoldQueries {
-  pub(crate) rx: mpsc::Receiver<(
-    FoldQuery,
-    oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
-  )>,
+  pub(crate) rx: mpsc::Receiver<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
 }
 
 /// The acked-emit receive half: pairs an event with the responder the fold
@@ -609,10 +657,7 @@ pub struct FoldAcks {
 impl FoldQueries {
   pub async fn recv(
     &mut self,
-  ) -> Option<(
-    FoldQuery,
-    oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
-  )> {
+  ) -> Option<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)> {
     self.rx.recv().await
   }
 }
@@ -630,5 +675,3 @@ pub(crate) async fn emit_catalog_event(
     spine.emit(EngineEvent::Catalog(event)).await;
   }
 }
-
-

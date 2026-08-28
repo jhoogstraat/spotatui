@@ -25,7 +25,7 @@ pub struct RecapPromptState {
 }
 
 // Is it possible to compose enums?
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum TrackTableContext {
   MyPlaylists,
   AlbumSearch,
@@ -38,6 +38,7 @@ pub enum TrackTableContext {
   YouTubePlaylist,
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct SearchResult {
   pub albums: Option<crate::core::pagination::Paged<crate::core::plugin_api::AlbumInfo>>,
   pub artists: Option<crate::core::pagination::Paged<crate::core::plugin_api::ArtistInfo>>,

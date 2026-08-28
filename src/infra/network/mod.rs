@@ -980,10 +980,18 @@ impl Network {
 
   /// Emit one session fact through the spine (no-op without a fold, i.e.
   /// in tests that never installed one).
-  async fn emit_session(&self, fact: SessionFact) {
+  pub(crate) async fn emit_session(&self, fact: SessionFact) {
     if let Some(spine) = self.spine.as_ref() {
       spine.emit(EngineEvent::Session(fact)).await;
     }
+  }
+
+  /// Ask the fold for published state (ticket 17: command surfaces read
+  /// here instead of locking App). `None` when no fold is live — the same
+  /// contract as `emit_session`'s no-op, and the reason CLI mode opens one.
+  pub(crate) async fn fold_query(&self, query: FoldQuery) -> Option<FoldAnswer> {
+    let spine = self.spine.as_ref()?;
+    spine.query(query).await.ok()
   }
 
   /// Emit a status notice (the old `show_status_message`, now a fact; the
@@ -1007,9 +1015,7 @@ impl Network {
         .emit_session(SessionFact::ClearPendingPlaylistOpen(Some(id.clone())))
         .await;
     }
-    self
-      .emit_session(SessionFact::LoadingCleared)
-      .await;
+    self.emit_session(SessionFact::LoadingCleared).await;
   }
 
   /// Route a handler failure through the fold as a fact (the old inline
@@ -1143,9 +1149,7 @@ impl Network {
           .await;
         // The old inline path cleared the spinner alongside the mirrors;
         // keep that pairing so a failed gate never leaves it stuck.
-        self
-          .emit_session(SessionFact::LoadingCleared)
-          .await;
+        self.emit_session(SessionFact::LoadingCleared).await;
         self.handle_error(anyhow!(e)).await;
         false
       }
