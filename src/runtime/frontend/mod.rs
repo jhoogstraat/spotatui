@@ -922,6 +922,18 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         app.followed_artist_ids_set.insert(id);
       }
     }
+    SessionFact::ClearNativeShuffleSession => {
+      #[cfg(feature = "streaming")]
+      app.clear_native_shuffle_session();
+    }
+    SessionFact::ClearNativeShufflePendingReload => {
+      // The load that would have confirmed this reload failed; a later
+      // genuine `TrackChanged` must not be mistaken for it.
+      #[cfg(feature = "streaming")]
+      if let Some(session) = app.native_spotify_shuffle.as_mut() {
+        session.pending_reload_index = None;
+      }
+    }
     SessionFact::ApplyAction(action) => {
       // Ticket 17: the DJ tools / MCP executor mutations. The fold is the
       // single writer, so their old inline `app.apply(...)` under the lock
@@ -1377,6 +1389,50 @@ pub(crate) fn answer_query(
     FoldQuery::FlushStateSave => {
       app.flush_state_save(true);
       FoldAnswer::Bool(true)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::TrackTableIsSavedTracks => FoldAnswer::Bool(matches!(
+      app.track_table.context,
+      Some(crate::core::app::TrackTableContext::SavedTracks)
+    )),
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeShuffleInstall {
+      install,
+      park,
+      arm_watchdog,
+      mark_playing,
+    } => crate::infra::network::native_shuffle::claim_native_shuffle_install(
+      app,
+      install,
+      park,
+      arm_watchdog,
+      mark_playing,
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeShuffleToggle { on } => {
+      crate::infra::network::native_shuffle::claim_native_shuffle_toggle(app, on)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeShuffleLapReshuffle => {
+      crate::infra::network::native_shuffle::claim_native_shuffle_lap_reshuffle(app)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeShuffleResume {
+      resume_index,
+      generation,
+    } => crate::infra::network::native_shuffle::claim_native_shuffle_resume(
+      app,
+      resume_index,
+      generation,
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::FoldNativeShuffleFullFetch { generation, result } => {
+      FoldAnswer::NativeShuffleReload(
+        crate::infra::network::native_shuffle::apply_native_shuffle_full_fetch(
+          app, generation, result,
+        )
+        .map(Box::new),
+      )
     }
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),

@@ -194,6 +194,13 @@ pub enum SessionFact {
   /// The follow-check round-trip for ids already known to be followed
   /// (metadata.rs seeds the set directly; the IoEvent lane covers the rest).
   FollowedArtistsConfirmed(Vec<String>),
+  /// The app-owned native-shuffle session is gone (failed load or explicit
+  /// teardown): the fold runs `App::clear_native_shuffle_session`.
+  ClearNativeShuffleSession,
+  /// A reload a native-shuffle load was confirming is not coming (the load
+  /// failed): drop the session's pending reload confirmation so a later
+  /// genuine `TrackChanged` is not mistaken for it.
+  ClearNativeShufflePendingReload,
   /// The device list landed (user.rs `get_devices`). The fold runs the whole
   /// old lock section: navigation, the native recovery interlock (a
   /// check-and-set must not be split from the write it gates), the
@@ -263,6 +270,10 @@ impl std::fmt::Debug for SessionFact {
         .debug_tuple("FollowedArtistsConfirmed")
         .field(&ids.len())
         .finish(),
+      SessionFact::ClearNativeShuffleSession => f.write_str("ClearNativeShuffleSession"),
+      SessionFact::ClearNativeShufflePendingReload => {
+        f.write_str("ClearNativeShufflePendingReload")
+      }
       SessionFact::DevicesLanded { navigate, .. } => f
         .debug_struct("DevicesLanded")
         .field("navigate", navigate)
@@ -579,6 +590,49 @@ pub enum FoldQuery {
   /// The announcement-surface sources: whether the feature is enabled, the
   /// configured feed URL, and the seen-announcement dedup set.
   AnnouncementSources { seen_ids: bool },
+  // --- Ticket 17 (playback family): native-shuffle claims. Each names the
+  // decision it feeds; each is a read-and-write the caller must not race.
+  /// Is the visible track table standing in for Liked Songs? Decides whether
+  /// a raw URI list (search/recommendation vs. library) is shuffleable.
+  #[cfg(feature = "streaming")]
+  TrackTableIsSavedTracks,
+  /// Install an app-owned native-shuffle session: the fold stamps the fresh
+  /// generation and applies the park/watchdog/context writes in one atomic
+  /// step (the caller's next action — loading Spirc — must not race a
+  /// replacement session). Answers with the generation (which gates the
+  /// background full-context fetch) plus the player/seek/play state sampled
+  /// at install time for the reload.
+  #[cfg(feature = "streaming")]
+  ClaimNativeShuffleInstall {
+    install: NativeShuffleInstall,
+    park: Option<StartPlaybackPark>,
+    arm_watchdog: bool,
+    mark_playing: bool,
+  },
+  /// Apply a shuffle toggle to the app-owned session (reorder + flip the
+  /// flag + set the pending reload) and return what the caller should do.
+  #[cfg(feature = "streaming")]
+  ClaimNativeShuffleToggle { on: bool },
+  /// Re-randomize the session's order for a repeat-all lap (current track
+  /// first) and return the reload it implies.
+  #[cfg(feature = "streaming")]
+  ClaimNativeShuffleLapReshuffle,
+  /// Apply a queue-drain resume against the stored session generation (a
+  /// stale resume must not touch a replaced session) and return the reload
+  /// or the "queue finished" outcome the fold already reported.
+  #[cfg(feature = "streaming")]
+  ClaimNativeShuffleResume {
+    resume_index: Option<usize>,
+    generation: u64,
+  },
+  /// Fold a completed full-context fetch into the live session (merge,
+  /// suspend remap, failure fallback — the whole old lock section) and
+  /// return the reload it implies, if any.
+  #[cfg(feature = "streaming")]
+  FoldNativeShuffleFullFetch {
+    generation: u64,
+    result: Result<(Vec<String>, bool), String>,
+  },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -641,6 +695,21 @@ pub enum FoldAnswer {
   StreamingPlayer(Option<std::sync::Arc<crate::infra::player::StreamingPlayer>>),
   /// A clone of the App's IoEvent sender (`None` when the channel is gone).
   IoTx(Option<std::sync::mpsc::Sender<crate::infra::network::IoEvent>>),
+  /// The native-shuffle install outcome: the stamped generation plus the
+  /// player/seek/play state sampled at install time (`None` when no player
+  /// is live).
+  #[cfg(feature = "streaming")]
+  NativeShuffleInstall {
+    generation: u64,
+    reload: Option<Box<NativeShuffleReloadContext>>,
+  },
+  /// The native-shuffle toggle decision (built/spirc-fallback/reload/no-op).
+  #[cfg(feature = "streaming")]
+  NativeShuffleToggle(Box<NativeShuffleToggleDecision>),
+  /// A prepared session reload, or `None` when the fold decided there is
+  /// nothing to reload (lap reshuffle denied, stale resume, no session).
+  #[cfg(feature = "streaming")]
+  NativeShuffleReload(Option<Box<NativeShuffleReload>>),
 }
 
 impl std::fmt::Debug for FoldAnswer {
@@ -692,6 +761,19 @@ impl std::fmt::Debug for FoldAnswer {
         .field(&player.is_some())
         .finish(),
       FoldAnswer::IoTx(io_tx) => f.debug_tuple("IoTx").field(&io_tx.is_some()).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeShuffleInstall { generation, reload } => f
+        .debug_struct("NativeShuffleInstall")
+        .field("generation", generation)
+        .field("reload", &reload.is_some())
+        .finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeShuffleToggle(_) => f.write_str("NativeShuffleToggle"),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeShuffleReload(v) => f
+        .debug_tuple("NativeShuffleReload")
+        .field(&v.is_some())
+        .finish(),
     }
   }
 }
@@ -750,6 +832,69 @@ pub struct HostSyncState {
   pub track_uri: String,
   pub position_ms: u64,
   pub is_playing: bool,
+}
+
+// --- Ticket 17 (playback family): native-shuffle session claims. All
+// streaming-only — the slim build has no native player.
+
+/// The session fields a native-shuffle install writes (the generation is
+/// stamped by the fold, atomically with the install).
+#[cfg(feature = "streaming")]
+#[derive(Debug)]
+pub struct NativeShuffleInstall {
+  pub order: Vec<String>,
+  pub original: Vec<String>,
+  pub index: usize,
+  pub shuffled: bool,
+  pub fetch_complete: bool,
+  pub pending_reload_index: Option<usize>,
+}
+
+/// The `park_start_playback` payload a start-path install parks alongside the
+/// session, so zombie-session recovery replays the original request.
+#[cfg(feature = "streaming")]
+#[derive(Debug)]
+pub struct StartPlaybackPark {
+  pub context_uri: Option<String>,
+  pub uris: Option<Vec<String>>,
+  pub offset: Option<usize>,
+}
+
+/// Player state sampled at native-shuffle install time for the reload the
+/// caller drives next.
+#[cfg(feature = "streaming")]
+pub struct NativeShuffleReloadContext {
+  pub player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+  pub seek_ms: u32,
+  pub is_playing: bool,
+}
+
+/// A session reload the fold has fully prepared: everything
+/// `load_session_tracks` needs, sampled atomically with the session mutation
+/// that requested it.
+#[cfg(feature = "streaming")]
+pub struct NativeShuffleReload {
+  pub player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+  pub order: Vec<String>,
+  pub index: usize,
+  pub seek_ms: u32,
+  pub is_playing: bool,
+}
+
+/// What a native-shuffle toggle should do, decided and applied atomically by
+/// the fold (the old inline `Action` of `toggle_native_shuffle_session`).
+#[cfg(feature = "streaming")]
+pub enum NativeShuffleToggleDecision {
+  /// The app-owned session was reordered; reload it.
+  Reload(NativeShuffleReload),
+  /// No session covers this; build one around the current context.
+  Build {
+    context_uri: String,
+    current_uri: String,
+  },
+  /// Fall back to Spirc's own shuffle on this player.
+  Spirc(std::sync::Arc<crate::infra::player::StreamingPlayer>),
+  Nothing,
 }
 
 /// The result of an acked emit: the fold has *applied* the event, and hands

@@ -21,9 +21,14 @@ use super::requests::spotify_get_typed_compat_for_with_refresh;
 #[cfg(feature = "streaming")]
 use super::Network;
 #[cfg(feature = "streaming")]
-use crate::core::app::{App, NativeSpotifyShuffleSession, TrackTableContext};
+use crate::core::app::{App, NativeSpotifyShuffleSession};
 #[cfg(feature = "streaming")]
 use crate::infra::player::StreamingPlayer;
+#[cfg(feature = "streaming")]
+use crate::runtime::engine::{
+  FoldAnswer, FoldQuery, NativeShuffleInstall, NativeShuffleToggleDecision, SessionFact,
+  StartPlaybackPark,
+};
 #[cfg(feature = "streaming")]
 use anyhow::anyhow;
 #[cfg(feature = "streaming")]
@@ -179,18 +184,6 @@ fn load_session_tracks(
   player.load(LoadRequest::from_tracks(order, options))
 }
 
-/// Drop a stale reload confirmation after a failed `load_session_tracks`: no
-/// `TrackChanged` follows a load that never landed, so a later genuine one must
-/// not be mistaken for the reload's confirmation (which would pin or move
-/// `session.index` onto the wrong duplicate occurrence). A no-op when the error
-/// path already cleared the whole session.
-#[cfg(feature = "streaming")]
-async fn clear_pending_reload(app: &Arc<Mutex<App>>) {
-  if let Some(session) = app.lock().await.native_spotify_shuffle.as_mut() {
-    session.pending_reload_index = None;
-  }
-}
-
 /// What the background task should fetch to complete the session's context.
 #[cfg(feature = "streaming")]
 enum FullFetch {
@@ -251,13 +244,10 @@ impl Network {
         // Raw URI lists are only shuffleable when they stand in for Liked
         // Songs (the full library is fetchable); search/recommendation lists
         // have no larger backing context.
-        let is_saved_tracks = {
-          let app = self.app.lock().await;
-          matches!(
-            app.track_table.context,
-            Some(TrackTableContext::SavedTracks)
-          )
-        };
+        let is_saved_tracks = matches!(
+          self.fold_query(FoldQuery::TrackTableIsSavedTracks).await,
+          Some(FoldAnswer::Bool(true))
+        );
         if !is_saved_tracks || list.is_empty() {
           return false;
         }
@@ -305,41 +295,35 @@ impl Network {
       }
     };
 
-    let generation = {
-      let mut app = self.app.lock().await;
-      let generation = app.next_native_shuffle_generation();
-      app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
-        order: order.clone(),
-        original,
-        index: 0,
-        shuffled: true,
-        fetch_complete: fetch.is_none(),
-        fetch_failed: false,
-        generation,
-        // The load below plays index 0; confirm that on the first TrackChanged.
-        pending_reload_index: Some(0),
-        pending_manual_skip: None,
-      });
-      // Park the ORIGINAL request so zombie-session recovery replays it
-      // through this same interception, and arm the load watchdog like the
-      // direct-load route does.
-      app.park_start_playback(
-        context_id.as_ref().map(|c| c.uri()),
-        uris
-          .as_ref()
-          .map(|list| list.iter().map(|u| u.uri()).collect()),
-        offset,
-      );
-      app.native_load_watchdog = Some(Instant::now());
-      if let Some(ctx) = &mut app.current_playback_context {
-        ctx.is_playing = true;
-        ctx.shuffle_state = true;
-      }
-      app.runtime_state.shuffle_enabled = true;
-      app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
-        true,
-      ));
-      generation
+    // The install is a claim: the fold stamps the generation and applies the
+    // park/watchdog/context writes before this caller loads Spirc, so the
+    // load's `TrackChanged` lands on the session it confirmed.
+    let Some(FoldAnswer::NativeShuffleInstall { generation, .. }) = self
+      .fold_query(FoldQuery::ClaimNativeShuffleInstall {
+        install: NativeShuffleInstall {
+          order: order.clone(),
+          original,
+          index: 0,
+          shuffled: true,
+          fetch_complete: fetch.is_none(),
+          // The load below plays index 0; confirm that on the first
+          // TrackChanged.
+          pending_reload_index: Some(0),
+        },
+        park: Some(StartPlaybackPark {
+          context_uri: context_id.as_ref().map(|c| c.uri()),
+          uris: uris
+            .as_ref()
+            .map(|list| list.iter().map(|u| u.uri()).collect()),
+          offset,
+        }),
+        arm_watchdog: true,
+        mark_playing: true,
+      })
+      .await
+    else {
+      // No fold: no session, no interception.
+      return false;
     };
 
     info!(
@@ -347,9 +331,12 @@ impl Network {
       order.len()
     );
     if let Err(e) = load_session_tracks(player, order, 0, 0, true) {
-      let mut app = self.app.lock().await;
-      app.clear_native_shuffle_session();
-      app.handle_error(anyhow!("Failed to start native playback: {}", e));
+      self
+        .emit_session(SessionFact::ClearNativeShuffleSession)
+        .await;
+      self
+        .handle_error(anyhow!("Failed to start native playback: {}", e))
+        .await;
       return true;
     }
     if let Some(kind) = fetch {
@@ -363,106 +350,34 @@ impl Network {
   /// build one from the current context when possible; otherwise fall back to
   /// Spirc shuffle (previous behavior).
   pub(super) async fn toggle_native_shuffle_session(&mut self, on: bool) {
-    enum Action {
-      Reload(Arc<StreamingPlayer>, Vec<String>, usize, u32, bool),
-      Build {
-        context_uri: String,
-        current_uri: String,
-      },
-      Spirc(Arc<StreamingPlayer>),
-      Nothing,
-    }
-
-    let action = {
-      let mut guard = self.app.lock().await;
-      let player = guard.streaming_player.clone();
-      let seek_ms = u32::try_from(guard.song_progress_ms).unwrap_or(u32::MAX);
-      let is_playing = guard.native_shuffle_is_playing();
-      if let Some(session) = guard.native_spotify_shuffle.as_mut() {
-        if session.shuffled == on {
-          Action::Nothing
-        } else if !session.fetch_complete {
-          // The full context is still being fetched, so the app-owned
-          // `original` is incomplete: reordering now would truncate playback to
-          // the handful of loaded tracks. Flip the flag and let the
-          // fetch-completion path apply it against the whole context. Leave
-          // `pending_reload_index` intact — the initial load's confirmation may
-          // still be in flight, and this path issues no new reload.
-          session.shuffled = on;
-          Action::Nothing
-        } else {
-          let current_uri = session.order.get(session.index).cloned();
-          if on {
-            let first = current_uri
-              .as_ref()
-              .and_then(|uri| session.original.iter().position(|x| x == uri))
-              .unwrap_or(0);
-            session.order = shuffled_order(session.original.clone(), first);
-            session.index = 0;
-          } else {
-            session.order = session.original.clone();
-            session.index = current_uri
-              .as_ref()
-              .and_then(|uri| session.order.iter().position(|x| x == uri))
-              .unwrap_or(0);
-          }
-          session.shuffled = on;
-          match player {
-            Some(player) => {
-              session.pending_reload_index = Some(session.index);
-              Action::Reload(
-                player,
-                session.order.clone(),
-                session.index,
-                seek_ms,
-                is_playing,
-              )
-            }
-            None => Action::Nothing,
-          }
-        }
-      } else if on {
-        let context_uri = guard
-          .current_playback_context
-          .as_ref()
-          .and_then(|ctx| ctx.context.as_ref())
-          .map(|c| c.uri.clone());
-        let current_uri = guard
-          .current_playback_context
-          .as_ref()
-          .and_then(|ctx| ctx.item.as_ref())
-          .and_then(|item| match item {
-            PlayableItem::Track(t) => t.id.as_ref().map(|id| id.uri()),
-            _ => None,
-          });
-        match (context_uri, current_uri, player) {
-          (Some(context_uri), Some(current_uri), Some(_)) => Action::Build {
-            context_uri,
-            current_uri,
-          },
-          (_, _, Some(player)) => Action::Spirc(player),
-          _ => Action::Nothing,
-        }
-      } else {
-        match player {
-          Some(player) => Action::Spirc(player),
-          None => Action::Nothing,
-        }
-      }
+    // The decision and its session mutation are one atomic fold step: the
+    // reload the decision implies is sampled with the reorder it is built from.
+    let decision = match self
+      .fold_query(FoldQuery::ClaimNativeShuffleToggle { on })
+      .await
+    {
+      Some(FoldAnswer::NativeShuffleToggle(decision)) => *decision,
+      _ => return,
     };
 
-    match action {
-      Action::Reload(player, order, index, seek_ms, start_playing) => {
-        if let Err(e) = load_session_tracks(&player, order, index, seek_ms, start_playing) {
-          clear_pending_reload(&self.app).await;
+    match decision {
+      NativeShuffleToggleDecision::Reload(reload) => {
+        if let Err(e) = load_session_tracks(
+          &reload.player,
+          reload.order,
+          reload.index,
+          reload.seek_ms,
+          reload.is_playing,
+        ) {
           self
-            .app
-            .lock()
-            .await
-            .handle_error(anyhow!("Failed to apply shuffle: {}", e));
+            .emit_session(SessionFact::ClearNativeShufflePendingReload)
+            .await;
+          self
+            .handle_error(anyhow!("Failed to apply shuffle: {}", e))
+            .await;
         }
       }
-      Action::Build {
+      NativeShuffleToggleDecision::Build {
         context_uri,
         current_uri,
       } => {
@@ -470,10 +385,10 @@ impl Network {
           .build_shuffle_session_from_current(context_uri, current_uri)
           .await;
       }
-      Action::Spirc(player) => {
+      NativeShuffleToggleDecision::Spirc(player) => {
         let _ = player.set_shuffle(on);
       }
-      Action::Nothing => {}
+      NativeShuffleToggleDecision::Nothing => {}
     }
   }
 
@@ -485,25 +400,27 @@ impl Network {
   async fn build_shuffle_session_from_current(&mut self, context_uri: String, current_uri: String) {
     match super::ids::play_context_id(&context_uri) {
       Some(PlayContextId::Playlist(id)) => {
-        let generation = {
-          let mut app = self.app.lock().await;
-          let generation = app.next_native_shuffle_generation();
-          app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
-            order: vec![current_uri.clone()],
-            original: vec![current_uri],
-            index: 0,
-            shuffled: true,
-            fetch_complete: false,
-            fetch_failed: false,
-            generation,
-            // No reload here: Spirc keeps playing its own context.
-            pending_reload_index: None,
-            pending_manual_skip: None,
-          });
-          generation
-        };
         // No reload yet: Spirc keeps playing its current context, and the
         // fetch completion swaps in the full shuffled list (single rebuffer).
+        let Some(FoldAnswer::NativeShuffleInstall { generation, .. }) = self
+          .fold_query(FoldQuery::ClaimNativeShuffleInstall {
+            install: NativeShuffleInstall {
+              order: vec![current_uri.clone()],
+              original: vec![current_uri],
+              index: 0,
+              shuffled: true,
+              fetch_complete: false,
+              // No reload here: Spirc keeps playing its own context.
+              pending_reload_index: None,
+            },
+            park: None,
+            arm_watchdog: false,
+            mark_playing: false,
+          })
+          .await
+        else {
+          return;
+        };
         self.spawn_full_context_fetch(FullFetch::Playlist(id), generation);
       }
       Some(PlayContextId::Album(id)) => {
@@ -523,34 +440,36 @@ impl Network {
           self.fallback_spirc_shuffle(true).await;
           return;
         };
-        let reload = {
-          let mut app = self.app.lock().await;
-          let generation = app.next_native_shuffle_generation();
-          let order = shuffled_order(uris.clone(), first);
-          app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
-            order: order.clone(),
-            original: uris,
-            index: 0,
-            shuffled: true,
-            fetch_complete: true,
-            fetch_failed: false,
-            generation,
-            // The reload below plays index 0.
-            pending_reload_index: Some(0),
-            pending_manual_skip: None,
-          });
-          let seek_ms = u32::try_from(app.song_progress_ms).unwrap_or(u32::MAX);
-          let is_playing = app.native_shuffle_is_playing();
-          app
-            .streaming_player
-            .clone()
-            .map(|p| (p, order, seek_ms, is_playing))
+        let order = shuffled_order(uris.clone(), first);
+        let Some(FoldAnswer::NativeShuffleInstall { reload, .. }) = self
+          .fold_query(FoldQuery::ClaimNativeShuffleInstall {
+            install: NativeShuffleInstall {
+              order: order.clone(),
+              original: uris,
+              index: 0,
+              shuffled: true,
+              fetch_complete: true,
+              // The reload below plays index 0.
+              pending_reload_index: Some(0),
+            },
+            park: None,
+            arm_watchdog: false,
+            mark_playing: false,
+          })
+          .await
+        else {
+          return;
         };
-        if let Some((player, order, seek_ms, is_playing)) = reload {
-          if let Err(e) = load_session_tracks(&player, order, 0, seek_ms, is_playing) {
-            let mut app = self.app.lock().await;
-            app.clear_native_shuffle_session();
-            app.handle_error(anyhow!("Failed to apply shuffle: {}", e));
+        if let Some(reload) = reload {
+          if let Err(e) =
+            load_session_tracks(&reload.player, order, 0, reload.seek_ms, reload.is_playing)
+          {
+            self
+              .emit_session(SessionFact::ClearNativeShuffleSession)
+              .await;
+            self
+              .handle_error(anyhow!("Failed to apply shuffle: {}", e))
+              .await;
           }
         }
       }
@@ -560,7 +479,9 @@ impl Network {
 
   #[cfg(feature = "streaming")]
   async fn fallback_spirc_shuffle(&self, on: bool) {
-    if let Some(player) = { self.app.lock().await.streaming_player.clone() } {
+    if let Some(FoldAnswer::StreamingPlayer(Some(player))) =
+      self.fold_query(FoldQuery::StreamingPlayerHandle).await
+    {
       let _ = player.set_shuffle(on);
     }
   }
@@ -569,31 +490,24 @@ impl Network {
   /// completed — re-randomize the order (current track first) so the next lap
   /// plays in a fresh order, like Spotify.
   pub(super) async fn reshuffle_native_shuffle_lap(&mut self) {
-    let reload = {
-      let mut guard = self.app.lock().await;
-      let player = guard.streaming_player.clone();
-      let seek_ms = u32::try_from(guard.song_progress_ms).unwrap_or(0);
-      let is_playing = guard.native_shuffle_is_playing();
-      let Some(session) = guard.native_spotify_shuffle.as_mut() else {
-        return;
-      };
-      if !session.shuffled || session.order.len() < 2 {
-        return;
-      }
-      let current_uri = session.order.get(session.index).cloned();
-      let first = current_uri
-        .as_ref()
-        .and_then(|uri| session.original.iter().position(|x| x == uri))
-        .unwrap_or(0);
-      session.order = shuffled_order(session.original.clone(), first);
-      session.index = 0;
-      session.pending_reload_index = Some(0);
-      player.map(|p| (p, session.order.clone(), seek_ms, is_playing))
+    let Some(FoldAnswer::NativeShuffleReload(reload)) = self
+      .fold_query(FoldQuery::ClaimNativeShuffleLapReshuffle)
+      .await
+    else {
+      return;
     };
-    if let Some((player, order, seek_ms, is_playing)) = reload {
-      if let Err(e) = load_session_tracks(&player, order, 0, seek_ms, is_playing) {
+    if let Some(reload) = reload {
+      if let Err(e) = load_session_tracks(
+        &reload.player,
+        reload.order,
+        reload.index,
+        reload.seek_ms,
+        reload.is_playing,
+      ) {
         warn!("native shuffle: lap reshuffle reload failed: {e}");
-        clear_pending_reload(&self.app).await;
+        self
+          .emit_session(SessionFact::ClearNativeShufflePendingReload)
+          .await;
       }
     }
   }
@@ -606,59 +520,31 @@ impl Network {
     resume_index: Option<usize>,
     generation: u64,
   ) {
-    let action = {
-      let mut guard = self.app.lock().await;
-      // The suspend snapshotted a specific session; a session replaced while the
-      // queue drained bumps the generation, so a stale resume must not touch it.
-      let session_matches = guard
-        .native_spotify_shuffle
-        .as_ref()
-        .is_some_and(|s| s.generation == generation);
-      match resume_index {
-        Some(index) if session_matches => {
-          let player = guard.streaming_player.clone();
-          match guard.native_spotify_shuffle.as_mut() {
-            Some(session) if index < session.order.len() => {
-              session.index = index;
-              session.pending_reload_index = Some(index);
-              player.map(|p| (p, session.order.clone(), index))
-            }
-            _ => {
-              guard.set_status_message("Queue finished", 3);
-              None
-            }
-          }
-        }
-        Some(_) => {
-          // The stored index belongs to a session that is no longer active. If a
-          // newer session replaced it, leave that one playing untouched;
-          // otherwise the session is simply gone, so note the queue finished.
-          if guard.native_spotify_shuffle.is_none() {
-            guard.set_status_message("Queue finished", 3);
-          }
-          None
-        }
-        None => {
-          // Session exhausted under repeat-off: nothing left to resume. Only tear
-          // down the session we suspended — a newer one must be left running.
-          if session_matches {
-            guard.clear_native_shuffle_session();
-          }
-          guard.set_status_message("Queue finished", 3);
-          None
-        }
-      }
+    let Some(FoldAnswer::NativeShuffleReload(reload)) = self
+      .fold_query(FoldQuery::ClaimNativeShuffleResume {
+        resume_index,
+        generation,
+      })
+      .await
+    else {
+      return;
     };
-    if let Some((player, order, index)) = action {
-      player.activate();
+    if let Some(reload) = reload {
+      reload.player.activate();
       // The queue drained, so resume playback regardless of prior pause state.
-      if let Err(e) = load_session_tracks(&player, order, index, 0, true) {
-        clear_pending_reload(&self.app).await;
+      if let Err(e) = load_session_tracks(
+        &reload.player,
+        reload.order,
+        reload.index,
+        reload.seek_ms,
+        reload.is_playing,
+      ) {
         self
-          .app
-          .lock()
-          .await
-          .handle_error(anyhow!("Failed to resume playback: {}", e));
+          .emit_session(SessionFact::ClearNativeShufflePendingReload)
+          .await;
+        self
+          .handle_error(anyhow!("Failed to resume playback: {}", e))
+          .await;
       }
     }
   }
@@ -671,6 +557,7 @@ impl Network {
     let spotify = self.spotify().clone();
     let app = Arc::clone(&self.app);
     let token_cache_path = self.token_cache_path.clone();
+    let spine = self.spine.clone();
     tokio::spawn(async move {
       // A failed fetch strands a lazily-seeded session on its single seed
       // track (nothing to advance into), so retry transient API failures
@@ -693,8 +580,45 @@ impl Network {
           result => break result,
         }
       };
-      finish_full_context_fetch(&app, generation, result).await;
+      finish_full_context_fetch(spine.as_ref(), generation, result).await;
     });
+  }
+}
+
+/// Hand a completed full-context fetch to the fold (the merge and the reload
+/// it implies are one atomic step) and drive the reload when the fold has one.
+#[cfg(feature = "streaming")]
+async fn finish_full_context_fetch(
+  spine: Option<&crate::runtime::engine::Spine>,
+  generation: u64,
+  result: anyhow::Result<(Vec<String>, bool)>,
+) {
+  use crate::runtime::engine::{EngineEvent, FoldAnswer, FoldQuery, SessionFact};
+
+  let Some(spine) = spine else { return };
+  let reload = match spine
+    .query(FoldQuery::FoldNativeShuffleFullFetch {
+      generation,
+      result: result.map_err(|e| format!("{e:#}")),
+    })
+    .await
+  {
+    Ok(FoldAnswer::NativeShuffleReload(reload)) => reload.map(|r| *r),
+    _ => None,
+  };
+  if let Some(reload) = reload {
+    if let Err(e) = load_session_tracks(
+      &reload.player,
+      reload.order,
+      reload.index,
+      reload.seek_ms,
+      reload.is_playing,
+    ) {
+      warn!("native shuffle: reload after full fetch failed: {e}");
+      spine.emit_now(EngineEvent::Session(
+        SessionFact::ClearNativeShufflePendingReload,
+      ));
+    }
   }
 }
 
@@ -803,186 +727,427 @@ fn reanchor_by_rank(order: &[String], index: usize, target: &[String]) -> usize 
     .unwrap_or(0)
 }
 
-/// Fold a finished full-context fetch into the live session and reload Spirc
-/// once, anchored on the actually-playing track with the position preserved.
+// --- Ticket 17: fold-side reducers. The fold's `answer_query` arms call these
+// so the whole old lock section (read + session mutation + reload sampling)
+// stays one atomic step under the fold's lock. Each returns what the producer
+// needs to drive its next Spirc call — the fold itself stays I/O-free.
+
+/// Install an app-owned native-shuffle session: stamp the fresh generation and
+/// apply the caller's park/watchdog/context writes atomically.
 #[cfg(feature = "streaming")]
-async fn finish_full_context_fetch(
-  app: &Arc<Mutex<App>>,
-  generation: u64,
-  result: anyhow::Result<(Vec<String>, bool)>,
-) {
-  let reload = {
-    let mut guard = app.lock().await;
-    let player = guard.streaming_player.clone();
-    let seek_ms = u32::try_from(guard.song_progress_ms).unwrap_or(u32::MAX);
-    let start_playing = guard.native_shuffle_is_playing();
-    // The session may be suspended behind a queued track; folding the context
-    // in is fine, but reloading Spirc would hijack the sink from the queue.
-    let queue_active = guard.queue_owns_playback() || guard.queue_suspended.is_some();
-    // The resume point the suspend already computed (same-track handoff vs a
-    // plain advance), captured so the fold can remap it rather than clobber it.
-    let suspended_resume: Option<Option<usize>> = match &guard.queue_suspended {
-      Some(crate::core::queue::SuspendedContext::SpotifyShuffled { resume_index, .. }) => {
-        Some(*resume_index)
+pub(crate) fn claim_native_shuffle_install(
+  app: &mut App,
+  install: crate::runtime::engine::NativeShuffleInstall,
+  park: Option<crate::runtime::engine::StartPlaybackPark>,
+  arm_watchdog: bool,
+  mark_playing: bool,
+) -> crate::runtime::engine::FoldAnswer {
+  use crate::runtime::engine::{FoldAnswer, NativeShuffleReloadContext};
+
+  let crate::runtime::engine::NativeShuffleInstall {
+    order,
+    original,
+    index,
+    shuffled,
+    fetch_complete,
+    pending_reload_index,
+  } = install;
+  let generation = app.next_native_shuffle_generation();
+  app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+    order,
+    original,
+    index,
+    shuffled,
+    fetch_complete,
+    fetch_failed: false,
+    generation,
+    pending_reload_index,
+    pending_manual_skip: None,
+  });
+  // Park the ORIGINAL request so zombie-session recovery replays it through
+  // the same interception, and arm the load watchdog like the direct-load
+  // route does.
+  if let Some(park) = park {
+    app.park_start_playback(park.context_uri, park.uris, park.offset);
+  }
+  if arm_watchdog {
+    app.native_load_watchdog = Some(Instant::now());
+  }
+  if mark_playing {
+    if let Some(ctx) = &mut app.current_playback_context {
+      ctx.is_playing = true;
+      ctx.shuffle_state = true;
+    }
+    app.runtime_state.shuffle_enabled = true;
+    app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
+      true,
+    ));
+  }
+  let reload = app.streaming_player.clone().map(|player| {
+    Box::new(NativeShuffleReloadContext {
+      player,
+      seek_ms: u32::try_from(app.song_progress_ms).unwrap_or(u32::MAX),
+      is_playing: app.native_shuffle_is_playing(),
+    })
+  });
+  FoldAnswer::NativeShuffleInstall { generation, reload }
+}
+
+/// Apply a shuffle toggle to the app-owned session (reorder + flip the flag +
+/// set the pending reload) and return what the caller should do next.
+#[cfg(feature = "streaming")]
+pub(crate) fn claim_native_shuffle_toggle(
+  app: &mut App,
+  on: bool,
+) -> crate::runtime::engine::FoldAnswer {
+  use crate::runtime::engine::{FoldAnswer, NativeShuffleReload, NativeShuffleToggleDecision};
+
+  let player = app.streaming_player.clone();
+  let seek_ms = u32::try_from(app.song_progress_ms).unwrap_or(u32::MAX);
+  let is_playing = app.native_shuffle_is_playing();
+  let decision = if let Some(session) = app.native_spotify_shuffle.as_mut() {
+    if session.shuffled == on {
+      NativeShuffleToggleDecision::Nothing
+    } else if !session.fetch_complete {
+      // The full context is still being fetched, so the app-owned `original`
+      // is incomplete: reordering now would truncate playback to the handful
+      // of loaded tracks. Flip the flag and let the fetch-completion path
+      // apply it against the whole context. Leave `pending_reload_index`
+      // intact — the initial load's confirmation may still be in flight, and
+      // this path issues no new reload.
+      session.shuffled = on;
+      NativeShuffleToggleDecision::Nothing
+    } else {
+      let current_uri = session.order.get(session.index).cloned();
+      if on {
+        let first = current_uri
+          .as_ref()
+          .and_then(|uri| session.original.iter().position(|x| x == uri))
+          .unwrap_or(0);
+        session.order = shuffled_order(session.original.clone(), first);
+        session.index = 0;
+      } else {
+        session.order = session.original.clone();
+        session.index = current_uri
+          .as_ref()
+          .and_then(|uri| session.order.iter().position(|x| x == uri))
+          .unwrap_or(0);
       }
-      _ => None,
-    };
-    let mut status: Option<String> = None;
-    // When the session is suspended behind the queue, the new play order is
-    // still folded in but Spirc is not reloaded; this carries the re-pointed
-    // resume index out to `queue_suspended` once the session borrow ends.
-    let mut resume_update: Option<Option<usize>> = None;
-    // Carries the seed-only fetch failure out of the session borrow: a
-    // suspension taken while the fetch was still in flight stored a shuffled
-    // resume into the seed-only order and must be converted to the context
-    // route (mirror of the suspend-time fallback).
-    let mut convert_suspend_to_context = false;
-    let reload = {
-      let Some(session) = guard.native_spotify_shuffle.as_mut() else {
-        return;
-      };
-      if session.generation != generation {
-        return;
-      }
-      session.fetch_complete = true;
-      match result {
-        Err(e) => {
-          session.fetch_failed = true;
-          info!(
-            "native shuffle: full-context fetch failed; shuffle covers the {} loaded tracks: {e}",
-            session.order.len()
-          );
-          // A seed-only session can't shuffle anything; tell the user instead
-          // of silently degrading (the queue-suspend path now falls back to
-          // the context route, see `suspend_native_spotify_context_for_queue`).
-          if session.order.len() <= 1 {
-            status = Some("Shuffle: failed to load the context's track list".to_string());
-            convert_suspend_to_context = true;
-          }
-          // A shuffle-off deferred to fetch completion still needs applying, or
-          // state stays inconsistent (`shuffled == false` yet the shuffled order
-          // is loaded, and a repeat shuffle-off is a no-op, and a queue drain
-          // resumes shuffled). Fall back to the available (partial) natural order
-          // so the toggle is honored — whether or not the queue owns the sink.
-          if session.shuffled || session.order == session.original {
-            None
-          } else {
-            let old_index = session.index.min(session.order.len().saturating_sub(1));
-            let restored = session.original.clone();
-            // Anchor on the current track's rank so a duplicate doesn't jump.
-            let new_index = reanchor_by_rank(&session.order, old_index, &restored);
-            session.order = restored;
-            session.index = new_index;
-            if queue_active {
-              // Suspended behind the queue: remap the resume index, don't reload.
-              let same_track = matches!(suspended_resume, Some(Some(j)) if j <= old_index);
-              let resume = if same_track {
-                Some(new_index)
-              } else {
-                (new_index + 1 < session.order.len()).then_some(new_index + 1)
-              };
-              resume_update = Some(resume);
-              None
-            } else {
-              session.pending_reload_index = Some(new_index);
-              Some((session.order.clone(), new_index))
-            }
-          }
+      session.shuffled = on;
+      match player {
+        Some(player) => {
+          session.pending_reload_index = Some(session.index);
+          NativeShuffleToggleDecision::Reload(NativeShuffleReload {
+            player,
+            order: session.order.clone(),
+            index: session.index,
+            seek_ms,
+            is_playing,
+          })
         }
-        Ok((fetched, truncated)) => {
-          if fetched.is_empty() {
-            None
-          } else if queue_active {
-            // The queue owns the sink (session suspended). Fold the full
-            // context into the app-owned order so the resume plays the whole
-            // thing, but never reload over the queued track. The already-played
-            // prefix is preserved, so `index` still points at the suspended
-            // track and the resume math is unambiguous even with duplicates.
-            let index = session.index.min(session.order.len().saturating_sub(1));
-            let new_order = fold_full_context(&session.order, index, &fetched, session.shuffled);
-            // Remap, don't clobber. The played prefix is preserved verbatim, so
-            // any stored resume index within it (`j <= index`) maps to itself —
-            // covering a same-track handoff (`j == index`) and a repeat-context
-            // last-to-first wrap (`j == 0`) alike. A resume past the prefix (a
-            // plain advance, or `None` when the partial order looked exhausted)
-            // continues at the first not-yet-played track.
-            let resume = match suspended_resume {
-              Some(Some(j)) if j <= index => Some(j),
-              _ => (index + 1 < new_order.len()).then_some(index + 1),
+        None => NativeShuffleToggleDecision::Nothing,
+      }
+    }
+  } else if on {
+    let context_uri = app
+      .current_playback_context
+      .as_ref()
+      .and_then(|ctx| ctx.context.as_ref())
+      .map(|c| c.uri.clone());
+    let current_uri = app
+      .current_playback_context
+      .as_ref()
+      .and_then(|ctx| ctx.item.as_ref())
+      .and_then(|item| match item {
+        PlayableItem::Track(t) => t.id.as_ref().map(|id| id.uri()),
+        _ => None,
+      });
+    match (context_uri, current_uri, player) {
+      (Some(context_uri), Some(current_uri), Some(_)) => NativeShuffleToggleDecision::Build {
+        context_uri,
+        current_uri,
+      },
+      (_, _, Some(player)) => NativeShuffleToggleDecision::Spirc(player),
+      _ => NativeShuffleToggleDecision::Nothing,
+    }
+  } else {
+    match player {
+      Some(player) => NativeShuffleToggleDecision::Spirc(player),
+      None => NativeShuffleToggleDecision::Nothing,
+    }
+  };
+  FoldAnswer::NativeShuffleToggle(Box::new(decision))
+}
+
+/// Re-randomize the session's order for a repeat-all lap (current track first)
+/// and return the reload it implies, if the session can be reshuffled.
+#[cfg(feature = "streaming")]
+pub(crate) fn claim_native_shuffle_lap_reshuffle(
+  app: &mut App,
+) -> crate::runtime::engine::FoldAnswer {
+  use crate::runtime::engine::{FoldAnswer, NativeShuffleReload};
+
+  let player = app.streaming_player.clone();
+  let seek_ms = u32::try_from(app.song_progress_ms).unwrap_or(0);
+  let is_playing = app.native_shuffle_is_playing();
+  let reload = app.native_spotify_shuffle.as_mut().and_then(|session| {
+    if !session.shuffled || session.order.len() < 2 {
+      return None;
+    }
+    let current_uri = session.order.get(session.index).cloned();
+    let first = current_uri
+      .as_ref()
+      .and_then(|uri| session.original.iter().position(|x| x == uri))
+      .unwrap_or(0);
+    session.order = shuffled_order(session.original.clone(), first);
+    session.index = 0;
+    session.pending_reload_index = Some(0);
+    player.clone().map(|p| NativeShuffleReload {
+      player: p,
+      order: session.order.clone(),
+      index: 0,
+      seek_ms,
+      is_playing,
+    })
+  });
+  FoldAnswer::NativeShuffleReload(reload.map(Box::new))
+}
+
+/// Apply a queue-drain resume against the stored session generation (a stale
+/// resume must not touch a replaced session) and return the reload it implies.
+#[cfg(feature = "streaming")]
+pub(crate) fn claim_native_shuffle_resume(
+  app: &mut App,
+  resume_index: Option<usize>,
+  generation: u64,
+) -> crate::runtime::engine::FoldAnswer {
+  use crate::runtime::engine::{FoldAnswer, NativeShuffleReload};
+
+  let player = app.streaming_player.clone();
+  let session_matches = app
+    .native_spotify_shuffle
+    .as_ref()
+    .is_some_and(|s| s.generation == generation);
+  let reload = match resume_index {
+    Some(index) if session_matches => match app.native_spotify_shuffle.as_mut() {
+      Some(session) if index < session.order.len() => {
+        session.index = index;
+        session.pending_reload_index = Some(index);
+        player.map(|p| NativeShuffleReload {
+          player: p,
+          order: session.order.clone(),
+          index,
+          seek_ms: 0,
+          is_playing: true,
+        })
+      }
+      _ => {
+        app.set_status_message("Queue finished", 3);
+        None
+      }
+    },
+    Some(_) => {
+      // The stored index belongs to a session that is no longer active. If a
+      // newer session replaced it, leave that one playing untouched;
+      // otherwise the session is simply gone, so note the queue finished.
+      if app.native_spotify_shuffle.is_none() {
+        app.set_status_message("Queue finished", 3);
+      }
+      None
+    }
+    None => {
+      // Session exhausted under repeat-off: nothing left to resume. Only tear
+      // down the session we suspended — a newer one must be left running.
+      if session_matches {
+        app.clear_native_shuffle_session();
+      }
+      app.set_status_message("Queue finished", 3);
+      None
+    }
+  };
+  FoldAnswer::NativeShuffleReload(reload.map(Box::new))
+}
+
+/// Fold a finished full-context fetch into the live session (merge, suspend
+/// remap, failure fallback — the whole old lock section) and return the reload
+/// it implies, if any.
+#[cfg(feature = "streaming")]
+pub(crate) fn apply_native_shuffle_full_fetch(
+  app: &mut App,
+  generation: u64,
+  result: Result<(Vec<String>, bool), String>,
+) -> Option<crate::runtime::engine::NativeShuffleReload> {
+  use crate::runtime::engine::NativeShuffleReload;
+
+  let player = app.streaming_player.clone();
+  let seek_ms = u32::try_from(app.song_progress_ms).unwrap_or(u32::MAX);
+  let start_playing = app.native_shuffle_is_playing();
+  // The session may be suspended behind a queued track; folding the context
+  // in is fine, but reloading Spirc would hijack the sink from the queue.
+  let queue_active = app.queue_owns_playback() || app.queue_suspended.is_some();
+  // The resume point the suspend already computed (same-track handoff vs a
+  // plain advance), captured so the fold can remap it rather than clobber it.
+  let suspended_resume: Option<Option<usize>> = match &app.queue_suspended {
+    Some(crate::core::queue::SuspendedContext::SpotifyShuffled { resume_index, .. }) => {
+      Some(*resume_index)
+    }
+    _ => None,
+  };
+  let mut status: Option<String> = None;
+  // When the session is suspended behind the queue, the new play order is
+  // still folded in but Spirc is not reloaded; this carries the re-pointed
+  // resume index out to `queue_suspended` once the session borrow ends.
+  let mut resume_update: Option<Option<usize>> = None;
+  // Carries the seed-only fetch failure out of the session borrow: a
+  // suspension taken while the fetch was still in flight stored a shuffled
+  // resume into the seed-only order and must be converted to the context
+  // route (mirror of the suspend-time fallback).
+  let mut convert_suspend_to_context = false;
+  let reload = {
+    let session = app.native_spotify_shuffle.as_mut()?;
+    if session.generation != generation {
+      return None;
+    }
+    session.fetch_complete = true;
+    match result {
+      Err(e) => {
+        session.fetch_failed = true;
+        info!(
+          "native shuffle: full-context fetch failed; shuffle covers the {} loaded tracks: {e}",
+          session.order.len()
+        );
+        // A seed-only session can't shuffle anything; tell the user instead
+        // of silently degrading (the queue-suspend path now falls back to
+        // the context route, see `suspend_native_spotify_context_for_queue`).
+        if session.order.len() <= 1 {
+          status = Some("Shuffle: failed to load the context's track list".to_string());
+          convert_suspend_to_context = true;
+        }
+        // A shuffle-off deferred to fetch completion still needs applying, or
+        // state stays inconsistent (`shuffled == false` yet the shuffled order
+        // is loaded, and a repeat shuffle-off is a no-op, and a queue drain
+        // resumes shuffled). Fall back to the available (partial) natural order
+        // so the toggle is honored — whether or not the queue owns the sink.
+        if session.shuffled || session.order == session.original {
+          None
+        } else {
+          let old_index = session.index.min(session.order.len().saturating_sub(1));
+          let restored = session.original.clone();
+          // Anchor on the current track's rank so a duplicate doesn't jump.
+          let new_index = reanchor_by_rank(&session.order, old_index, &restored);
+          session.order = restored;
+          session.index = new_index;
+          if queue_active {
+            // Suspended behind the queue: remap the resume index, don't reload.
+            let same_track = matches!(suspended_resume, Some(Some(j)) if j <= old_index);
+            let resume = if same_track {
+              Some(new_index)
+            } else {
+              (new_index + 1 < session.order.len()).then_some(new_index + 1)
             };
-            session.original = fetched;
-            session.order = new_order;
-            session.index = index;
             resume_update = Some(resume);
             None
-          } else if !session.shuffled {
-            // Shuffle is off (toggled off while the fetch ran): restore the
-            // context's natural order and continue from the current track, so
-            // Next follows the real tracklist. Anchor on the occurrence matching
-            // the current track's rank among the tracks played so far, so a
-            // duplicated track isn't reloaded at an earlier copy.
-            let index = reanchor_by_rank(&session.order, session.index, &fetched);
-            let changed = session.order != fetched;
-            session.original = fetched.clone();
-            session.order = fetched;
-            session.index = index;
-            if changed {
-              session.pending_reload_index = Some(index);
-              Some((session.order.clone(), index))
-            } else {
-              None
-            }
-          } else if same_track_multiset(&session.order, &fetched) {
-            // The initial load already held the whole context; keep its
-            // shuffle rather than re-rolling and reloading for nothing.
-            session.original = fetched;
-            None
           } else {
-            // The played prefix is preserved, so the currently-playing track
-            // stays fixed at `session.index`; anchor on it directly rather than
-            // a duplicate-ambiguous URI lookup.
-            let index = session.index.min(session.order.len().saturating_sub(1));
-            let merged = merge_full_fetch(&session.order, index, &fetched);
-            session.original = fetched;
-            session.order = merged;
-            session.index = index;
-            if truncated {
-              status = Some(format!(
-                "Large context: shuffling the first {MAX_NATIVE_SHUFFLE_TRACKS} tracks"
-              ));
-            }
-            session.pending_reload_index = Some(index);
-            Some((session.order.clone(), index))
+            session.pending_reload_index = Some(new_index);
+            Some((session.order.clone(), new_index))
           }
         }
       }
-    };
-    if let Some(message) = status {
-      guard.set_status_message(message, 4);
-    }
-    // Re-point the suspended resume index into the folded-in order so the
-    // queue drains back into the full context, not the partial one.
-    if let Some(resume) = resume_update {
-      if let Some(crate::core::queue::SuspendedContext::SpotifyShuffled { resume_index, .. }) =
-        guard.queue_suspended.as_mut()
-      {
-        *resume_index = resume;
+      Ok((fetched, truncated)) => {
+        if fetched.is_empty() {
+          None
+        } else if queue_active {
+          // The queue owns the sink (session suspended). Fold the full
+          // context into the app-owned order so the resume plays the whole
+          // thing, but never reload over the queued track. The already-played
+          // prefix is preserved, so `index` still points at the suspended
+          // track and the resume math is unambiguous even with duplicates.
+          let index = session.index.min(session.order.len().saturating_sub(1));
+          let new_order = fold_full_context(&session.order, index, &fetched, session.shuffled);
+          // Remap, don't clobber. The played prefix is preserved verbatim, so
+          // any stored resume index within it (`j <= index`) maps to itself —
+          // covering a same-track handoff (`j == index`) and a repeat-context
+          // last-to-first wrap (`j == 0`) alike. A resume past the prefix (a
+          // plain advance, or `None` when the partial order looked exhausted)
+          // continues at the first not-yet-played track.
+          let resume = match suspended_resume {
+            Some(Some(j)) if j <= index => Some(j),
+            _ => (index + 1 < new_order.len()).then_some(index + 1),
+          };
+          session.original = fetched;
+          session.order = new_order;
+          session.index = index;
+          resume_update = Some(resume);
+          None
+        } else if !session.shuffled {
+          // Shuffle is off (toggled off while the fetch ran): restore the
+          // context's natural order and continue from the current track, so
+          // Next follows the real tracklist. Anchor on the occurrence matching
+          // the current track's rank among the tracks played so far, so a
+          // duplicated track isn't reloaded at an earlier copy.
+          let index = reanchor_by_rank(&session.order, session.index, &fetched);
+          let changed = session.order != fetched;
+          session.original = fetched.clone();
+          session.order = fetched;
+          session.index = index;
+          if changed {
+            session.pending_reload_index = Some(index);
+            Some((session.order.clone(), index))
+          } else {
+            None
+          }
+        } else if same_track_multiset(&session.order, &fetched) {
+          // The initial load already held the whole context; keep its
+          // shuffle rather than re-rolling and reloading for nothing.
+          session.original = fetched;
+          None
+        } else {
+          // The played prefix is preserved, so the currently-playing track
+          // stays fixed at `session.index`; anchor on it directly rather than
+          // a duplicate-ambiguous URI lookup.
+          let index = session.index.min(session.order.len().saturating_sub(1));
+          let merged = merge_full_fetch(&session.order, index, &fetched);
+          session.original = fetched;
+          session.order = merged;
+          session.index = index;
+          if truncated {
+            status = Some(format!(
+              "Large context: shuffling the first {MAX_NATIVE_SHUFFLE_TRACKS} tracks"
+            ));
+          }
+          session.pending_reload_index = Some(index);
+          Some((session.order.clone(), index))
+        }
       }
     }
-    // The seed-only fetch failed while this session's suspension already sat
-    // behind the queue: its shuffled resume dead-ends, so hand the drain to
-    // the context route instead.
-    if convert_suspend_to_context {
-      guard.convert_shuffled_suspension_to_context(Some(generation));
-    }
-    reload.and_then(|(order, index)| player.map(|p| (p, order, index, seek_ms, start_playing)))
   };
-  if let Some((player, order, index, seek_ms, start_playing)) = reload {
-    if let Err(e) = load_session_tracks(&player, order, index, seek_ms, start_playing) {
-      warn!("native shuffle: reload after full fetch failed: {e}");
-      clear_pending_reload(app).await;
+  if let Some(message) = status {
+    app.set_status_message(message, 4);
+  }
+  // Re-point the suspended resume index into the folded-in order so the
+  // queue drains back into the full context, not the partial one.
+  if let Some(resume) = resume_update {
+    if let Some(crate::core::queue::SuspendedContext::SpotifyShuffled { resume_index, .. }) =
+      app.queue_suspended.as_mut()
+    {
+      *resume_index = resume;
     }
   }
+  // The seed-only fetch failed while this session's suspension already sat
+  // behind the queue: its shuffled resume dead-ends, so hand the drain to
+  // the context route instead.
+  if convert_suspend_to_context {
+    app.convert_shuffled_suspension_to_context(Some(generation));
+  }
+  reload.and_then(|(order, index)| {
+    player.map(|p| NativeShuffleReload {
+      player: p,
+      order,
+      index,
+      seek_ms,
+      is_playing: start_playing,
+    })
+  })
 }
 
 #[cfg(test)]
@@ -1003,58 +1168,58 @@ mod tests {
     use crate::core::app::NativeSpotifyShuffleSession;
     use crate::core::queue::SuspendedContext;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_all()
-      .build()
-      .unwrap();
-    rt.block_on(async {
-      let (tx, _rx) = std::sync::mpsc::channel();
-      let mut app = App::new(
-        tx,
-        crate::core::user_config::UserConfig::new(),
-        Some(std::time::SystemTime::now()),
-      );
-      app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
-        order: uris(&["seed"]),
-        original: uris(&["seed"]),
-        index: 0,
-        shuffled: true,
-        fetch_complete: false,
-        fetch_failed: false,
-        generation: 9,
-        pending_reload_index: None,
-        pending_manual_skip: None,
-      });
-      // The suspend computed from the seed-only order: an exhausted resume.
-      app.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
-        resume_index: None,
-        generation: 9,
-        context_uri: Some("spotify:playlist:suspended".to_string()),
-        resume_track_uri: None,
-      });
-      let app = Arc::new(Mutex::new(app));
-
-      finish_full_context_fetch(&app, 9, Err(anyhow!("fetch failed"))).await;
-
-      let guard = app.lock().await;
-      match &guard.queue_suspended {
-        Some(SuspendedContext::Spotify { context_uri, .. }) => {
-          assert_eq!(
-            context_uri.as_deref(),
-            Some("spotify:playlist:suspended"),
-            "the context captured at suspension time must survive the conversion"
-          );
-        }
-        other => panic!("expected a context suspension, got {other:?}"),
-      }
-      assert!(
-        guard
-          .native_spotify_shuffle
-          .as_ref()
-          .is_some_and(|s| s.fetch_failed),
-        "the session must be marked failed for the suspend fallback"
-      );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(
+      tx,
+      crate::core::user_config::UserConfig::new(),
+      Some(std::time::SystemTime::now()),
+    );
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: uris(&["seed"]),
+      original: uris(&["seed"]),
+      index: 0,
+      shuffled: true,
+      fetch_complete: false,
+      fetch_failed: false,
+      generation: 9,
+      pending_reload_index: None,
+      pending_manual_skip: None,
     });
+    // The suspend computed from the seed-only order: an exhausted resume.
+    app.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
+      resume_index: None,
+      generation: 9,
+      context_uri: Some("spotify:playlist:suspended".to_string()),
+      resume_track_uri: None,
+    });
+
+    let reload = crate::infra::network::native_shuffle::apply_native_shuffle_full_fetch(
+      &mut app,
+      9,
+      Err("fetch failed".to_string()),
+    );
+
+    assert!(
+      reload.is_none(),
+      "a suspended session must not reload over the queue"
+    );
+    match &app.queue_suspended {
+      Some(SuspendedContext::Spotify { context_uri, .. }) => {
+        assert_eq!(
+          context_uri.as_deref(),
+          Some("spotify:playlist:suspended"),
+          "the context captured at suspension time must survive the conversion"
+        );
+      }
+      other => panic!("expected a context suspension, got {other:?}"),
+    }
+    assert!(
+      app
+        .native_spotify_shuffle
+        .as_ref()
+        .is_some_and(|s| s.fetch_failed),
+      "the session must be marked failed for the suspend fallback"
+    );
   }
 
   #[test]
