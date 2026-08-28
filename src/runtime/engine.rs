@@ -770,6 +770,11 @@ pub enum FoldQuery {
   /// is now held.
   #[cfg(feature = "dj-core")]
   ClaimDjLibraryIndex,
+  /// Is a playlist crawl already done or in flight? The pre-dispatch dedup
+  /// check (`request_library_index`) reads this instead of claiming — the
+  /// dispatched crawl claims on its own when it runs.
+  #[cfg(feature = "dj-core")]
+  DjLibraryIndexPending,
   /// The cached avoid-library index, if the crawl finished. Decides whether
   /// ownership checks are complete and carries the crawled id set.
   #[cfg(feature = "dj-core")]

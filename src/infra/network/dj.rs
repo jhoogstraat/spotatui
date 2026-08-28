@@ -419,13 +419,16 @@ impl Network {
   /// queues behind the tool call that asked for it rather than extending it; the
   /// channel is unbounded, so the send cannot block the handler it is inside.
   async fn request_library_index(&self) {
-    // The claim and the dispatch stay separate because the dispatch goes
-    // through the fold too (this handler runs on the serial lane, so the crawl
-    // queues behind the tool call that asked for it rather than extending it).
-    if !matches!(
-      self.fold_query(FoldQuery::ClaimDjLibraryIndex).await,
+    // A read-only dedup check, not a claim: the dispatched crawl claims on
+    // its own when it runs (the old code only checked here too, and a claim
+    // held across the dispatch boundary would refuse the very crawl it
+    // dispatched). This runs *on* the serial lane, so the crawl queues behind
+    // the tool call that asked for it rather than extending it.
+    let already = matches!(
+      self.fold_query(FoldQuery::DjLibraryIndexPending).await,
       Some(FoldAnswer::Bool(true))
-    ) {
+    );
+    if already {
       return;
     }
     self
@@ -589,7 +592,10 @@ impl Network {
       Ok(library) => SessionFact::DjLibraryIndexed(Ok(Box::new(library))),
       Err(e) => SessionFact::DjLibraryIndexed(Err(format!("{e}"))),
     };
-    self.emit_session(fact).await;
+    // Acked: `dj_library_index`'s cold-path caller immediately asks the fold
+    // for the index, so the install must have been applied before this
+    // returns — an unacked emit would race the caller's query.
+    self.emit_session_acked(fact).await;
   }
 
   /// Run the crawl, resolving the listener's own account ID first.

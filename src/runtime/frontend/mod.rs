@@ -1635,6 +1635,10 @@ pub(crate) fn answer_query(
       FoldAnswer::Bool(claimed)
     }
     #[cfg(feature = "dj-core")]
+    FoldQuery::DjLibraryIndexPending => {
+      FoldAnswer::Bool(app.dj.library.is_some() || app.dj.library_indexing)
+    }
+    #[cfg(feature = "dj-core")]
     FoldQuery::DjLibrary => FoldAnswer::DjLibrary(app.dj.library.clone().map(Box::new)),
     #[cfg(feature = "dj-core")]
     FoldQuery::ApplyDjQueueTracks { tracks } => {
