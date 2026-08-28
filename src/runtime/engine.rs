@@ -99,6 +99,19 @@ pub enum SessionFact {
   /// Dispatch `GetPlaylists` from the fold (the post-create refresh and
   /// other places that re-pull the sidebar list after a mutation).
   DispatchPlaylistRefresh,
+  /// Apply an in-process producer's action through the fold (ticket 17:
+  /// DJ tools, MCP executor). The fold runs `App::apply`'s ownership-aware
+  /// arm under its own lock — the exact old inline `app.apply(...)` writes.
+  ApplyAction(crate::core::action::EngineAction),
+  /// One DJ transcript line (ticket 17: the agent loop stopped locking App).
+  #[cfg(feature = "dj-core")]
+  DjPushLine {
+    speaker: crate::infra::dj::DjSpeaker,
+    text: String,
+  },
+  /// The DJ's per-turn progress flag (`…thinking` row).
+  #[cfg(feature = "dj-core")]
+  DjStep(Option<(usize, usize)>),
 }
 
 /// The data fetches `complete_spotify_login` used to dispatch under the same
@@ -148,6 +161,15 @@ impl std::fmt::Debug for SessionFact {
         f.debug_tuple("ClearPendingPlaylistOpen").field(id).finish()
       }
       SessionFact::DispatchPlaylistRefresh => f.write_str("DispatchPlaylistRefresh"),
+      SessionFact::ApplyAction(action) => f.debug_tuple("ApplyAction").field(action).finish(),
+      #[cfg(feature = "dj-core")]
+      SessionFact::DjPushLine { speaker, text } => f
+        .debug_struct("DjPushLine")
+        .field("speaker", speaker)
+        .field("text", text)
+        .finish(),
+      #[cfg(feature = "dj-core")]
+      SessionFact::DjStep(step) => f.debug_tuple("DjStep").field(step).finish(),
     }
   }
 }
@@ -382,6 +404,18 @@ pub enum FoldQuery {
   LastError,
   /// Force the pending state save out to disk now (CLI end-of-command).
   FlushStateSave,
+  /// The source-agnostic playback snapshot (DJ now-playing, window title).
+  MediaSnapshot,
+  /// The native queue's depth (DJ now-playing payload).
+  QueueDepth,
+  /// The native queue's tracks, in order (DJ `get_queue`).
+  QueueTracks,
+  /// The DJ generation counter (the agent turn loop's adopt-one-bump rule).
+  #[cfg(feature = "dj-core")]
+  DjGeneration,
+  /// The standing DJ vibe and whether auto-queue is on (vibe-effect text).
+  #[cfg(feature = "dj-core")]
+  DjVibe,
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -405,6 +439,16 @@ pub enum FoldAnswer {
   Tracks(Vec<crate::core::plugin_api::TrackInfo>),
   /// The latest catalog search results.
   Search(Box<crate::core::app::SearchResult>),
+  /// The source-agnostic playback snapshot (or `None` when nothing plays).
+  Media(Option<crate::infra::media_metadata::PlaybackSnapshot>),
+  /// The native queue's tracks, in order.
+  QueueTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  /// The standing DJ vibe and whether the auto-queue DJ is on.
+  #[cfg(feature = "dj-core")]
+  DjVibe {
+    vibe: Option<String>,
+    auto_queue: bool,
+  },
   /// Status text a fold query computed (the add-to-playlist ack).
   StatusText(String),
   /// The registration result for a playlist refresh (the page-1 install).
@@ -438,6 +482,14 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::Playlists(v) => f.debug_tuple("Playlists").field(&v.is_some()).finish(),
       FoldAnswer::Tracks(v) => f.debug_tuple("Tracks").field(&v.len()).finish(),
       FoldAnswer::Search(v) => f.debug_tuple("Search").field(v).finish(),
+      FoldAnswer::Media(v) => f.debug_tuple("Media").field(&v.is_some()).finish(),
+      FoldAnswer::QueueTracks(v) => f.debug_tuple("QueueTracks").field(&v.len()).finish(),
+      #[cfg(feature = "dj-core")]
+      FoldAnswer::DjVibe { vibe, auto_queue } => f
+        .debug_struct("DjVibe")
+        .field("vibe", vibe)
+        .field("auto_queue", auto_queue)
+        .finish(),
       FoldAnswer::StatusText(v) => f.debug_tuple("StatusText").field(v).finish(),
       FoldAnswer::PlaylistRefreshRegistered { generation, .. } => f
         .debug_struct("PlaylistRefreshRegistered")

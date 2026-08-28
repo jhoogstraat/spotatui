@@ -501,6 +501,41 @@ impl Default for Snapshot {
 /// trigger a rebuild. Session facts (ticket 16) replay the exact old handler
 /// code under the fold's lock; producer queries are answered here too, so no
 /// producer outside this task ever locks `App`.
+/// Open a spine, install it on `App`, and spawn the fold task (ticket 17).
+/// Command surfaces that live outside the full runtime boot (CLI mode, and
+/// spine-driven tests) need a live fold for their queries and events to be
+/// answered. Returns the spine handle and the snapshot watch receiver.
+pub(crate) async fn spawn_fold(
+  app: &Arc<tokio::sync::Mutex<App>>,
+) -> (
+  crate::runtime::engine::Spine,
+  tokio::sync::watch::Receiver<Snapshot>,
+) {
+  let (spine, events_rx, spine_queries) = crate::runtime::engine::Spine::open(Default::default());
+  app.lock().await.spine = Some(spine.clone());
+  let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Snapshot {
+    playback: None,
+    library: Default::default(),
+    position_ms: None,
+    as_of: std::time::Instant::now(),
+    queue_upcoming: Vec::new(),
+    search_tracks: Vec::new(),
+    search_loading: false,
+    spotify_connected: false,
+    notice: None,
+    notice_is_error: false,
+    audio_ready: false,
+    audio_pending: false,
+  });
+  tokio::spawn(fold_loop(
+    app.clone(),
+    snapshot_tx,
+    events_rx,
+    spine_queries.take(),
+  ));
+  (spine, snapshot_rx)
+}
+
 /// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
 /// writer of App state outside producers. `pub(super)` so the CLI mode can
 /// run one for its subcommand lifetime (ticket 17: the CLI reads published
@@ -795,6 +830,21 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     SessionFact::DispatchPlaylistRefresh => {
       app.dispatch(IoEvent::GetPlaylists);
     }
+    SessionFact::ApplyAction(action) => {
+      // Ticket 17: the DJ tools / MCP executor mutations. The fold is the
+      // single writer, so their old inline `app.apply(...)` under the lock
+      // becomes a fact reduced here; publishing happens on the normal
+      // event path.
+      app.apply(action);
+    }
+    #[cfg(feature = "dj-core")]
+    SessionFact::DjPushLine { speaker, text } => {
+      app.dj.push_line(crate::infra::dj::DjLine { speaker, text });
+    }
+    #[cfg(feature = "dj-core")]
+    SessionFact::DjStep(step) => {
+      app.dj.step = step;
+    }
   }
 }
 
@@ -938,6 +988,18 @@ pub(crate) fn answer_query(
     FoldQuery::TableTracks => FoldAnswer::Tracks(app.track_table.tracks.clone()),
     FoldQuery::SearchResults => FoldAnswer::Search(Box::new(app.search_results.clone())),
     FoldQuery::LastError => FoldAnswer::StatusText(app.api_error.clone()),
+    FoldQuery::MediaSnapshot => {
+      FoldAnswer::Media(crate::infra::media_metadata::current_playback_snapshot(app))
+    }
+    FoldQuery::QueueDepth => FoldAnswer::U64(app.native_queue.len() as u64),
+    FoldQuery::QueueTracks => FoldAnswer::QueueTracks(app.native_queue.clone()),
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjGeneration => FoldAnswer::U64(app.dj.generation),
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjVibe => FoldAnswer::DjVibe {
+      vibe: app.dj.vibe.clone(),
+      auto_queue: app.dj.auto_queue,
+    },
     FoldQuery::FlushStateSave => {
       app.flush_state_save(true);
       FoldAnswer::Bool(true)

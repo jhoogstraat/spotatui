@@ -718,19 +718,22 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     };
     if enabled {
       match io_tx {
-        Some(io_tx) => match crate::infra::mcp::spawn_listener(Arc::clone(&app), io_tx).await {
-          Ok(port) => {
-            let mut app_mut = app.lock().await;
-            if app_mut.status_message.is_none() {
-              app_mut.set_status_message(format!("MCP server listening on 127.0.0.1:{port}"), 6);
+        Some(io_tx) => {
+          match crate::infra::mcp::spawn_listener(Arc::clone(&app), io_tx, ctx.spine.clone()).await
+          {
+            Ok(port) => {
+              let mut app_mut = app.lock().await;
+              if app_mut.status_message.is_none() {
+                app_mut.set_status_message(format!("MCP server listening on 127.0.0.1:{port}"), 6);
+              }
+            }
+            Err(e) => {
+              log::warn!("MCP: could not start the control socket: {e}");
+              let mut app_mut = app.lock().await;
+              app_mut.set_error_status_message(format!("MCP server failed to start: {e}"), 8);
             }
           }
-          Err(e) => {
-            log::warn!("MCP: could not start the control socket: {e}");
-            let mut app_mut = app.lock().await;
-            app_mut.set_error_status_message(format!("MCP server failed to start: {e}"), 8);
-          }
-        },
+        }
         None => log::warn!("MCP: no IoEvent sender available; control socket not started"),
       }
     }

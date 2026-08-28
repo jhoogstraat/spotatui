@@ -2,13 +2,14 @@
 //!
 //! Shared by both front doors, which is why it lives here rather than under
 //! `infra::mcp`: the MCP server drives it for a remote agent, and the in-TUI DJ's
-//! agent loop drives it for the local brain. Anything that only needs the `App`
-//! lock is answered inline; the rest goes down the serial IoEvent lane and waits
-//! on a `oneshot`, because only that lane has the real Spotify client.
+//! agent loop drives it for the local brain. App-only reads go through the fold's
+//! published state and mutations through fold facts (ticket 17); the rest goes
+//! down the serial IoEvent lane and waits on a `oneshot`, because only that lane
+//! has the real Spotify client.
 
 use super::tools::{self, DjToolCall, ToolOutcome};
-use crate::core::app::App;
 use crate::infra::network::IoEvent;
+use crate::runtime::engine::{EngineEvent, SessionFact, Spine};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
@@ -25,7 +26,8 @@ pub trait ToolExecutor {
 
 /// Executes against the live player.
 pub struct AppExecutor {
-  app: Arc<Mutex<App>>,
+  /// The engine spine: app-only reads and mutations flow through the fold.
+  spine: Spine,
   io_tx: Sender<IoEvent>,
   /// Whether a mutating call raises a status-bar toast.
   ///
@@ -38,9 +40,9 @@ pub struct AppExecutor {
 impl AppExecutor {
   /// For the MCP front door: mutating calls are announced in the status bar.
   #[cfg_attr(not(feature = "mcp-server"), allow(dead_code))]
-  pub fn new(app: Arc<Mutex<App>>, io_tx: Sender<IoEvent>) -> Self {
+  pub fn new(io_tx: Sender<IoEvent>, spine: Spine) -> Self {
     Self {
-      app,
+      spine,
       io_tx,
       announce: true,
     }
@@ -48,17 +50,23 @@ impl AppExecutor {
 
   /// For the in-TUI DJ, which reports its own tool calls in the transcript.
   #[cfg_attr(not(feature = "ai-dj"), allow(dead_code))]
-  pub fn silent(app: Arc<Mutex<App>>, io_tx: Sender<IoEvent>) -> Self {
+  pub fn silent(io_tx: Sender<IoEvent>, spine: Spine) -> Self {
     Self {
-      app,
+      spine,
       io_tx,
       announce: false,
     }
   }
 
   async fn announce(&self, message: String) {
-    let mut app = self.app.lock().await;
-    app.set_status_message(format!("MCP: {message}"), 5);
+    self
+      .spine
+      .emit(EngineEvent::Session(SessionFact::Status {
+        message: format!("MCP: {message}"),
+        ttl_secs: 5,
+        is_error: false,
+      }))
+      .await;
   }
 }
 
@@ -74,9 +82,9 @@ impl ToolExecutor for AppExecutor {
       "tool table and DjToolCall disagree about needing the network"
     );
 
-    // Anything that only needs `App` is answered here and now.
+    // Anything that only needs published state is answered here and now.
     if !call.needs_network() {
-      if let Some(outcome) = tools::execute_app_only(&self.app, &call).await {
+      if let Some(outcome) = tools::execute_app_only(&self.spine, &call).await {
         if announce && !outcome.is_error {
           self.announce(outcome.text.clone()).await;
         }
@@ -120,7 +128,8 @@ mod tests {
     let (tx, rx) = std::sync::mpsc::channel();
     drop(rx);
     let app = Arc::new(Mutex::new(App::default()));
-    let executor = AppExecutor::new(app, tx);
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let executor = AppExecutor::new(tx, spine);
     // `search_tracks` needs the network, so it takes the IoEvent path.
     let outcome = executor
       .call(DjToolCall::SearchTracks {
@@ -137,7 +146,8 @@ mod tests {
     let (tx, rx) = std::sync::mpsc::channel();
     drop(rx);
     let app = Arc::new(Mutex::new(App::default()));
-    let executor = AppExecutor::new(app, tx);
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let executor = AppExecutor::new(tx, spine);
     // Nothing is playing in a default App, but the call still succeeds — it
     // never touches the (closed) IoEvent channel.
     let outcome = executor.call(DjToolCall::GetNowPlaying).await;
@@ -151,7 +161,8 @@ mod tests {
     // for its work would be both duplicated and wrongly attributed.
     let (tx, _rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
-    let executor = AppExecutor::silent(Arc::clone(&app), tx);
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let executor = AppExecutor::silent(tx, spine);
     let outcome = executor
       .call(DjToolCall::SetDjVibe {
         vibe: Some("mellow".into()),

@@ -88,38 +88,15 @@ pub(super) async fn run_subcommand(boot: Boot, cmd: &str, matches: &ArgMatches) 
   // Ticket 17: the CLI is a command surface reading fold-published state,
   // so it runs its own fold for the subcommand lifetime. Snapshot
   // publication has no subscriber here; the fold task ends when this
-  // function drops the watch sender and the spine.
-  let (spine, events_rx, spine_queries) = crate::runtime::engine::Spine::open(Default::default());
+  // function drops the watch receiver and the spine.
+  let (spine, _snapshot_rx) = crate::runtime::frontend::spawn_fold(&app).await;
   network.spine = Some(spine.clone());
-  app.lock().await.spine = Some(spine.clone());
-  let (snapshot_tx, _snapshot_rx) =
-    tokio::sync::watch::channel(crate::runtime::frontend::Snapshot {
-      playback: None,
-      library: Default::default(),
-      position_ms: None,
-      as_of: std::time::Instant::now(),
-      queue_upcoming: Vec::new(),
-      search_tracks: Vec::new(),
-      search_loading: false,
-      spotify_connected: false,
-      notice: None,
-      notice_is_error: false,
-      audio_ready: false,
-      audio_pending: false,
-    });
-  let fold_task = tokio::spawn(crate::runtime::frontend::fold_loop(
-    app.clone(),
-    snapshot_tx,
-    events_rx,
-    spine_queries.take(),
-  ));
   let cli_result = cli::handle_matches(matches, cmd.to_string(), network, boot.user_config).await;
   // End-of-command persistence flush through the fold (it owns the state).
   let _ = spine
     .query(crate::runtime::engine::FoldQuery::FlushStateSave)
     .await;
-  drop(spine);
-  let _ = fold_task.await;
+  drop(spine); // closes the spine: the fold task drains and exits
   println!("{}", cli_result?);
   Ok(())
 }

@@ -19,6 +19,8 @@ use super::session::TurnContext;
 use super::tools::{self, DjToolCall, ToolCallError};
 use super::{DjLine, DjSpeaker};
 use crate::core::app::App;
+use crate::runtime::engine::{EngineEvent, SessionFact};
+use crate::runtime::engine::{FoldAnswer, FoldQuery};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -55,10 +57,13 @@ pub struct TurnOutcome {
 
 /// Everything one turn needs.
 pub struct Turn<'a, E: ToolExecutor> {
-  pub app: &'a Arc<Mutex<App>>,
   pub brain: &'a DjBrain,
   pub context: &'a TurnContext,
   pub executor: &'a E,
+  /// The engine spine (ticket 17): transcript pushes and step flags flow as
+  /// fold facts; the generation guard queries the fold. The turn never
+  /// locks App.
+  pub spine: &'a crate::runtime::engine::Spine,
   /// The generation this turn belongs to. A bump the turn did not cause means the
   /// listener has moved on and everything after it is unwanted.
   pub generation: u64,
@@ -196,7 +201,10 @@ impl<E: ToolExecutor> Turn<'_, E> {
     // turn queueing alongside the one they just started, so only the single bump
     // our own `set_dj_vibe` makes is adopted. Their bump on top of ours moves the
     // counter by two, and still aborts.
-    let after = { self.app.lock().await.dj.generation };
+    let after = match self.spine.query(FoldQuery::DjGeneration).await {
+      Ok(FoldAnswer::U64(generation)) => generation,
+      _ => before,
+    };
     if after != before {
       if sets_vibe && !outcome.is_error && after == before.wrapping_add(1) {
         self.generation = after;
@@ -239,12 +247,22 @@ impl<E: ToolExecutor> Turn<'_, E> {
   }
 
   async fn abandoned(&self) -> bool {
-    self.app.lock().await.dj.generation != self.generation
+    match self.spine.query(FoldQuery::DjGeneration).await {
+      Ok(FoldAnswer::U64(generation)) => generation != self.generation,
+      _ => false,
+    }
   }
 
   async fn push(&self, line: DjLine) {
-    let mut app = self.app.lock().await;
-    app.dj.push_line(line);
+    // Acked so the transcript line is ordered with the tool events around it
+    // and is visible before the turn moves on (tests read it after run()).
+    let _ = self
+      .spine
+      .emit_acked(EngineEvent::Session(SessionFact::DjPushLine {
+        speaker: line.speaker,
+        text: line.text,
+      }))
+      .await;
   }
 
   /// One transcript line per tool call, so the listener sees the DJ work rather
@@ -260,8 +278,10 @@ impl<E: ToolExecutor> Turn<'_, E> {
   }
 
   async fn show_step(&self, step: usize, of: usize) {
-    let mut app = self.app.lock().await;
-    app.dj.step = Some((step, of));
+    let _ = self
+      .spine
+      .emit_acked(EngineEvent::Session(SessionFact::DjStep(Some((step, of)))))
+      .await;
   }
 }
 
@@ -333,13 +353,13 @@ mod tests {
   }
 
   fn turn<'a>(
-    app: &'a Arc<Mutex<App>>,
+    spine: &'a crate::runtime::engine::Spine,
     brain: &'a DjBrain,
     context: &'a TurnContext,
     executor: &'a ScriptedExecutor,
   ) -> Turn<'a, ScriptedExecutor> {
     Turn {
-      app,
+      spine,
       brain,
       context,
       executor,
@@ -348,17 +368,18 @@ mod tests {
     }
   }
 
-  #[test]
-  fn the_filter_toggle_is_applied_whether_or_not_the_model_asked() {
+  #[tokio::test]
+  async fn the_filter_toggle_is_applied_whether_or_not_the_model_asked() {
     // In-TUI the filter is the listener's toggle, so it cannot depend on the model
     // remembering to pass `exclude_owned`.
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _rx) = crate::runtime::frontend::spawn_fold(&app).await;
     let brain = DjBrain::OpenAiCompat(super::super::brain::openai_compat::OpenAiCompatBrain::new(
       None, None, None,
     ));
     let executor = ScriptedExecutor::new();
     let filtered = context(true);
-    let turn = turn(&app, &brain, &filtered, &executor);
+    let turn = turn(&spine, &brain, &filtered, &executor);
 
     let call = DjToolCall::QueueTracks {
       items: vec![],
@@ -382,13 +403,14 @@ mod tests {
 
   #[test]
   fn an_unfiltered_session_leaves_the_models_own_choice_alone() {
-    let app = Arc::new(Mutex::new(App::default()));
+    // Policy only: no fold needed, a closed spine never answers queries.
+    let (spine, _events, _queries) = crate::runtime::engine::Spine::open(Default::default());
     let brain = DjBrain::OpenAiCompat(super::super::brain::openai_compat::OpenAiCompatBrain::new(
       None, None, None,
     ));
     let executor = ScriptedExecutor::new();
     let unfiltered = context(false);
-    let turn = turn(&app, &brain, &unfiltered, &executor);
+    let turn = turn(&spine, &brain, &unfiltered, &executor);
 
     for asked in [true, false] {
       let call = DjToolCall::QueueTracks {
@@ -536,11 +558,12 @@ echo '{"say":"Still going.","tool_calls":[{"name":"get_queue","arguments":{}}]}'
     // when the model has something to say and nothing to run.
     let brain = stub_brain("two-step");
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
     let executor = slow_executor(&app, false);
     let context = context(false);
 
     let outcome = Turn {
-      app: &app,
+      spine: &spine,
       brain: &brain,
       context: &context,
       executor: &executor,
@@ -586,11 +609,12 @@ echo '{"say":"Still going.","tool_calls":[{"name":"get_queue","arguments":{}}]}'
     // have it queue on alongside the one the listener just started.
     let brain = stub_brain("queues-once");
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
     let executor = slow_executor(&app, true);
     let context = context(false);
 
     let outcome = Turn {
-      app: &app,
+      spine: &spine,
       brain: &brain,
       context: &context,
       executor: &executor,
@@ -619,13 +643,14 @@ echo '{"say":"Still going.","tool_calls":[{"name":"get_queue","arguments":{}}]}'
     // moving on would have the DJ kill its turn the moment it set a vibe.
     let brain = stub_brain("sets-vibe");
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
     // The real tool, so the real bump: a stub executor would not reproduce this.
     let (tx, _rx) = std::sync::mpsc::channel();
-    let executor = super::super::exec::AppExecutor::silent(Arc::clone(&app), tx);
+    let executor = super::super::exec::AppExecutor::silent(tx, spine.clone());
     let context = context(false);
 
     let outcome = Turn {
-      app: &app,
+      spine: &spine,
       brain: &brain,
       context: &context,
       executor: &executor,
@@ -646,11 +671,12 @@ echo '{"say":"Still going.","tool_calls":[{"name":"get_queue","arguments":{}}]}'
   async fn a_model_that_never_stops_is_capped_and_says_so() {
     let brain = stub_brain("never-stops");
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
     let executor = slow_executor(&app, false);
     let context = context(false);
 
     let outcome = Turn {
-      app: &app,
+      spine: &spine,
       brain: &brain,
       context: &context,
       executor: &executor,
