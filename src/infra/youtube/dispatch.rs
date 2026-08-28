@@ -181,9 +181,12 @@ async fn run_youtube_search(app: &Arc<Mutex<App>>, query: &str) {
         CatalogStateEvent::SearchCompleted {
           source: Source::YouTube,
           query: query.to_string(),
-          tracks: Some(Paged {
-            items: results.tracks,
-            total,
+          pages: Box::new(crate::core::catalog::SearchCompletionPages {
+            tracks: Some(Paged {
+              items: results.tracks,
+              total,
+              ..Default::default()
+            }),
             ..Default::default()
           }),
         },

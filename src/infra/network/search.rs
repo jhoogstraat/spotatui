@@ -1,6 +1,7 @@
 use super::{IoEvent, Network};
 use crate::core::plugin_api::{AlbumInfo, ArtistInfo, PlaylistInfo, ShowInfo, TrackInfo};
 use crate::infra::network::mapping::map_page;
+use crate::runtime::engine::SessionFact;
 use anyhow::anyhow;
 use rspotify::model::{
   artist::FullArtist, enums::Country, page::Page, playlist::SimplifiedPlaylist,
@@ -52,7 +53,7 @@ impl Network {
       crate::core::catalog::CatalogStateEvent::SearchCompleted {
         source: crate::core::source::Source::Spotify,
         query: query.to_string(),
-        tracks: None,
+        pages: Box::default(),
       },
     )
     .await;
@@ -123,20 +124,20 @@ impl SearchNetwork for Network {
     // Silently ignore playlist errors - this is a known Spotify API issue
     let playlist_result = playlist_search.ok().map(|res| res.playlists);
 
-    let mut app = self.app.lock().await;
-
-    // Extract ids for follow/saved checks from raw rspotify pages before conversion.
+    // Ticket 17: the completion event carries every page, so the fold is
+    // the single writer of the visible search surface (pages, focus, and
+    // the stale-index clamps all moved into the fold's reducer). The
+    // liked/follow/saved membership checks still ride the IoEvent lane,
+    // dispatched by the fold to preserve the old spinner semantics.
+    let mut checks: Vec<IoEvent> = Vec::new();
     if let Some(ref track_results) = track_result {
       let track_ids = track_results
         .items
         .iter()
         .filter_map(|track| track.id.as_ref().map(|id| id.id().to_string()))
         .collect();
-
-      // Check if these tracks are liked
-      app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_ids));
+      checks.push(IoEvent::CurrentUserSavedTracksContains(track_ids));
     }
-
     if let Some(ref album_results) = album_result {
       let artist_ids = album_results
         .items
@@ -148,34 +149,28 @@ impl SearchNetwork for Network {
             .filter_map(|artist| artist.id.as_ref().map(|id| id.id().to_string()))
         })
         .collect();
-
-      // Check if these artists are followed
-      app.dispatch(IoEvent::UserArtistFollowCheck(artist_ids));
-
+      checks.push(IoEvent::UserArtistFollowCheck(artist_ids));
       let album_ids = album_results
         .items
         .iter()
         .filter_map(|album| album.id.as_ref().map(|id| id.id().to_string()))
         .collect();
-
-      // Check if these albums are saved
-      app.dispatch(IoEvent::CurrentUserSavedAlbumsContains(album_ids));
+      checks.push(IoEvent::CurrentUserSavedAlbumsContains(album_ids));
     }
-
     if let Some(ref show_results) = show_result {
       let show_ids = show_results
         .items
         .iter()
         .map(|show| show.id.id().to_string())
         .collect();
-
-      // check if these shows are saved
-      app.dispatch(IoEvent::CurrentUserSavedShowsContains(show_ids));
+      checks.push(IoEvent::CurrentUserSavedShowsContains(show_ids));
+    }
+    if !checks.is_empty() {
+      self.emit_session(SessionFact::DispatchIo(checks)).await;
     }
 
-    // Convert rspotify pages to domain Paged<T> before publishing through the
-    // fold (ticket 15): the completion event carries all five pages; the fold
-    // enforces the stale-request contract before replacing visible rows.
+    // Convert rspotify pages to domain Paged<T> and publish the completion
+    // (the ticket 15 event shape, extended in ticket 17 to carry every page).
     let tracks_page = track_result
       .as_ref()
       .map(|p| map_page(p, |t| TrackInfo::from(t)));
@@ -193,49 +188,21 @@ impl SearchNetwork for Network {
       .as_ref()
       .map(|p| map_page(p, |s| ShowInfo::from(s)));
 
-    app.search_results.tracks = tracks_page.clone();
-    app.search_results.artists = artists_page;
-    app.search_results.albums = albums_page;
-    app.search_results.playlists = playlists_page;
-    app.search_results.shows = shows_page;
-
-    // Ticket 15: publish the completion through the spine as well. The
-    // direct writes above remain as the transition-period mirror (deleted
-    // with the mega-mutex in ticket 18); the event ordering is what the
-    // fold's stale-request enforcement keys on.
     crate::runtime::engine::emit_catalog_event(
       &self.app,
       crate::core::catalog::CatalogStateEvent::SearchCompleted {
         source: crate::core::source::Source::Spotify,
         query: search_term_snapshot,
-        tracks: tracks_page,
+        pages: Box::new(crate::core::catalog::SearchCompletionPages {
+          tracks: tracks_page,
+          artists: artists_page,
+          albums: albums_page,
+          playlists: playlists_page,
+          shows: shows_page,
+        }),
       },
     )
     .await;
-
-    // A replaced page can be shorter than the previous one (or empty), which
-    // would otherwise leave a stale selected-index pointing past the end of
-    // the new results (panic-1: unchecked `.items[selected_index]` indexing
-    // downstream). Clamp/reset every selected-index field to stay in range of
-    // its freshly-replaced sibling page. Each page length is read first (ending
-    // the shared borrow) so the mutable index borrow that follows doesn't
-    // overlap it through the `App` guard's `Deref`.
-    let tracks_len = page_len(&app.search_results.tracks);
-    let artists_len = page_len(&app.search_results.artists);
-    let albums_len = page_len(&app.search_results.albums);
-    let playlists_len = page_len(&app.search_results.playlists);
-    let shows_len = page_len(&app.search_results.shows);
-    clamp_selected_index(&mut app.search_results.selected_tracks_index, tracks_len);
-    clamp_selected_index(&mut app.search_results.selected_artists_index, artists_len);
-    clamp_selected_index(&mut app.search_results.selected_album_index, albums_len);
-    clamp_selected_index(
-      &mut app.search_results.selected_playlists_index,
-      playlists_len,
-    );
-    clamp_selected_index(&mut app.search_results.selected_shows_index, shows_len);
-    app
-      .plugin_data_generations
-      .bump(crate::core::app::PluginDataKind::Search);
   }
 
   async fn search_tracks_for_playlist(&mut self, search_term: String) {
@@ -263,8 +230,9 @@ impl SearchNetwork for Network {
       }
     };
 
-    let mut app = self.app.lock().await;
-    app.create_playlist_search_results = tracks;
+    self
+      .emit_session(SessionFact::CreatePlaylistSearchResults(tracks))
+      .await;
   }
 }
 
@@ -274,22 +242,22 @@ impl SearchNetwork for Network {
 /// point past the end of the new `items` Vec, which panics wherever a caller
 /// indexes directly (panic-1: `src/tui/handlers/search_results.rs`, the `D`
 /// / unfollow-playlist handler).
-fn page_len<T>(page: &Option<crate::core::pagination::Paged<T>>) -> usize {
-  page.as_ref().map(|p| p.items.len()).unwrap_or(0)
-}
-
-fn clamp_selected_index(index: &mut Option<usize>, len: usize) {
-  *index = match (*index, len) {
-    (_, 0) => None,
-    (Some(i), len) => Some(i.min(len - 1)),
-    (None, _) => None,
-  };
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::core::pagination::Paged;
+
+  fn page_len<T>(page: &Option<crate::core::pagination::Paged<T>>) -> usize {
+    page.as_ref().map(|p| p.items.len()).unwrap_or(0)
+  }
+
+  fn clamp_selected_index(index: &mut Option<usize>, len: usize) {
+    *index = match (*index, len) {
+      (_, 0) => None,
+      (Some(i), len) => Some(i.min(len - 1)),
+      (None, _) => None,
+    };
+  }
 
   fn page_of(len: usize) -> Option<Paged<u32>> {
     Some(Paged {

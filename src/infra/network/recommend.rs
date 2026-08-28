@@ -1,6 +1,6 @@
 use super::{ids, IoEvent, Network};
-use crate::core::app::{ActiveBlock, RouteId, TrackTableContext};
 use crate::core::plugin_api::TrackInfo;
+use crate::runtime::engine::SessionFact;
 use anyhow::anyhow;
 use rspotify::model::{
   enums::Country,
@@ -111,21 +111,24 @@ impl RecommendationNetwork for Network {
           }
         };
 
-        let mut app = self.app.lock().await;
-        // Check if these tracks are liked (only the rspotify recommendations,
-        // not the prepended domain-layer seed track).
+        // Ticket 17: the membership check rides the fold's dispatch fact,
+        // and the table write + navigation moved into the fold reducer.
         let track_check = ids::track_check_ids(full_tracks.iter().map(|t| t.id.as_ref()));
         if !track_check.is_empty() {
-          app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_check));
+          self
+            .emit_session(SessionFact::DispatchIo(vec![
+              IoEvent::CurrentUserSavedTracksContains(track_check),
+            ]))
+            .await;
         }
-        app.track_table.tracks = full_tracks.iter().map(TrackInfo::from).collect();
-
+        let mut tracks: Vec<TrackInfo> = full_tracks.iter().map(TrackInfo::from).collect();
         // Prepend the seed track if available so user knows context
         if let Some(track) = *first_track {
-          app.track_table.tracks.insert(0, track);
+          tracks.insert(0, track);
         }
-        app.track_table.context = Some(TrackTableContext::RecommendedTracks);
-        app.push_navigation_stack(RouteId::Recommendations, ActiveBlock::TrackTable);
+        self
+          .emit_session(SessionFact::RecommendedTracks { tracks })
+          .await;
       }
       Err(e) => {
         self.handle_error(anyhow!(e)).await;

@@ -41,6 +41,18 @@ pub struct RequestToken {
   pub seq: u64,
 }
 
+/// All five search pages a completion carries. Spotify fills every field;
+/// single-source engines pass track rows only and the fold clears the
+/// remaining pages on a fresh completion.
+#[derive(Debug, Clone, Default)]
+pub struct SearchCompletionPages {
+  pub tracks: Option<Paged<TrackInfo>>,
+  pub artists: Option<Paged<crate::core::plugin_api::ArtistInfo>>,
+  pub albums: Option<Paged<crate::core::plugin_api::AlbumInfo>>,
+  pub playlists: Option<Paged<crate::core::plugin_api::PlaylistInfo>>,
+  pub shows: Option<Paged<crate::core::plugin_api::ShowInfo>>,
+}
+
 /// One observed catalog fact.
 #[derive(Debug, Clone)]
 pub enum CatalogStateEvent {
@@ -55,7 +67,10 @@ pub enum CatalogStateEvent {
   SearchCompleted {
     source: Source,
     query: String,
-    tracks: Option<Paged<TrackInfo>>,
+    /// All five pages: the fold is the single writer of the visible search
+    /// surface (ticket 17). Boxed — five `Paged` payloads dwarf the enum's
+    /// other variants.
+    pages: Box<SearchCompletionPages>,
   },
   /// A playlist/album listing landed in the shared browse table.
   TrackTableReplaced {

@@ -1,5 +1,6 @@
 use super::Network;
-use crate::core::app::{Announcement, AnnouncementLevel, LyricsStatus};
+use crate::core::app::{Announcement, AnnouncementLevel};
+use crate::runtime::engine::{FoldAnswer, FoldQuery, SessionFact};
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer};
 use std::collections::HashSet;
@@ -88,24 +89,25 @@ impl UtilsNetwork for Network {
     let request_identity = (track.clone(), artists.join(", "));
     let client = super::requests::shared_http_client();
 
-    // Update state to loading
+    // Register the fetch with the fold (ticket 17): the claim re-checks the
+    // desired identity and flips the loading state in one atomic step; a
+    // superseded request never leaves the ground.
+    let live = match self
+      .fold_query(FoldQuery::ClaimLyricsFetch {
+        identity: request_identity.clone(),
+      })
+      .await
     {
-      let mut app = self.app.lock().await;
-      if app.desired_lyrics_identity.as_ref() != Some(&request_identity) {
-        return;
-      }
-      app.lyrics_status = LyricsStatus::Loading;
-      app.lyrics = None;
-      app.lyrics_synced = false;
+      Some(FoldAnswer::Bool(live)) => live,
+      _ => false,
+    };
+    if !live {
+      return;
     }
 
     let lrc_resp = fetch_lrclib_lyrics(client, &track, &artists, duration).await;
 
-    let mut app = self.app.lock().await;
-    if app.desired_lyrics_identity.as_ref() != Some(&request_identity) {
-      return;
-    }
-    match lrc_resp {
+    let (lyrics, synced, found) = match lrc_resp {
       Some(lrc_resp) => {
         // Prefer timestamped ("synced") lyrics. If LRCLIB only has plain
         // (unsynced) lyrics, still show them as static text rather than
@@ -117,28 +119,28 @@ impl UtilsNetwork for Network {
           .unwrap_or_default();
 
         if !synced.is_empty() {
-          app.lyrics = Some(synced);
-          app.lyrics_synced = true;
-          app.lyrics_status = LyricsStatus::Found;
+          (Some(synced), true, true)
         } else if let Some(plain) = lrc_resp
           .plainLyrics
           .as_deref()
           .filter(|text| !text.trim().is_empty())
         {
-          app.lyrics = Some(synthesize_plain_lyrics(plain, duration));
-          app.lyrics_synced = false;
-          app.lyrics_status = LyricsStatus::Found;
+          (Some(synthesize_plain_lyrics(plain, duration)), false, true)
         } else {
-          app.lyrics_status = LyricsStatus::NotFound;
+          (None, false, false)
         }
       }
-      None => {
-        app.lyrics_status = LyricsStatus::NotFound;
-      }
-    }
-    app
-      .plugin_data_generations
-      .bump(crate::core::app::PluginDataKind::Lyrics);
+      None => (None, false, false),
+    };
+
+    self
+      .emit_session(SessionFact::Lyrics {
+        identity: request_identity,
+        lyrics,
+        synced,
+        found,
+      })
+      .await;
   }
 
   async fn increment_global_song_count(&mut self) {
@@ -163,17 +165,28 @@ impl UtilsNetwork for Network {
     {
       Ok(resp) => {
         if let Ok(data) = resp.json::<GlobalSongCountResponse>().await {
-          let mut app = self.app.lock().await;
-          app.global_song_count = Some(data.count);
-          app.global_song_count_failed = false;
+          self
+            .emit_session(SessionFact::GlobalSongCount {
+              count: Some(data.count),
+              failed: false,
+            })
+            .await;
         } else {
-          let mut app = self.app.lock().await;
-          app.global_song_count_failed = true;
+          self
+            .emit_session(SessionFact::GlobalSongCount {
+              count: None,
+              failed: true,
+            })
+            .await;
         }
       }
       Err(_) => {
-        let mut app = self.app.lock().await;
-        app.global_song_count_failed = true;
+        self
+          .emit_session(SessionFact::GlobalSongCount {
+            count: None,
+            failed: true,
+          })
+          .await;
       }
     }
   }
@@ -185,12 +198,17 @@ impl UtilsNetwork for Network {
       "https://raw.githubusercontent.com/LargeModGames/spotatui/main/announcements.json";
 
     let (announcements_enabled, feed_url, seen_ids) = {
-      let app = self.app.lock().await;
-      (
-        app.user_config.behavior.enable_announcements,
-        app.user_config.behavior.announcement_feed_url.clone(),
-        app.runtime_state.seen_announcement_ids.clone(),
-      )
+      match self
+        .fold_query(FoldQuery::AnnouncementSources { seen_ids: true })
+        .await
+      {
+        Some(FoldAnswer::AnnouncementSources {
+          enabled,
+          feed_url,
+          seen_ids,
+        }) => (enabled, feed_url, seen_ids),
+        _ => return,
+      }
     };
 
     if !announcements_enabled {
@@ -246,7 +264,10 @@ impl UtilsNetwork for Network {
     };
 
     let now = Utc::now();
-    let seen_ids = seen_ids.into_iter().collect::<HashSet<String>>();
+    let seen_ids = seen_ids
+      .unwrap_or_default()
+      .into_iter()
+      .collect::<HashSet<String>>();
     let mut feed_ids_seen = HashSet::new();
     let mut announcements = Vec::new();
 
@@ -308,16 +329,9 @@ impl UtilsNetwork for Network {
       return;
     }
 
-    let mut app = self.app.lock().await;
-    let had_active_announcement = app.active_announcement.is_some();
-    app.enqueue_announcements(announcements);
-
-    if !had_active_announcement && app.active_announcement.is_some() {
-      app.push_navigation_stack(
-        crate::core::app::RouteId::AnnouncementPrompt,
-        crate::core::app::ActiveBlock::AnnouncementPrompt,
-      );
-    }
+    self
+      .emit_session(SessionFact::Announcements(announcements))
+      .await;
   }
 }
 

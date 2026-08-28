@@ -109,6 +109,27 @@ pub struct PartySession {
   pub host_name: String,
 }
 
+/// Party session field updates from the relay (ticket 17): the message
+/// handlers used to mutate `App`'s `party_session` under the lock; now they
+/// emit one of these and the fold replays the exact old RMW.
+#[derive(Clone, Debug)]
+pub enum PartySessionFact {
+  /// `RoomCreated`: store the room code on the live session.
+  RoomCode(String),
+  /// `JoinedRoom`: record the host's display name.
+  HostName(String),
+  /// A guest arrived: add them (deduped) and toast.
+  GuestJoined(String),
+  /// A guest left: remove them and show the status message.
+  GuestLeft(String),
+  /// The host's control-mode change landed.
+  ControlMode(ControlMode),
+  /// The room closed: disconnect, clear the session, "Party ended".
+  Ended(String),
+  /// The relay errored: disconnect and surface the message as an error.
+  Error(String),
+}
+
 pub struct PartyConnection {
   write: SplitSink<WsStream, Message>,
 }

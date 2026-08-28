@@ -112,6 +112,56 @@ pub enum SessionFact {
   /// The DJ's per-turn progress flag (`…thinking` row).
   #[cfg(feature = "dj-core")]
   DjStep(Option<(usize, usize)>),
+  // --- Ticket 17 (network envelope): session-surface facts.
+  /// The signed-in profile response (the old `get_user`'s `app.user` write).
+  /// `Err` surfaces the rate-limit notice through the same fold sink.
+  User(Result<crate::core::app::UserInfo, String>),
+  /// A finished lyrics fetch. The fold re-gates on `desired_lyrics_identity`
+  /// (the old inline stale-check) before applying; the loading-half claim is
+  /// [`FoldQuery::ClaimLyricsFetch`].
+  Lyrics {
+    identity: (String, String),
+    lyrics: Option<Vec<(u128, String)>>,
+    synced: bool,
+    found: bool,
+  },
+  /// The global play counter (telemetry read; `None` = fetch failed).
+  GlobalSongCount { count: Option<u64>, failed: bool },
+  /// A deduplicated announcement feed: the fold enqueues and opens the
+  /// prompt route only when nothing was active (the old inline block).
+  Announcements(Vec<crate::core::app::Announcement>),
+  /// A finished listening-history stats load. The fold applies only when
+  /// the period still matches the selected one (the old inline race check).
+  StatsLoaded {
+    period: crate::infra::history::RecapPeriod,
+    stats: crate::infra::history::StatsData,
+    streaks: crate::infra::history::StreakSummary,
+  },
+  /// Party-mode state transition (status bar + optional session swap).
+  Party {
+    status: crate::infra::network::sync::PartyStatus,
+    session: Option<crate::infra::network::sync::PartySession>,
+  },
+  /// Party session field updates from the relay (room code, host name,
+  /// guest join/leave, control mode, room ended/error teardown).
+  PartySessionUpdate(crate::infra::network::sync::PartySessionFact),
+  /// A completed recently-played page (liked checks are dispatched by the
+  /// producer; the fold sorts + bumps + optionally navigates).
+  RecentlyPlayed {
+    page: crate::core::pagination::CursorPaged<crate::core::plugin_api::TrackInfo>,
+    navigate: bool,
+  },
+  /// Fire these IoEvents from the fold (`App::dispatch`, the old inline
+  /// spinner-raising semantics). For membership checks a producer cannot
+  /// send itself without locking App for the channel handle.
+  DispatchIo(Vec<crate::infra::network::IoEvent>),
+  /// The create-playlist track picker's candidate rows.
+  CreatePlaylistSearchResults(Vec<crate::core::plugin_api::TrackInfo>),
+  /// The recommendation table: the folded rows (seed prepended) replace the
+  /// visible table and open the recommendations route.
+  RecommendedTracks {
+    tracks: Vec<crate::core::plugin_api::TrackInfo>,
+  },
 }
 
 /// The data fetches `complete_spotify_login` used to dispatch under the same
@@ -170,6 +220,41 @@ impl std::fmt::Debug for SessionFact {
         .finish(),
       #[cfg(feature = "dj-core")]
       SessionFact::DjStep(step) => f.debug_tuple("DjStep").field(step).finish(),
+      SessionFact::User(result) => f.debug_tuple("User").field(&result.is_ok()).finish(),
+      SessionFact::Lyrics { identity, .. } => f.debug_tuple("Lyrics").field(identity).finish(),
+      SessionFact::GlobalSongCount { count, failed } => f
+        .debug_struct("GlobalSongCount")
+        .field("count", &count.is_some())
+        .field("failed", failed)
+        .finish(),
+      SessionFact::Announcements(announcements) => f
+        .debug_tuple("Announcements")
+        .field(&announcements.len())
+        .finish(),
+      SessionFact::StatsLoaded { period, .. } => {
+        f.debug_tuple("StatsLoaded").field(period).finish()
+      }
+      SessionFact::Party { status, session } => f
+        .debug_struct("Party")
+        .field("status", status)
+        .field("session", &session.is_some())
+        .finish(),
+      SessionFact::PartySessionUpdate(update) => {
+        f.debug_tuple("PartySessionUpdate").field(&update).finish()
+      }
+      SessionFact::RecentlyPlayed { navigate, .. } => f
+        .debug_struct("RecentlyPlayed")
+        .field("navigate", navigate)
+        .finish_non_exhaustive(),
+      SessionFact::DispatchIo(events) => f.debug_tuple("DispatchIo").field(&events.len()).finish(),
+      SessionFact::CreatePlaylistSearchResults(tracks) => f
+        .debug_tuple("CreatePlaylistSearchResults")
+        .field(&tracks.len())
+        .finish(),
+      SessionFact::RecommendedTracks { tracks } => f
+        .debug_tuple("RecommendedTracks")
+        .field(&tracks.len())
+        .finish(),
     }
   }
 }
@@ -352,6 +437,9 @@ pub enum FoldQuery {
   /// streaming is down).
   #[cfg(feature = "streaming")]
   StreamingPlayerHandle,
+  /// A clone of the App's IoEvent sender (the in-TUI login callback task
+  /// needs the channel handle without locking App).
+  IoTx,
   /// Publish a completed playlist refresh (or restore the previous list on
   /// pagination failure). The fold owns the generation check, folder
   /// structure, selection reconcile, and the community-pin prompt.
@@ -416,6 +504,29 @@ pub enum FoldQuery {
   /// The standing DJ vibe and whether auto-queue is on (vibe-effect text).
   #[cfg(feature = "dj-core")]
   DjVibe,
+  ClaimLyricsFetch {
+    /// The (track, joined-artists) identity the fetch was dispatched for.
+    identity: (String, String),
+  },
+  /// The relay server URL from the user config (the party connect paths).
+  PartyRelayUrl,
+  /// Whether a party session is live and hosting (relay commands from
+  /// guests are only accepted by the host).
+  IsPartyHost,
+  /// Whether a party session is live as a guest (incoming sync handling).
+  IsPartyGuest,
+  /// The host's playback identity to broadcast: current track URI, position,
+  /// and play state. `None` when not hosting or nothing is playing.
+  HostSyncState,
+  /// The guest's current playback identity: (uri, is_playing, progress).
+  GuestSyncCurrent,
+  /// The announcement-surface sources: whether the feature is enabled, the
+  /// loading flip in one atomic fold step) — see [`Self::ClaimLyricsFetch`].
+  AnnouncementSources {
+    /// Whether to also snapshot the seen-announcement ids (the fetch path's
+    /// dedup set; `false` for the cheap enabled/url-only probe).
+    seen_ids: bool,
+  },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -449,6 +560,16 @@ pub enum FoldAnswer {
     vibe: Option<String>,
     auto_queue: bool,
   },
+  /// The announcement-surface answer (feed config + optional dedup set).
+  AnnouncementSources {
+    enabled: bool,
+    feed_url: Option<String>,
+    seen_ids: Option<Vec<String>>,
+  },
+  /// The host's playback identity to broadcast (`None` = nothing to sync).
+  HostSync(Option<HostSyncState>),
+  /// The guest's current playback identity: (uri, is_playing, progress).
+  GuestSyncCurrent(String, bool, u64),
   /// Status text a fold query computed (the add-to-playlist ack).
   StatusText(String),
   /// The registration result for a playlist refresh (the page-1 install).
@@ -466,6 +587,8 @@ pub enum FoldAnswer {
   /// A cloned handle to the live streaming player (rootlist query).
   #[cfg(feature = "streaming")]
   StreamingPlayer(Option<std::sync::Arc<crate::infra::player::StreamingPlayer>>),
+  /// A clone of the App's IoEvent sender (`None` when the channel is gone).
+  IoTx(Option<std::sync::mpsc::Sender<crate::infra::network::IoEvent>>),
 }
 
 impl std::fmt::Debug for FoldAnswer {
@@ -490,6 +613,22 @@ impl std::fmt::Debug for FoldAnswer {
         .field("vibe", vibe)
         .field("auto_queue", auto_queue)
         .finish(),
+      FoldAnswer::AnnouncementSources {
+        enabled,
+        feed_url: _,
+        seen_ids,
+      } => f
+        .debug_struct("AnnouncementSources")
+        .field("enabled", enabled)
+        .field("seen_ids", &seen_ids.is_some())
+        .finish_non_exhaustive(),
+      FoldAnswer::HostSync(v) => f.debug_tuple("HostSync").field(&v.is_some()).finish(),
+      FoldAnswer::GuestSyncCurrent(uri, playing, progress) => f
+        .debug_tuple("GuestSyncCurrent")
+        .field(&uri.len())
+        .field(playing)
+        .field(&progress)
+        .finish(),
       FoldAnswer::StatusText(v) => f.debug_tuple("StatusText").field(v).finish(),
       FoldAnswer::PlaylistRefreshRegistered { generation, .. } => f
         .debug_struct("PlaylistRefreshRegistered")
@@ -500,6 +639,7 @@ impl std::fmt::Debug for FoldAnswer {
         .debug_tuple("StreamingPlayer")
         .field(&player.is_some())
         .finish(),
+      FoldAnswer::IoTx(io_tx) => f.debug_tuple("IoTx").field(&io_tx.is_some()).finish(),
     }
   }
 }
@@ -549,6 +689,15 @@ impl From<&rspotify::model::device::DevicePayload> for DeviceList {
         .collect(),
     }
   }
+}
+
+/// The host's playback identity to broadcast from the fold (ticket 17):
+/// the old inline read of party host + context + progress.
+#[derive(Debug, Clone)]
+pub struct HostSyncState {
+  pub track_uri: String,
+  pub position_ms: u64,
+  pub is_playing: bool,
 }
 
 /// The result of an acked emit: the fold has *applied* the event, and hands

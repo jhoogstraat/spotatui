@@ -2,6 +2,7 @@ use super::requests::is_rate_limited_error;
 use super::{ids, IoEvent, Network};
 use crate::core::app::{ActiveBlock, RouteId, UserInfo};
 use crate::core::plugin_api::TrackInfo;
+use crate::runtime::engine::SessionFact;
 use anyhow::anyhow;
 
 use crate::infra::network::mapping::map_cursor_page;
@@ -11,7 +12,6 @@ use rspotify::model::{
 #[cfg(feature = "streaming")]
 use rspotify::model::{enums::DeviceType, Device};
 use rspotify::prelude::*;
-use std::time::{Duration, Instant};
 
 #[cfg(feature = "streaming")]
 fn include_native_streaming_device(app: &crate::core::app::App, payload: &mut DevicePayload) {
@@ -66,27 +66,29 @@ impl UserNetwork for Network {
   async fn get_user(&mut self) {
     match self.spotify_get_typed::<PrivateUser>("me", &[]).await {
       Ok(user) => {
-        let mut app = self.app.lock().await;
         // `PrivateUser::country` is deprecated upstream but still the only
         // market signal available; mirror the existing read in `get_user_country`.
         #[allow(deprecated)]
         let country = user.country.map(|c| <&'static str>::from(c).to_string());
-        app.user = Some(UserInfo {
-          id: user.id.id().to_string(),
-          display_name: user.display_name.clone(),
-          // Store the ISO 3166-1 alpha-2 code as a plain string so no rspotify
-          // type leaks into App state; `App::get_user_country` re-derives it.
-          country,
-        });
+        self
+          .emit_session(SessionFact::User(Ok(UserInfo {
+            id: user.id.id().to_string(),
+            display_name: user.display_name.clone(),
+            // Store the ISO 3166-1 alpha-2 code as a plain string so no rspotify
+            // type leaks into App state; `App::get_user_country` re-derives it.
+            country,
+          })))
+          .await;
       }
       Err(e) => {
         let err = anyhow!(e);
         if is_rate_limited_error(&err) {
-          let mut app = self.app.lock().await;
-          app.status_message = Some(
-            "Spotify rate limit hit while loading profile. Retrying automatically.".to_string(),
-          );
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(6));
+          // Acked: the notice is the handler's whole outcome.
+          self
+            .emit_session_acked(SessionFact::Error(
+              "Spotify rate limit hit while loading profile. Retrying automatically.".to_string(),
+            ))
+            .await;
           return;
         }
         self.handle_error(err).await;
@@ -138,21 +140,23 @@ impl UserNetwork for Network {
     {
       Ok(recently_played) => {
         let domain_page = map_cursor_page(&recently_played, |ph| TrackInfo::from(&ph.track));
-        let mut app = self.app.lock().await;
-        // Check if these tracks are liked.
+        // Liked checks ride the fold's dispatch fact (the producer cannot
+        // reach the IoEvent channel without the App lock it no longer takes).
         let track_check =
           ids::track_check_ids(recently_played.items.iter().map(|ph| ph.track.id.as_ref()));
         if !track_check.is_empty() {
-          app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_check));
+          self
+            .emit_session(SessionFact::DispatchIo(vec![
+              IoEvent::CurrentUserSavedTracksContains(track_check),
+            ]))
+            .await;
         }
-        app.recently_played.result = Some(domain_page);
-        app.sort_recently_played_items();
-        app
-          .plugin_data_generations
-          .bump(crate::core::app::PluginDataKind::RecentlyPlayed);
-        if navigate {
-          app.push_navigation_stack(RouteId::RecentlyPlayed, ActiveBlock::RecentlyPlayed);
-        }
+        self
+          .emit_session(SessionFact::RecentlyPlayed {
+            page: domain_page,
+            navigate,
+          })
+          .await;
       }
       Err(e) => {
         self.handle_error(anyhow!(e)).await;

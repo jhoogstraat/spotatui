@@ -161,9 +161,12 @@ async fn run_radio_search(app: &Arc<Mutex<App>>, query: &str) {
         CatalogStateEvent::SearchCompleted {
           source: Source::Radio,
           query: query.to_string(),
-          tracks: Some(Paged {
-            items: results.tracks,
-            total,
+          pages: Box::new(crate::core::catalog::SearchCompletionPages {
+            tracks: Some(Paged {
+              items: results.tracks,
+              total,
+              ..Default::default()
+            }),
             ..Default::default()
           }),
         },

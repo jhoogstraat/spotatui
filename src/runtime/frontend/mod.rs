@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use log::info;
+use rspotify::model::idtypes::Id as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
@@ -122,7 +123,7 @@ use crate::infra::network::library::{
   build_flat_playlist_items, maybe_prompt_community_pin, reconcile_playlist_selection,
 };
 use crate::infra::network::IoEvent;
-use crate::runtime::engine::{DeviceList, FoldAck, PlaylistRefreshPrevious};
+use crate::runtime::engine::{DeviceList, FoldAck, HostSyncState, PlaylistRefreshPrevious};
 
 pub use super::engine::EngineCommand as FrontendEngineCommand;
 
@@ -889,12 +890,150 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     SessionFact::DjStep(step) => {
       app.dj.step = step;
     }
+    SessionFact::User(result) => match result {
+      Ok(user) => {
+        app.user = Some(user);
+      }
+      Err(message) => {
+        // The rate-limit notice: the same sink the old inline write used.
+        app.set_status_message(message, 6);
+      }
+    },
+    SessionFact::Lyrics {
+      identity,
+      lyrics,
+      synced,
+      found,
+    } => {
+      // Re-gate on the track-change detector's identity (the old inline
+      // stale-check before every write): a fetch for a song that is no
+      // longer wanted must not land.
+      if app.desired_lyrics_identity.as_ref() == Some(&identity) {
+        if found {
+          app.lyrics = lyrics;
+          app.lyrics_synced = synced;
+          app.lyrics_status = crate::core::app::LyricsStatus::Found;
+        } else {
+          app.lyrics_status = crate::core::app::LyricsStatus::NotFound;
+        }
+        app
+          .plugin_data_generations
+          .bump(crate::core::app::PluginDataKind::Lyrics);
+      }
+    }
+    SessionFact::GlobalSongCount { count, failed } => {
+      if let Some(count) = count {
+        app.global_song_count = Some(count);
+        app.global_song_count_failed = false;
+      } else if failed {
+        app.global_song_count_failed = true;
+      }
+    }
+    SessionFact::Announcements(announcements) => {
+      let had_active_announcement = app.active_announcement.is_some();
+      app.enqueue_announcements(announcements);
+      if !had_active_announcement && app.active_announcement.is_some() {
+        app.push_navigation_stack(
+          crate::core::app::RouteId::AnnouncementPrompt,
+          crate::core::app::ActiveBlock::AnnouncementPrompt,
+        );
+      }
+    }
+    SessionFact::StatsLoaded {
+      period,
+      stats,
+      streaks,
+    } => {
+      app.listening_streaks = Some(streaks);
+      // Cycling periods quickly can race two loads; only the response for
+      // the currently selected period may land.
+      if app.stats_period == period {
+        app.stats_data = Some(stats);
+        app.stats_loading = false;
+      }
+    }
+    SessionFact::Party { status, session } => {
+      app.party_status = status;
+      app.party_session = session;
+    }
+    SessionFact::PartySessionUpdate(update) => {
+      use crate::infra::network::sync::PartySessionFact;
+      match update {
+        PartySessionFact::RoomCode(code) => {
+          if let Some(session) = &mut app.party_session {
+            session.code = code;
+          }
+        }
+        PartySessionFact::HostName(name) => {
+          if let Some(session) = &mut app.party_session {
+            session.host_name = name;
+          }
+        }
+        PartySessionFact::GuestJoined(name) => {
+          if let Some(session) = &mut app.party_session {
+            if !session.guests.contains(&name) {
+              session.guests.push(name.clone());
+            }
+          }
+          app.set_status_message(format!("{name} joined the party"), 3);
+        }
+        PartySessionFact::GuestLeft(name) => {
+          if let Some(session) = &mut app.party_session {
+            if let Some(pos) = session.guests.iter().position(|g| g == &name) {
+              session.guests.remove(pos);
+            }
+          }
+          app.set_status_message(format!("{name} left the party"), 3);
+        }
+        PartySessionFact::ControlMode(mode) => {
+          if let Some(session) = &mut app.party_session {
+            session.control_mode = mode;
+          }
+        }
+        PartySessionFact::Ended(message) => {
+          app.party_status = crate::infra::network::sync::PartyStatus::Disconnected;
+          app.party_session = None;
+          app.set_status_message(message, 5);
+        }
+        PartySessionFact::Error(message) => {
+          app.party_status = crate::infra::network::sync::PartyStatus::Disconnected;
+          app.party_session = None;
+          app.handle_error(anyhow::anyhow!("Party: {message}"));
+        }
+      }
+    }
+    SessionFact::RecentlyPlayed { page, navigate } => {
+      app.recently_played.result = Some(page);
+      app.sort_recently_played_items();
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::RecentlyPlayed);
+      if navigate {
+        app.push_navigation_stack(
+          crate::core::app::RouteId::RecentlyPlayed,
+          crate::core::app::ActiveBlock::RecentlyPlayed,
+        );
+      }
+    }
+    SessionFact::DispatchIo(events) => {
+      for event in events {
+        app.dispatch(event);
+      }
+    }
+    SessionFact::CreatePlaylistSearchResults(tracks) => {
+      app.create_playlist_search_results = tracks;
+    }
+    SessionFact::RecommendedTracks { tracks } => {
+      app.track_table.tracks = tracks;
+      app.track_table.context = Some(crate::core::app::TrackTableContext::RecommendedTracks);
+      app.push_navigation_stack(
+        crate::core::app::RouteId::Recommendations,
+        crate::core::app::ActiveBlock::TrackTable,
+      );
+    }
   }
 }
 
-/// Answer one producer query against the fold's authoritative state
-/// (ticket 16). Runs under the fold's lock; pure reads plus the one
-/// claim-style RMW (`ClaimLibraryOffset`) whose atomicity is the point.
 /// Takes `&mut App` because the claim and generation queries mutate the
 /// fold-owned bookkeeping — which is exactly the single-writer contract.
 pub(crate) fn answer_query(
@@ -945,6 +1084,7 @@ pub(crate) fn answer_query(
     }
     #[cfg(feature = "streaming")]
     FoldQuery::StreamingPlayerHandle => FoldAnswer::StreamingPlayer(app.streaming_player.clone()),
+    FoldQuery::IoTx => FoldAnswer::IoTx(app.io_tx_clone()),
     FoldQuery::PublishPlaylistRefresh {
       generation,
       playlists,
@@ -1039,6 +1179,73 @@ pub(crate) fn answer_query(
     FoldQuery::QueueTracks => FoldAnswer::QueueTracks(app.native_queue.clone()),
     #[cfg(feature = "dj-core")]
     FoldQuery::DjGeneration => FoldAnswer::U64(app.dj.generation),
+    FoldQuery::AnnouncementSources { seen_ids } => FoldAnswer::AnnouncementSources {
+      enabled: app.user_config.behavior.enable_announcements,
+      feed_url: app.user_config.behavior.announcement_feed_url.clone(),
+      seen_ids: seen_ids.then(|| app.runtime_state.seen_announcement_ids.clone()),
+    },
+    FoldQuery::PartyRelayUrl => {
+      FoldAnswer::StatusText(app.user_config.behavior.relay_server_url.clone())
+    }
+    FoldQuery::IsPartyHost => FoldAnswer::Bool(
+      matches!(&app.party_session, Some(s) if s.role == crate::infra::network::sync::PartyRole::Host),
+    ),
+    FoldQuery::IsPartyGuest => FoldAnswer::Bool(matches!(
+      &app.party_session,
+      Some(s) if s.role == crate::infra::network::sync::PartyRole::Guest
+    )),
+    FoldQuery::HostSyncState => {
+      let sync = match (&app.party_session, &app.current_playback_context) {
+        (Some(s), Some(ctx)) if s.role == crate::infra::network::sync::PartyRole::Host => {
+          let uri = match &ctx.item {
+            Some(rspotify::model::PlayableItem::Track(t)) => {
+              t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
+            }
+            Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
+            Some(_) | None => return FoldAnswer::HostSync(None),
+          };
+          Some(HostSyncState {
+            track_uri: uri,
+            position_ms: app.song_progress_ms as u64,
+            is_playing: ctx.is_playing,
+          })
+        }
+        _ => None,
+      };
+      FoldAnswer::HostSync(sync)
+    }
+    FoldQuery::GuestSyncCurrent => {
+      let uri = match &app.current_playback_context {
+        Some(ctx) => match &ctx.item {
+          Some(rspotify::model::PlayableItem::Track(t)) => {
+            t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
+          }
+          Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
+          Some(_) | None => String::new(),
+        },
+        None => String::new(),
+      };
+      let playing = app
+        .current_playback_context
+        .as_ref()
+        .map(|c| c.is_playing)
+        .unwrap_or(false);
+      let progress = app.song_progress_ms as u64;
+      FoldAnswer::GuestSyncCurrent(uri, playing, progress)
+    }
+    FoldQuery::ClaimLyricsFetch { identity } => {
+      // The lyrics fetch's claim (ticket 17): atomic identity re-check plus
+      // loading flip — the old two-block inline section. A superseded
+      // request (the track already changed again) never shows a spinner.
+      if app.desired_lyrics_identity.as_ref() == Some(&identity) {
+        app.lyrics_status = crate::core::app::LyricsStatus::Loading;
+        app.lyrics = None;
+        app.lyrics_synced = false;
+        FoldAnswer::Bool(true)
+      } else {
+        FoldAnswer::Bool(false)
+      }
+    }
     #[cfg(feature = "dj-core")]
     FoldQuery::DjVibe => FoldAnswer::DjVibe {
       vibe: app.dj.vibe.clone(),

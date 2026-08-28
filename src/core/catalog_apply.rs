@@ -10,6 +10,21 @@ use crate::core::app::{App, SearchResultBlock, TrackTableContext};
 use crate::core::catalog::{CatalogOutcome, CatalogStateEvent, SavedSetKind};
 use crate::infra::network::IoEvent;
 
+/// The visible length of an optional search page (fold-local copy of the
+/// handler's helper: the clamp needs it, and the helper should not be
+/// reachable from a producer's import graph).
+fn page_len_of<T>(page: &Option<crate::core::pagination::Paged<T>>) -> usize {
+  page.as_ref().map(|p| p.items.len()).unwrap_or(0)
+}
+
+fn clamp_selected_index(index: &mut Option<usize>, len: usize) {
+  *index = match (*index, len) {
+    (_, 0) => None,
+    (Some(i), len) => Some(i.min(len - 1)),
+    (None, _) => None,
+  };
+}
+
 /// The fold's single write path for catalog facts.
 pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogOutcome {
   match event {
@@ -32,7 +47,7 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
     CatalogStateEvent::SearchCompleted {
       source,
       query,
-      tracks,
+      pages,
     } => {
       let outcome = app.catalog_state.absorb(event);
       if outcome.stale_event_dropped {
@@ -41,7 +56,10 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         );
         return outcome;
       }
-      if let Some(page) = tracks {
+      // Ticket 17: the completion carries every page, so the fold is the
+      // single writer of the visible search surface (the old handler wrote
+      // the non-track pages directly under the lock).
+      if let Some(page) = &pages.tracks {
         let total = page.total;
         let items = page.items.clone();
         app.search_results.tracks = Some(crate::core::pagination::Paged {
@@ -49,16 +67,33 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
           total,
           ..Default::default()
         });
-        app.search_results.albums = None;
-        app.search_results.artists = None;
-        app.search_results.playlists = None;
-        app.search_results.shows = None;
         // Focus the songs block so the first hit is selectable immediately
         // (parity with the per-source dispatchers' inline writes).
         app.search_results.selected_tracks_index = Some(0);
         app.search_results.hovered_block = SearchResultBlock::SongSearch;
         app.search_results.selected_block = SearchResultBlock::Empty;
       }
+      app.search_results.artists = pages.artists.clone();
+      app.search_results.albums = pages.albums.clone();
+      app.search_results.playlists = pages.playlists.clone();
+      app.search_results.shows = pages.shows.clone();
+      // A replaced page can be shorter than the previous one (or empty),
+      // which would otherwise leave a stale selected-index pointing past the
+      // end of the new results (panic-1: unchecked `.items[selected_index]`
+      // indexing downstream).
+      let tracks_len = page_len_of(&app.search_results.tracks);
+      let artists_len = page_len_of(&app.search_results.artists);
+      let albums_len = page_len_of(&app.search_results.albums);
+      let playlists_len = page_len_of(&app.search_results.playlists);
+      let shows_len = page_len_of(&app.search_results.shows);
+      clamp_selected_index(&mut app.search_results.selected_tracks_index, tracks_len);
+      clamp_selected_index(&mut app.search_results.selected_artists_index, artists_len);
+      clamp_selected_index(&mut app.search_results.selected_album_index, albums_len);
+      clamp_selected_index(
+        &mut app.search_results.selected_playlists_index,
+        playlists_len,
+      );
+      clamp_selected_index(&mut app.search_results.selected_shows_index, shows_len);
       outcome
     }
     CatalogStateEvent::TrackTableReplaced {
@@ -319,7 +354,10 @@ mod tests {
       &CatalogStateEvent::SearchCompleted {
         source: Source::YouTube,
         query: "lofi".to_string(),
-        tracks: Some(paged),
+        pages: Box::new(crate::core::catalog::SearchCompletionPages {
+          tracks: Some(paged),
+          ..Default::default()
+        }),
       },
     );
     assert!(outcome.search_rows_replaced);
@@ -359,7 +397,10 @@ mod tests {
       &CatalogStateEvent::SearchCompleted {
         source: Source::YouTube,
         query: "a".to_string(),
-        tracks: Some(paged),
+        pages: Box::new(crate::core::catalog::SearchCompletionPages {
+          tracks: Some(paged),
+          ..Default::default()
+        }),
       },
     );
     assert!(outcome.stale_event_dropped);

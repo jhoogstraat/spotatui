@@ -27,13 +27,12 @@ use rspotify::model::{
   enums::{Country, RepeatState},
   idtypes::{EpisodeId, PlayableId, TrackId},
 };
-use rspotify::prelude::Id;
 // `parse_response_code` / `request_token` for the in-TUI login live on this trait.
 use rspotify::clients::OAuthClient;
 use rspotify::AuthCodePkceSpotify;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 // Re-export traits
@@ -48,8 +47,10 @@ use self::utils::UtilsNetwork;
 // Most variants were constructed by TUI handlers (deleted, ticket 01); ticket
 // 02's event-spine work replaces this enum. Never `cfg` a variant out for
 // feature-gating - a build leg missing a feature would then compile clean
-// while the feature is silently absent.
+// while the feature is silently absent. `Clone` so it can ride spine facts
+// (ticket 17: fold-dispatched membership checks); every payload is Clone.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub enum IoEvent {
   GetCurrentPlayback,
   /// After a track transition (e.g., EndOfTrack), ensure we don't end up paused on the next item.
@@ -625,11 +626,14 @@ impl Network {
         if let Some(id) = ids::playlist_id(&playlist_id) {
           self.get_playlist_tracks(id, playlist_offset).await;
         } else {
-          let mut app = self.app.lock().await;
-          if app.pending_playlist_open.as_deref() == Some(playlist_id.as_str()) {
-            app.pending_playlist_open = None;
-          }
-          app.set_status_message("Invalid playlist identifier.", 5);
+          self
+            .emit_session(SessionFact::ClearPendingPlaylistOpen(Some(
+              playlist_id.to_string(),
+            )))
+            .await;
+          self
+            .emit_status("Invalid playlist identifier.".to_string(), 5)
+            .await;
         }
       }
       IoEvent::SearchPlaylistTracks(playlist_id, query) => {
@@ -1059,20 +1063,22 @@ impl Network {
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
 
-    let mut app = self.app.lock().await;
     match result {
       Ok((stats, streaks)) => {
-        app.listening_streaks = Some(streaks);
-        // Cycling periods quickly can race two loads; only the response for
-        // the currently selected period may land.
-        if app.stats_period == period {
-          app.stats_data = Some(stats);
-          app.stats_loading = false;
-        }
+        self
+          .emit_session(SessionFact::StatsLoaded {
+            period,
+            stats,
+            streaks,
+          })
+          .await;
       }
       Err(error) => {
-        app.stats_loading = false;
-        app.handle_error(anyhow!("failed to load listening history: {}", error));
+        // Acked: the loading flag must be down before the caller decides.
+        self.emit_session_acked(SessionFact::LoadingCleared).await;
+        self
+          .handle_error(anyhow!("failed to load listening history: {}", error))
+          .await;
       }
     }
   }
@@ -1096,19 +1102,21 @@ impl Network {
         if let Err(e) = open::that(&output_path) {
           log::warn!("failed to open recap in browser: {}", e);
         }
-        let mut app = self.app.lock().await;
-        app.set_status_message(
-          format!(
-            "Listening recap generated at {} ({} listens)",
-            output_path.display(),
-            count
-          ),
-          5,
-        );
+        self
+          .emit_status(
+            format!(
+              "Listening recap generated at {} ({} listens)",
+              output_path.display(),
+              count
+            ),
+            5,
+          )
+          .await;
       }
       Err(error) => {
-        let mut app = self.app.lock().await;
-        app.set_status_message(format!("Failed to generate recap: {}", error), 5);
+        self
+          .emit_status(format!("Failed to generate recap: {}", error), 5)
+          .await;
       }
     }
   }
@@ -1225,10 +1233,15 @@ impl Network {
     });
 
     // Drive the callback server off a spawned task so the pump/UI stay responsive.
-    // The task carries only the sender + port, never the client.
-    let io_tx = self.app.lock().await.io_tx_clone();
-    let Some(io_tx) = io_tx else {
-      return;
+    // The task carries only the sender + port, never the client. The channel
+    // handle comes from the fold (ticket 17) — same contract as
+    // `FoldAnswer::StreamingPlayer`: a cloned handle, not shared state.
+    let io_tx = match self
+      .fold_query(crate::runtime::engine::FoldQuery::IoTx)
+      .await
+    {
+      Some(FoldAnswer::IoTx(Some(io_tx))) => io_tx,
+      _ => return,
     };
     tokio::spawn(async move {
       let overall_timeout = Duration::from_secs(180);
@@ -1324,14 +1337,19 @@ impl Network {
   }
 
   async fn start_party(&mut self, control_mode: sync::ControlMode) {
-    {
-      let mut app = self.app.lock().await;
-      app.party_status = sync::PartyStatus::Connecting;
-    }
+    self
+      .emit_session(SessionFact::Party {
+        status: sync::PartyStatus::Connecting,
+        session: None,
+      })
+      .await;
 
-    let relay_url = {
-      let app = self.app.lock().await;
-      app.user_config.behavior.relay_server_url.clone()
+    let relay_url = match self
+      .fold_query(crate::runtime::engine::FoldQuery::PartyRelayUrl)
+      .await
+    {
+      Some(FoldAnswer::StatusText(url)) => url,
+      _ => return,
     };
 
     let mode_str = match &control_mode {
@@ -1346,33 +1364,47 @@ impl Network {
         self.party_connection = Some(conn);
         self.party_incoming_rx = Some(incoming_rx);
 
-        let mut app = self.app.lock().await;
-        app.party_status = sync::PartyStatus::Hosting;
-        app.party_session = Some(sync::PartySession {
-          role: sync::PartyRole::Host,
-          code: String::new(),
-          guests: Vec::new(),
-          control_mode,
-          host_name: "Host".to_string(),
-        });
+        self
+          .emit_session(SessionFact::Party {
+            status: sync::PartyStatus::Hosting,
+            session: Some(sync::PartySession {
+              role: sync::PartyRole::Host,
+              code: String::new(),
+              guests: Vec::new(),
+              control_mode,
+              host_name: "Host".to_string(),
+            }),
+          })
+          .await;
       }
       Err(e) => {
-        let mut app = self.app.lock().await;
-        app.party_status = sync::PartyStatus::Disconnected;
-        app.handle_error(anyhow!("Failed to start party: {}", e));
+        self
+          .emit_session(SessionFact::Party {
+            status: sync::PartyStatus::Disconnected,
+            session: None,
+          })
+          .await;
+        self
+          .handle_error(anyhow!("Failed to start party: {}", e))
+          .await;
       }
     }
   }
 
   async fn join_party(&mut self, code: String, name: String) {
-    {
-      let mut app = self.app.lock().await;
-      app.party_status = sync::PartyStatus::Connecting;
-    }
+    self
+      .emit_session(SessionFact::Party {
+        status: sync::PartyStatus::Connecting,
+        session: None,
+      })
+      .await;
 
-    let relay_url = {
-      let app = self.app.lock().await;
-      app.user_config.behavior.relay_server_url.clone()
+    let relay_url = match self
+      .fold_query(crate::runtime::engine::FoldQuery::PartyRelayUrl)
+      .await
+    {
+      Some(FoldAnswer::StatusText(url)) => url,
+      _ => return,
     };
 
     match sync::connect_to_relay(&relay_url, "join", &[("code", &code), ("name", &name)]).await {
@@ -1382,20 +1414,29 @@ impl Network {
         self.party_connection = Some(conn);
         self.party_incoming_rx = Some(incoming_rx);
 
-        let mut app = self.app.lock().await;
-        app.party_status = sync::PartyStatus::Joined;
-        app.party_session = Some(sync::PartySession {
-          role: sync::PartyRole::Guest,
-          code: code.to_uppercase(),
-          guests: Vec::new(),
-          control_mode: sync::ControlMode::default(),
-          host_name: String::new(),
-        });
+        self
+          .emit_session(SessionFact::Party {
+            status: sync::PartyStatus::Joined,
+            session: Some(sync::PartySession {
+              role: sync::PartyRole::Guest,
+              code: code.to_uppercase(),
+              guests: Vec::new(),
+              control_mode: sync::ControlMode::default(),
+              host_name: String::new(),
+            }),
+          })
+          .await;
       }
       Err(e) => {
-        let mut app = self.app.lock().await;
-        app.party_status = sync::PartyStatus::Disconnected;
-        app.handle_error(anyhow!("Failed to join party: {}", e));
+        self
+          .emit_session(SessionFact::Party {
+            status: sync::PartyStatus::Disconnected,
+            session: None,
+          })
+          .await;
+        self
+          .handle_error(anyhow!("Failed to join party: {}", e))
+          .await;
       }
     }
   }
@@ -1407,40 +1448,28 @@ impl Network {
     self.party_connection = None;
     self.party_incoming_rx = None;
 
-    let mut app = self.app.lock().await;
-    app.party_status = sync::PartyStatus::Disconnected;
-    app.party_session = None;
+    self
+      .emit_session(SessionFact::Party {
+        status: sync::PartyStatus::Disconnected,
+        session: None,
+      })
+      .await;
   }
 
   async fn sync_playback(&mut self) {
-    let sync_state = {
-      let app = self.app.lock().await;
-      let session = match &app.party_session {
-        Some(s) if s.role == sync::PartyRole::Host => s,
-        _ => return,
-      };
-      let _ = session;
-
-      let (track_uri, is_playing) = match &app.current_playback_context {
-        Some(ctx) => {
-          let uri = match &ctx.item {
-            Some(rspotify::model::PlayableItem::Track(t)) => {
-              t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
-            }
-            Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
-            Some(_) | None => return,
-          };
-          (uri, ctx.is_playing)
-        }
-        None => return,
-      };
-
-      sync::SyncMessage::SyncState {
-        track_uri,
-        position_ms: app.song_progress_ms as u64,
-        is_playing,
+    // Ticket 17: the host gate + playback identity read is one fold query
+    // (the old single lock section); `None` means nothing to sync.
+    let sync_state = match self
+      .fold_query(crate::runtime::engine::FoldQuery::HostSyncState)
+      .await
+    {
+      Some(FoldAnswer::HostSync(Some(state))) => sync::SyncMessage::SyncState {
+        track_uri: state.track_uri,
+        position_ms: state.position_ms,
+        is_playing: state.is_playing,
         timestamp: sync::now_ms(),
-      }
+      },
+      _ => return,
     };
 
     if let Some(conn) = &mut self.party_connection {
@@ -1493,45 +1522,43 @@ impl Network {
     for msg in messages {
       match msg {
         sync::SyncMessage::RoomCreated { code, .. } => {
-          let mut app = self.app.lock().await;
-          if let Some(session) = &mut app.party_session {
-            session.code = code;
-          }
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::RoomCode(code),
+            ))
+            .await;
         }
         sync::SyncMessage::JoinedRoom { host_name } => {
-          let mut app = self.app.lock().await;
-          if let Some(session) = &mut app.party_session {
-            session.host_name = host_name;
-          }
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::HostName(host_name),
+            ))
+            .await;
         }
         sync::SyncMessage::GuestJoined { name } => {
-          let mut app = self.app.lock().await;
-          if let Some(session) = &mut app.party_session {
-            if !session.guests.contains(&name) {
-              session.guests.push(name.clone());
-            }
-          }
-          app.status_message = Some(format!("{} joined the party", name));
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::GuestJoined(name),
+            ))
+            .await;
         }
         sync::SyncMessage::GuestLeft { name } => {
-          let mut app = self.app.lock().await;
-          if let Some(session) = &mut app.party_session {
-            if let Some(pos) = session.guests.iter().position(|g| g == &name) {
-              session.guests.remove(pos);
-            }
-          }
-          app.status_message = Some(format!("{} left the party", name));
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::GuestLeft(name),
+            ))
+            .await;
         }
         sync::SyncMessage::SetControlMode { control_mode } => {
-          let mut app = self.app.lock().await;
-          if let Some(session) = &mut app.party_session {
-            session.control_mode = match control_mode.as_str() {
-              "shared_control" => sync::ControlMode::SharedControl,
-              _ => sync::ControlMode::HostOnly,
-            };
-          }
+          let mode = match control_mode.as_str() {
+            "shared_control" => sync::ControlMode::SharedControl,
+            _ => sync::ControlMode::HostOnly,
+          };
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::ControlMode(mode),
+            ))
+            .await;
         }
         sync::SyncMessage::SyncState {
           track_uri,
@@ -1548,19 +1575,20 @@ impl Network {
         }
         sync::SyncMessage::RoomClosed => {
           self.party_connection = None;
-          let mut app = self.app.lock().await;
-          app.party_status = sync::PartyStatus::Disconnected;
-          app.party_session = None;
-          app.status_message = Some("Party ended".to_string());
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(5));
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::Ended("Party ended".to_string()),
+            ))
+            .await;
         }
         sync::SyncMessage::Error { message } => {
           self.party_connection = None;
           self.party_incoming_rx = None;
-          let mut app = self.app.lock().await;
-          app.party_status = sync::PartyStatus::Disconnected;
-          app.party_session = None;
-          app.handle_error(anyhow!("Party: {}", message));
+          self
+            .emit_session(SessionFact::PartySessionUpdate(
+              sync::PartySessionFact::Error(message),
+            ))
+            .await;
         }
         _ => {}
       }
@@ -1574,12 +1602,12 @@ impl Network {
     is_playing: bool,
     timestamp: u64,
   ) {
-    let is_guest = {
-      let app = self.app.lock().await;
-      matches!(
-        &app.party_session,
-        Some(s) if s.role == sync::PartyRole::Guest
-      )
+    let is_guest = match self
+      .fold_query(crate::runtime::engine::FoldQuery::IsPartyGuest)
+      .await
+    {
+      Some(FoldAnswer::Bool(is_guest)) => is_guest,
+      _ => false,
     };
     if !is_guest {
       return;
@@ -1598,25 +1626,12 @@ impl Network {
       position_ms
     };
 
-    let (current_uri, current_is_playing, current_progress) = {
-      let app = self.app.lock().await;
-      let uri = match &app.current_playback_context {
-        Some(ctx) => match &ctx.item {
-          Some(rspotify::model::PlayableItem::Track(t)) => {
-            t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
-          }
-          Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
-          Some(_) | None => String::new(),
-        },
-        None => String::new(),
-      };
-      let playing = app
-        .current_playback_context
-        .as_ref()
-        .map(|c| c.is_playing)
-        .unwrap_or(false);
-      let progress = app.song_progress_ms as u64;
-      (uri, playing, progress)
+    let (current_uri, current_is_playing, current_progress) = match self
+      .fold_query(crate::runtime::engine::FoldQuery::GuestSyncCurrent)
+      .await
+    {
+      Some(FoldAnswer::GuestSyncCurrent(uri, playing, progress)) => (uri, playing, progress),
+      _ => (String::new(), false, 0),
     };
 
     let mut switched_track = false;
@@ -1660,12 +1675,12 @@ impl Network {
   }
 
   async fn handle_incoming_playback_command(&mut self, action: sync::PlaybackAction) {
-    let is_host = {
-      let app = self.app.lock().await;
-      matches!(
-        &app.party_session,
-        Some(s) if s.role == sync::PartyRole::Host
-      )
+    let is_host = match self
+      .fold_query(crate::runtime::engine::FoldQuery::IsPartyHost)
+      .await
+    {
+      Some(FoldAnswer::Bool(is_host)) => is_host,
+      _ => false,
     };
     if !is_host {
       return;
