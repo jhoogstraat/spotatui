@@ -1085,7 +1085,76 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         crate::core::app::ActiveBlock::TrackTable,
       );
     }
+    SessionFact::DevicesLanded { devices, navigate } => {
+      if navigate {
+        app.push_navigation_stack(RouteId::SelectedDevice, ActiveBlock::SelectDevice);
+      }
+      #[cfg(feature = "streaming")]
+      let mut payload = rspotify::model::device::DevicePayload { devices };
+      #[cfg(not(feature = "streaming"))]
+      let payload = rspotify::model::device::DevicePayload { devices };
+      #[cfg(feature = "streaming")]
+      {
+        // The recovery interlock is a check-and-set and gates the merge
+        // below, so both stay in this one reducer step.
+        let recovering = app.request_native_streaming_recovery_if_disconnected(true);
+        if !recovering {
+          include_native_streaming_device(app, &mut payload);
+        }
+      }
+      app.devices = Some(payload);
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::Devices);
+    }
   }
+}
+
+/// Merge the native streaming player into a freshly fetched device list
+/// (streaming builds): when the player is up, its device joins the payload —
+/// or fills in the missing id on the matching Web API row — so the device
+/// picker shows the local device even before Spotify lists it.
+#[cfg(feature = "streaming")]
+fn include_native_streaming_device(
+  app: &crate::core::app::App,
+  payload: &mut rspotify::model::device::DevicePayload,
+) {
+  use rspotify::model::{enums::DeviceType, Device};
+
+  let Some(player) = app.streaming_player.as_ref() else {
+    return;
+  };
+
+  if !player.is_available() {
+    return;
+  }
+
+  let device_name = player.device_name();
+  let device_id = app
+    .native_device_id
+    .clone()
+    .unwrap_or_else(|| player.device_id());
+
+  if let Some(device) = payload
+    .devices
+    .iter_mut()
+    .find(|device| device.name.eq_ignore_ascii_case(device_name))
+  {
+    if device.id.is_none() {
+      device.id = Some(device_id);
+    }
+    return;
+  }
+
+  payload.devices.push(Device {
+    id: Some(device_id),
+    is_active: app.is_streaming_active,
+    is_private_session: false,
+    is_restricted: false,
+    name: device_name.to_string(),
+    _type: DeviceType::Computer,
+    volume_percent: Some(player.get_volume().into()),
+  });
 }
 
 /// Takes `&mut App` because the claim and generation queries mutate the

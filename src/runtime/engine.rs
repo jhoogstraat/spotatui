@@ -194,6 +194,15 @@ pub enum SessionFact {
   /// The follow-check round-trip for ids already known to be followed
   /// (metadata.rs seeds the set directly; the IoEvent lane covers the rest).
   FollowedArtistsConfirmed(Vec<String>),
+  /// The device list landed (user.rs `get_devices`). The fold runs the whole
+  /// old lock section: navigation, the native recovery interlock (a
+  /// check-and-set must not be split from the write it gates), the
+  /// native-device merge, the cache write, and the plugin generation bump.
+  /// `Device` clones; the payload wrapper does not.
+  DevicesLanded {
+    devices: Vec<rspotify::model::device::Device>,
+    navigate: bool,
+  },
 }
 
 /// The data fetches `complete_spotify_login` used to dispatch under the same
@@ -254,6 +263,10 @@ impl std::fmt::Debug for SessionFact {
         .debug_tuple("FollowedArtistsConfirmed")
         .field(&ids.len())
         .finish(),
+      SessionFact::DevicesLanded { navigate, .. } => f
+        .debug_struct("DevicesLanded")
+        .field("navigate", navigate)
+        .finish_non_exhaustive(),
       SessionFact::ApplyAction(action) => f.debug_tuple("ApplyAction").field(action).finish(),
       #[cfg(feature = "dj-core")]
       SessionFact::DjPushLine { speaker, text } => f

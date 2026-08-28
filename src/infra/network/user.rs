@@ -1,6 +1,6 @@
 use super::requests::is_rate_limited_error;
 use super::{ids, IoEvent, Network};
-use crate::core::app::{ActiveBlock, RouteId, UserInfo};
+use crate::core::app::UserInfo;
 use crate::core::plugin_api::TrackInfo;
 use crate::runtime::engine::SessionFact;
 use anyhow::anyhow;
@@ -9,47 +9,7 @@ use crate::infra::network::mapping::map_cursor_page;
 use rspotify::model::{
   device::DevicePayload, page::CursorBasedPage, playing::PlayHistory, user::PrivateUser,
 };
-#[cfg(feature = "streaming")]
-use rspotify::model::{enums::DeviceType, Device};
 use rspotify::prelude::*;
-
-#[cfg(feature = "streaming")]
-fn include_native_streaming_device(app: &crate::core::app::App, payload: &mut DevicePayload) {
-  let Some(player) = app.streaming_player.as_ref() else {
-    return;
-  };
-
-  if !player.is_available() {
-    return;
-  }
-
-  let device_name = player.device_name();
-  let device_id = app
-    .native_device_id
-    .clone()
-    .unwrap_or_else(|| player.device_id());
-
-  if let Some(device) = payload
-    .devices
-    .iter_mut()
-    .find(|device| device.name.eq_ignore_ascii_case(device_name))
-  {
-    if device.id.is_none() {
-      device.id = Some(device_id);
-    }
-    return;
-  }
-
-  payload.devices.push(Device {
-    id: Some(device_id),
-    is_active: app.is_streaming_active,
-    is_private_session: false,
-    is_restricted: false,
-    name: device_name.to_string(),
-    _type: DeviceType::Computer,
-    volume_percent: Some(player.get_volume().into()),
-  });
-}
 
 pub trait UserNetwork {
   async fn get_user(&mut self);
@@ -103,26 +63,15 @@ impl UserNetwork for Network {
       .await
     {
       Ok(result) => {
-        let mut app = self.app.lock().await;
-        if navigate {
-          app.push_navigation_stack(RouteId::SelectedDevice, ActiveBlock::SelectDevice);
-        }
-
-        #[cfg(feature = "streaming")]
-        let mut result = result;
-        #[cfg(feature = "streaming")]
-        {
-          let recovering = app.request_native_streaming_recovery_if_disconnected(true);
-          if !recovering {
-            include_native_streaming_device(&app, &mut result);
-          }
-        }
-
-        let _ = &result;
-        app.devices = Some(result);
-        app
-          .plugin_data_generations
-          .bump(crate::core::app::PluginDataKind::Devices);
+        // One fact, one fold step: the navigation, the native recovery
+        // interlock (a check-and-set that gates the device merge), the cache
+        // write, and the plugin generation bump all reduce together.
+        self
+          .emit_session(SessionFact::DevicesLanded {
+            devices: result.devices,
+            navigate,
+          })
+          .await;
       }
       Err(e) => {
         self.handle_error(anyhow!(e)).await;
