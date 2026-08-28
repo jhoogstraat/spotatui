@@ -1020,13 +1020,17 @@ mod in_tui {
       let Some(io_tx) = io_tx else {
         anyhow::bail!("no event channel available");
       };
+      let spine = self
+        .spine
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no engine spine"))?;
       let context = session::turn_context(&self.app, request.extra_instruction.as_deref()).await?;
       // Silent: the DJ transcript already shows every call, so the MCP front
       // door's status-bar announcements would be duplicated and misattributed.
-      let executor = AppExecutor::silent(Arc::clone(&self.app), io_tx);
+      let executor = AppExecutor::silent(io_tx, spine.clone());
 
       Turn {
-        app: &self.app,
+        spine: &spine,
         brain: &brain,
         context: &context,
         executor: &executor,

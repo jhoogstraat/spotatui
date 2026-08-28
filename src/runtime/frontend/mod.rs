@@ -114,15 +114,15 @@ impl Options {
 use super::engine::{Changed, EngineCommand, EngineEvent, Spine};
 
 use crate::core::app::App;
+use crate::core::catalog::CatalogStateEvent;
 use crate::core::catalog::PlaylistSelection;
 #[cfg(feature = "streaming")]
 use crate::infra::network::library::structurize_playlist_folders;
 use crate::infra::network::library::{
   build_flat_playlist_items, maybe_prompt_community_pin, reconcile_playlist_selection,
 };
-use crate::core::catalog::CatalogStateEvent;
 use crate::infra::network::IoEvent;
-use crate::runtime::engine::{FoldAck, PlaylistRefreshPrevious};
+use crate::runtime::engine::{DeviceList, FoldAck, PlaylistRefreshPrevious};
 
 pub use super::engine::EngineCommand as FrontendEngineCommand;
 
@@ -146,7 +146,6 @@ pub struct Runtime {
   tick_wake: Arc<tokio::sync::Notify>,
   tick_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
-
 
 impl Runtime {
   /// Boot the runtime synchronously. Runs the full shared bootstrap
@@ -189,7 +188,7 @@ impl Runtime {
     let events_rx = services.spine_rx;
     // The fold also answers producer queries (ticket 16): claim/release,
     // staleness checks, and the small read set detached workers need.
-    let folds = services.spine_queries.take();
+    let folds = rt.block_on(services.spine_queries.take());
     // The frontend's own spine handle for command-side pokes: on streaming
     // legs the command path reuses the shared producer spine so ordering with
     // player events is preserved.
@@ -502,7 +501,47 @@ impl Default for Snapshot {
 /// trigger a rebuild. Session facts (ticket 16) replay the exact old handler
 /// code under the fold's lock; producer queries are answered here too, so no
 /// producer outside this task ever locks `App`.
-async fn fold_loop(
+/// Open a spine, install it on `App`, and spawn the fold task (ticket 17).
+/// Command surfaces that live outside the full runtime boot (CLI mode, and
+/// spine-driven tests) need a live fold for their queries and events to be
+/// answered. Returns the spine handle and the snapshot watch receiver.
+pub(crate) async fn spawn_fold(
+  app: &Arc<tokio::sync::Mutex<App>>,
+) -> (
+  crate::runtime::engine::Spine,
+  tokio::sync::watch::Receiver<Snapshot>,
+) {
+  let (spine, events_rx, spine_queries) = crate::runtime::engine::Spine::open(Default::default());
+  app.lock().await.spine = Some(spine.clone());
+  let spine_queries = spine_queries.take().await;
+  let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Snapshot {
+    playback: None,
+    library: Default::default(),
+    position_ms: None,
+    as_of: std::time::Instant::now(),
+    queue_upcoming: Vec::new(),
+    search_tracks: Vec::new(),
+    search_loading: false,
+    spotify_connected: false,
+    notice: None,
+    notice_is_error: false,
+    audio_ready: false,
+    audio_pending: false,
+  });
+  tokio::spawn(fold_loop(
+    app.clone(),
+    snapshot_tx,
+    events_rx,
+    spine_queries,
+  ));
+  (spine, snapshot_rx)
+}
+
+/// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
+/// writer of App state outside producers. `pub(super)` so the CLI mode can
+/// run one for its subcommand lifetime (ticket 17: the CLI reads published
+/// state instead of locking App).
+pub(super) async fn fold_loop(
   app: Arc<Mutex<App>>,
   tx: watch::Sender<Snapshot>,
   mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
@@ -514,8 +553,9 @@ async fn fold_loop(
   };
   loop {
     // Answer any producer query that arrived since the last event before
-    // (possibly) blocking on the next one: the query loop is driven by
-    // event arrivals, so a quiet spine with a pending query still answers.
+    // (possibly) blocking on the next one: the try_recv drain below clears a
+    // backlog, and the select watches the same channels so a quiet spine
+    // with a pending query still answers.
     if let Some(queries) = queries.as_mut() {
       while let Ok((query, responder)) = queries.rx.try_recv() {
         let answer = {
@@ -538,11 +578,53 @@ async fn fold_loop(
         publish(&app, &tx).await;
       }
     }
+    // The select keeps queries and acks responsive while parked on events:
+    // producers on quiet surfaces (CLI mode, DJ turn loop, MCP tools) block
+    // on answers, so the fold must not wait for an unrelated event first.
     let event = tokio::select! {
       event = events_rx.recv() => match event {
         Some(event) => event,
         None => break, // spine closed
       },
+      answer = async {
+        match queries.as_mut() {
+          Some(queries) => queries.rx.recv().await,
+          None => std::future::pending().await,
+        }
+      } => {
+        match answer {
+          Some((query, responder)) => {
+            let answer = {
+              let mut guard = app.lock().await;
+              answer_query(&mut guard, query)
+            };
+            let _ = responder.send(Ok(answer));
+          }
+          // Query channel closed (spine dropped): stop watching it.
+          None => queries = None,
+        }
+        continue;
+      }
+      acked = async {
+        match acks.as_mut() {
+          Some(acks) => acks.rx.recv().await,
+          None => std::future::pending().await,
+        }
+      } => {
+        match acked {
+          Some((event, responder)) => {
+            let ack = {
+              let mut guard = app.lock().await;
+              apply_acked(&mut guard, &event)
+            };
+            let _ = responder.send(ack);
+            publish(&app, &tx).await;
+          }
+          // Ack channel closed: stop watching it.
+          None => acks = None,
+        }
+        continue;
+      }
       _ = tx.closed() => break,
     };
     match &event {
@@ -728,10 +810,7 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
 
 /// The fold's reducer for session facts (ticket 16). Byte-for-byte parity
 /// with the inline writes each producer used to make under the App lock.
-pub(crate) fn apply_session_fact(
-  app: &mut App,
-  fact: crate::runtime::engine::SessionFact,
-) {
+pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::SessionFact) {
   use crate::runtime::engine::{PostConnectFetch, SessionFact};
   match fact {
     SessionFact::Auth {
@@ -795,6 +874,21 @@ pub(crate) fn apply_session_fact(
     SessionFact::DispatchPlaylistRefresh => {
       app.dispatch(IoEvent::GetPlaylists);
     }
+    SessionFact::ApplyAction(action) => {
+      // Ticket 17: the DJ tools / MCP executor mutations. The fold is the
+      // single writer, so their old inline `app.apply(...)` under the lock
+      // becomes a fact reduced here; publishing happens on the normal
+      // event path.
+      app.apply(action);
+    }
+    #[cfg(feature = "dj-core")]
+    SessionFact::DjPushLine { speaker, text } => {
+      app.dj.push_line(crate::infra::dj::DjLine { speaker, text });
+    }
+    #[cfg(feature = "dj-core")]
+    SessionFact::DjStep(step) => {
+      app.dj.step = step;
+    }
   }
 }
 
@@ -838,9 +932,7 @@ pub(crate) fn answer_query(
         .map(|id| app.liked_song_ids_set.contains(id))
         .collect(),
     ),
-    FoldQuery::UserId => {
-      FoldAnswer::User(app.user.as_ref().map(|user| user.id.clone()))
-    }
+    FoldQuery::UserId => FoldAnswer::User(app.user.as_ref().map(|user| user.id.clone())),
     FoldQuery::PlaylistTrackTableActive { playlist_id } => {
       let active = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
         .ok()
@@ -852,9 +944,7 @@ pub(crate) fn answer_query(
       FoldAnswer::Bool(app.playlist_refresh_generation == generation)
     }
     #[cfg(feature = "streaming")]
-    FoldQuery::StreamingPlayerHandle => {
-      FoldAnswer::StreamingPlayer(app.streaming_player.clone())
-    }
+    FoldQuery::StreamingPlayerHandle => FoldAnswer::StreamingPlayer(app.streaming_player.clone()),
     FoldQuery::PublishPlaylistRefresh {
       generation,
       playlists,
@@ -895,10 +985,18 @@ pub(crate) fn answer_query(
       };
       app.playlist_refresh_generation = app.playlist_refresh_generation.wrapping_add(1);
       app.playlists = Some(first_page);
-      let selected_is_in_first_page = original_selection.playlist_id.as_ref().is_some_and(
-        |selected| first_items.iter().any(|p| p.id.as_deref() == Some(selected.as_str())),
-      );
-      if !had_previous_complete || original_selection.playlist_id.is_none() || selected_is_in_first_page
+      let selected_is_in_first_page =
+        original_selection
+          .playlist_id
+          .as_ref()
+          .is_some_and(|selected| {
+            first_items
+              .iter()
+              .any(|p| p.id.as_deref() == Some(selected.as_str()))
+          });
+      if !had_previous_complete
+        || original_selection.playlist_id.is_none()
+        || selected_is_in_first_page
       {
         app.all_playlists = first_items.clone();
         app
@@ -924,12 +1022,36 @@ pub(crate) fn answer_query(
         previous_complete,
       }
     }
+    // Ticket 17: command-surface reads of published state (CLI, DJ tools).
+    // The fold answers under its own lock; the caller never locks App.
+    FoldQuery::PlaybackContext => {
+      FoldAnswer::Playback(app.current_playback_context.clone().map(Box::new))
+    }
+    FoldQuery::Devices => FoldAnswer::Devices(app.devices.as_ref().map(DeviceList::from)),
+    FoldQuery::Playlists => FoldAnswer::Playlists(app.playlists.clone()),
+    FoldQuery::TableTracks => FoldAnswer::Tracks(app.track_table.tracks.clone()),
+    FoldQuery::SearchResults => FoldAnswer::Search(Box::new(app.search_results.clone())),
+    FoldQuery::LastError => FoldAnswer::StatusText(app.api_error.clone()),
+    FoldQuery::MediaSnapshot => {
+      FoldAnswer::Media(crate::infra::media_metadata::current_playback_snapshot(app))
+    }
+    FoldQuery::QueueDepth => FoldAnswer::U64(app.native_queue.len() as u64),
+    FoldQuery::QueueTracks => FoldAnswer::QueueTracks(app.native_queue.clone()),
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjGeneration => FoldAnswer::U64(app.dj.generation),
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjVibe => FoldAnswer::DjVibe {
+      vibe: app.dj.vibe.clone(),
+      auto_queue: app.dj.auto_queue,
+    },
+    FoldQuery::FlushStateSave => {
+      app.flush_state_save(true);
+      FoldAnswer::Bool(true)
+    }
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),
     ),
-    FoldQuery::SavedTracksGeneration => {
-      FoldAnswer::U64(app.saved_tracks_prefetch_generation)
-    }
+    FoldQuery::SavedTracksGeneration => FoldAnswer::U64(app.saved_tracks_prefetch_generation),
     FoldQuery::SpotifyConnected => FoldAnswer::Bool(app.spotify_connected),
     FoldQuery::ReleasePlaylistTracksPage {
       playlist_id,
@@ -1013,12 +1135,7 @@ pub(crate) fn answer_query(
         app.liked_lookup_worker_running = false;
         return FoldAnswer::LikedBatch(None);
       }
-      let batch: Vec<String> = app
-        .liked_lookup_pending
-        .iter()
-        .take(40)
-        .cloned()
-        .collect();
+      let batch: Vec<String> = app.liked_lookup_pending.iter().take(40).cloned().collect();
       for id in &batch {
         app.liked_lookup_pending.remove(id);
       }
@@ -1098,15 +1215,13 @@ pub(crate) fn answer_query(
         .ok()
         .map(|id| id.into_static())
         .is_some_and(|id| {
-          app.playlist_tracks_prefetch_generation == app.playlist_tracks_prefetch_generation
-            && app.is_playlist_track_table_active_for(&id)
+          // The old saved-tracks generation check has no playlist-tracks
+          // counterpart (no generation exists there); the claim is
+          // table-active + not already in flight.
+          app.is_playlist_track_table_active_for(&id)
         })
-        && !app
-          .playlist_tracks_prefetch_in_flight
-          .contains(&offset)
-        && app
-          .playlist_tracks_prefetch_in_flight
-          .insert(offset);
+        && !app.playlist_tracks_prefetch_in_flight.contains(&offset)
+        && app.playlist_tracks_prefetch_in_flight.insert(offset);
       FoldAnswer::Bool(claimed)
     }
     FoldQuery::ReleasePlaylistTracksOffset {
@@ -1152,5 +1267,37 @@ fn build_snapshot(app: &App) -> Snapshot {
     audio_pending: app.native_backend_pending,
     #[cfg(not(feature = "streaming"))]
     audio_pending: false,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::core::app::App;
+  use std::sync::Arc;
+  use tokio::sync::Mutex;
+
+  /// A query sent while the fold is parked on an empty event stream must
+  /// still be answered (ticket 17 regression): CLI mode, the DJ turn loop,
+  /// and the MCP tools all block on queries from quiet surfaces. Before the
+  /// fold's select watched the query channels, this test hung.
+  #[tokio::test]
+  async fn a_parked_fold_still_answers_queries() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _rx) = spawn_fold(&app).await;
+    // Let the fold task run to its park point (no events flowing).
+    for _ in 0..10 {
+      tokio::task::yield_now().await;
+    }
+    let answered = tokio::time::timeout(
+      std::time::Duration::from_secs(2),
+      spine.query(crate::runtime::engine::FoldQuery::QueueDepth),
+    )
+    .await
+    .expect("the parked fold must answer the query instead of hanging");
+    assert!(matches!(
+      answered,
+      Ok(crate::runtime::engine::FoldAnswer::U64(0))
+    ));
   }
 }

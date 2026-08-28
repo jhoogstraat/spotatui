@@ -79,14 +79,24 @@ pub(super) async fn run_subcommand(boot: Boot, cmd: &str, matches: &ArgMatches) 
   let _sync_io_rx = boot.sync_io_rx;
   // Both `Network::new` variants share one signature, so the same call
   // compiles with or without `streaming`. CLI mode never uses streaming.
-  let network = Network::new(
+  let mut network = Network::new(
     boot.spotify,
     boot.client_config,
     &app,
     boot.token_cache_path,
   );
+  // Ticket 17: the CLI is a command surface reading fold-published state,
+  // so it runs its own fold for the subcommand lifetime. Snapshot
+  // publication has no subscriber here; the fold task ends when this
+  // function drops the watch receiver and the spine.
+  let (spine, _snapshot_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+  network.spine = Some(spine.clone());
   let cli_result = cli::handle_matches(matches, cmd.to_string(), network, boot.user_config).await;
-  app.lock().await.flush_state_save(true);
+  // End-of-command persistence flush through the fold (it owns the state).
+  let _ = spine
+    .query(crate::runtime::engine::FoldQuery::FlushStateSave)
+    .await;
+  drop(spine); // closes the spine: the fold task drains and exits
   println!("{}", cli_result?);
   Ok(())
 }

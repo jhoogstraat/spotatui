@@ -1,5 +1,6 @@
 use crate::core::user_config::UserConfig;
 use crate::infra::network::{IoEvent, Network};
+use crate::runtime::engine::{FoldAnswer, FoldQuery};
 
 use super::{
   util::{Flag, JumpDirection, Type},
@@ -24,13 +25,13 @@ pub async fn handle_matches(
     .handle_network_event(IoEvent::GetCurrentPlayback)
     .await;
 
-  let devices_list = match &cli.net.app.lock().await.devices {
-    Some(p) => p
+  let devices_list = match cli.net.fold_query(FoldQuery::Devices).await {
+    Some(FoldAnswer::Devices(Some(payload))) => payload
       .devices
       .iter()
       .filter_map(|d| d.id.clone())
       .collect::<Vec<String>>(),
-    None => Vec::new(),
+    _ => Vec::new(),
   };
 
   // If the device_id is not specified, select the first available device
@@ -146,7 +147,10 @@ pub async fn handle_matches(
   };
 
   // Check if there was an error
-  let api_error = cli.net.app.lock().await.api_error.clone();
+  let api_error = match cli.net.fold_query(FoldQuery::LastError).await {
+    Some(FoldAnswer::StatusText(text)) => text,
+    _ => String::new(),
+  };
   if api_error.is_empty() {
     output
   } else {

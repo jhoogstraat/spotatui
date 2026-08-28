@@ -141,7 +141,11 @@ fn generate_token() -> Result<String> {
 /// Returns the bound port so the caller can report it. Each accepted connection
 /// gets its own task and its own [`server::Session`], so the per-connection era
 /// latch cannot leak between two different agents talking to us at once.
-pub async fn spawn_listener(app: Arc<Mutex<App>>, io_tx: Sender<IoEvent>) -> Result<u16> {
+pub async fn spawn_listener(
+  app: Arc<Mutex<App>>,
+  io_tx: Sender<IoEvent>,
+  spine: crate::runtime::engine::Spine,
+) -> Result<u16> {
   let listener = TcpListener::bind(("127.0.0.1", 0))
     .await
     .context("could not bind the MCP control socket on 127.0.0.1")?;
@@ -177,9 +181,11 @@ pub async fn spawn_listener(app: Arc<Mutex<App>>, io_tx: Sender<IoEvent>) -> Res
       }
       let app = Arc::clone(&app);
       let io_tx = io_tx.clone();
+      let spine = spine.clone();
       let token = token.clone();
       tokio::spawn(async move {
-        if let Err(e) = serve_connection(stream, app, io_tx, token, HANDSHAKE_TIMEOUT).await {
+        if let Err(e) = serve_connection(stream, app, io_tx, spine, token, HANDSHAKE_TIMEOUT).await
+        {
           log::debug!("MCP: connection ended: {e}");
         }
       });
@@ -197,6 +203,7 @@ async fn serve_connection(
   stream: TcpStream,
   app: Arc<Mutex<App>>,
   io_tx: Sender<IoEvent>,
+  spine: crate::runtime::engine::Spine,
   expected_token: String,
   handshake_timeout: std::time::Duration,
 ) -> Result<()> {
@@ -257,7 +264,7 @@ async fn serve_connection(
     anyhow::bail!("bad MCP control token");
   }
 
-  let executor = AppExecutor::new(app, io_tx);
+  let executor = AppExecutor::new(io_tx, spine);
   server::serve(reader, write_half, &executor).await?;
   Ok(())
 }
@@ -293,6 +300,7 @@ mod tests {
     let port = listener.local_addr().unwrap().port();
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
 
     let server = tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
@@ -300,6 +308,7 @@ mod tests {
         stream,
         app,
         io_tx,
+        spine,
         "correct-token".to_string(),
         HANDSHAKE_TIMEOUT,
       )
@@ -325,6 +334,7 @@ mod tests {
     // Keep the receiver alive so app-only calls are not reported as shut down.
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
 
     tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
@@ -332,6 +342,7 @@ mod tests {
         stream,
         app,
         io_tx,
+        spine,
         "correct-token".to_string(),
         HANDSHAKE_TIMEOUT,
       )
@@ -380,7 +391,8 @@ mod tests {
 
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
-    let port = spawn_listener(app, io_tx)
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let port = spawn_listener(app, io_tx, spine)
       .await
       .expect("listener should bind");
 
@@ -416,6 +428,7 @@ mod tests {
     let port = listener.local_addr().unwrap().port();
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
 
     let server = tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
@@ -423,6 +436,7 @@ mod tests {
         stream,
         app,
         io_tx,
+        spine,
         "t".to_string(),
         std::time::Duration::from_millis(50),
       )
@@ -450,10 +464,19 @@ mod tests {
     let port = listener.local_addr().unwrap().port();
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
 
     let server = tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
-      serve_connection(stream, app, io_tx, "t".to_string(), HANDSHAKE_TIMEOUT).await
+      serve_connection(
+        stream,
+        app,
+        io_tx,
+        spine,
+        "t".to_string(),
+        HANDSHAKE_TIMEOUT,
+      )
+      .await
     });
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

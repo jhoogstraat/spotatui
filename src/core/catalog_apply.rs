@@ -109,8 +109,7 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
       // offsets and pages, and drop the visible rows — the exact writes
       // `App::reset_saved_tracks_view` made under the handler's lock, minus
       // the dispatch (the producer emits the fetch event itself).
-      app.saved_tracks_prefetch_generation =
-        app.saved_tracks_prefetch_generation.wrapping_add(1);
+      app.saved_tracks_prefetch_generation = app.saved_tracks_prefetch_generation.wrapping_add(1);
       app.saved_tracks_prefetch_in_flight.clear();
       app.library.saved_tracks.clear();
       app.pending_track_table_selection = None;
@@ -192,16 +191,12 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
           ..CatalogOutcome::default()
         };
       }
-      app
-        .playlist_tracks_prefetch_in_flight
-        .remove(&page.offset);
+      app.playlist_tracks_prefetch_in_flight.remove(&page.offset);
       if app.pending_playlist_open.as_deref() == Some(playlist_id.as_str()) {
         app.pending_playlist_open = None;
       }
       let track_ids = track_ids_for_like_check.clone();
-      app
-        .playlist_track_pages
-        .upsert_page_by_offset(page.clone());
+      app.playlist_track_pages.upsert_page_by_offset(page.clone());
       app.set_playlist_tracks_to_table_continuous();
       if !track_ids.is_empty() {
         app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_ids));
@@ -438,10 +433,7 @@ mod tests {
   #[test]
   fn saved_tracks_page_under_a_live_generation_lands() {
     let mut app = app_with_io();
-    apply_catalog_state(
-      &mut app,
-      &CatalogStateEvent::SavedTracksReset,
-    );
+    apply_catalog_state(&mut app, &CatalogStateEvent::SavedTracksReset);
     let generation = app.saved_tracks_prefetch_generation;
     let outcome = apply_catalog_state(&mut app, &saved_tracks_page_event(0, generation, "row"));
     assert!(!outcome.stale_event_dropped);

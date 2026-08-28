@@ -12,11 +12,9 @@
 //! hit rates when the tools are rendered into model context.
 
 use super::{brief, DjSuggestion, MAX_BATCH};
-use crate::core::action::EngineAction as Action;
-use crate::core::app::App;
+use crate::core::action::EngineAction;
+use crate::runtime::engine::{EngineEvent, FoldAnswer, FoldQuery, SessionFact, Spine};
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Static description of one tool.
 pub struct ToolSpec {
@@ -444,34 +442,57 @@ impl DjToolCall {
   }
 }
 
-/// Execute the calls that only need the `App` lock (plus, for history, a
-/// blocking file read).
+/// Execute the calls that only need fold-published state (plus, for history,
+/// a blocking file read).
 ///
-/// Returns `None` for calls that need the Spotify client; those go through the
-/// serial IoEvent lane instead — see `crate::infra::network::dj`.
-pub async fn execute_app_only(app: &Arc<Mutex<App>>, call: &DjToolCall) -> Option<ToolOutcome> {
+/// Reads go through `Spine::query`; mutations are fold facts applied by the
+/// fold task (ticket 17). Returns `None` for calls that need the Spotify
+/// client; those go through the serial IoEvent lane instead — see
+/// `crate::infra::network::dj`.
+pub async fn execute_app_only(spine: &Spine, call: &DjToolCall) -> Option<ToolOutcome> {
   match call {
-    DjToolCall::GetListeningHistory { period } => Some(history_outcome(app, *period).await),
-    DjToolCall::GetNowPlaying => Some(now_playing_outcome(app).await),
-    DjToolCall::GetQueue => Some(queue_outcome(app).await),
+    DjToolCall::GetListeningHistory { period } => Some(history_outcome(spine, *period).await),
+    DjToolCall::GetNowPlaying => Some(now_playing_outcome(spine).await),
+    DjToolCall::GetQueue => Some(queue_outcome(spine).await),
     DjToolCall::SkipTrack => {
-      let mut app = app.lock().await;
-      // Through the shared vocabulary, so `App::next_track`'s ownership routing
-      // (queue slot, decoded sources, suspend-to-queue, native shuffle
-      // bookkeeping) applies; the old raw `IoEvent::NextTrack` dispatch missed
-      // the App-side branches.
-      app.apply(Action::NextTrack);
-      Some(ToolOutcome::ok("Skipped to the next track"))
+      // Through the shared vocabulary as a fold fact, so `App::next_track`'s
+      // ownership routing (queue slot, decoded sources, suspend-to-queue,
+      // native shuffle bookkeeping) applies; the old raw `IoEvent::NextTrack`
+      // dispatch missed the App-side branches. Acked so a dropped event
+      // cannot report a skip that never happened.
+      let applied = spine
+        .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+          EngineAction::NextTrack,
+        )))
+        .await;
+      Some(match applied {
+        Some(_) => ToolOutcome::ok("Skipped to the next track"),
+        None => ToolOutcome::error("The engine did not accept the skip; try again in a moment"),
+      })
     }
     DjToolCall::SetDjVibe { vibe } => {
-      let mut app = app.lock().await;
       // The apply arm bumps the DJ generation exactly once (the adopt-one-bump
       // rule in the turn loop depends on that count).
-      app.apply(Action::SetDjVibe(vibe.clone()));
-      Some(ToolOutcome::ok(match vibe.as_deref() {
-        Some(vibe) => format!("DJ vibe set to: {vibe}. {}", vibe_effect(&app)),
-        None => "DJ vibe cleared".to_string(),
-      }))
+      let applied = spine
+        .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+          EngineAction::SetDjVibe(vibe.clone()),
+        )))
+        .await;
+      match applied {
+        None => Some(ToolOutcome::error(
+          "The engine did not accept the vibe; try again in a moment",
+        )),
+        Some(_) => {
+          let auto_queue = match spine.query(FoldQuery::DjVibe).await {
+            Ok(FoldAnswer::DjVibe { auto_queue, .. }) => auto_queue,
+            _ => false,
+          };
+          Some(ToolOutcome::ok(match vibe.as_deref() {
+            Some(vibe) => format!("DJ vibe set to: {vibe}. {}", vibe_effect(auto_queue)),
+            None => "DJ vibe cleared".to_string(),
+          }))
+        }
+      }
     }
     // These need the real Spotify client, which only the serial lane has.
     // `play_now` is among them because it confirms the track exists before
@@ -496,10 +517,10 @@ pub async fn execute_app_only(app: &Arc<Mutex<App>>, call: &DjToolCall) -> Optio
 /// It is never *ignored*, which is why this points at the fallback: the vibe is
 /// stored on `App` and comes back out through `get_listening_history`, so an
 /// agent running its own top-up loop can read it and honour it itself.
-fn vibe_effect(app: &App) -> &'static str {
+fn vibe_effect(auto_queue: bool) -> &'static str {
   #[cfg(feature = "ai-dj")]
   {
-    if app.dj.auto_queue {
+    if auto_queue {
       "The built-in DJ will follow it from its next refill."
     } else {
       "The built-in DJ's auto-queue is off, so nothing will act on it until the user turns it on; \
@@ -508,19 +529,16 @@ fn vibe_effect(app: &App) -> &'static str {
   }
   #[cfg(not(feature = "ai-dj"))]
   {
-    // `App::dj` exists under `dj-core`, so `auto_queue` is readable here — but it
-    // is permanently false in this build, and saying "auto-queue is off" would
+    // `auto_queue` is readable through the fold either way — but it is
+    // permanently false in this build, and saying "auto-queue is off" would
     // imply it could be turned on.
-    let _ = app;
+    let _ = auto_queue;
     "This build has no built-in auto-queue DJ, so nothing will act on it automatically. It is \
      stored and returned by get_listening_history, so you can follow it yourself when you queue."
   }
 }
 
-async fn history_outcome(
-  app: &Arc<Mutex<App>>,
-  period: crate::infra::history::RecapPeriod,
-) -> ToolOutcome {
+async fn history_outcome(spine: &Spine, period: crate::infra::history::RecapPeriod) -> ToolOutcome {
   // `load_listens` is blocking and reads the whole file, which is unbounded
   // append-only — never call it directly on an async task.
   let loaded = tokio::task::spawn_blocking(crate::infra::history::load_listens).await;
@@ -531,11 +549,19 @@ async fn history_outcome(
   };
 
   let mut summary = brief::build_brief(&listens, period);
-  {
-    let app = app.lock().await;
-    summary.now_playing = super::current_track_label(&app);
-    summary.vibe = app.dj.vibe.clone();
-  }
+  // Now-playing and vibe from the fold's published state (ticket 17).
+  summary.now_playing = match spine.query(FoldQuery::MediaSnapshot).await {
+    Ok(FoldAnswer::Media(Some(snapshot))) => Some(format!(
+      "{} — {}",
+      snapshot.metadata.title,
+      snapshot.primary_artist()
+    )),
+    _ => None,
+  };
+  summary.vibe = match spine.query(FoldQuery::DjVibe).await {
+    Ok(FoldAnswer::DjVibe { vibe, .. }) => vibe,
+    _ => None,
+  };
 
   if summary.is_sparse() {
     return ToolOutcome::ok(format!(
@@ -558,13 +584,19 @@ async fn history_outcome(
   ToolOutcome::with_data(summary.to_prompt_block(), structured)
 }
 
-async fn now_playing_outcome(app: &Arc<Mutex<App>>) -> ToolOutcome {
-  let app = app.lock().await;
-  let queue_depth = app.native_queue.len();
+async fn now_playing_outcome(spine: &Spine) -> ToolOutcome {
+  let queue_depth = match spine.query(FoldQuery::QueueDepth).await {
+    Ok(FoldAnswer::U64(depth)) => depth as usize,
+    _ => 0,
+  };
   // One snapshot for both the label and the transport state: it is the
   // source-agnostic view (Spotify, local, Subsonic, YouTube, radio), so this
   // works whatever is actually producing sound.
-  match crate::infra::media_metadata::current_playback_snapshot(&app) {
+  let snapshot = match spine.query(FoldQuery::MediaSnapshot).await {
+    Ok(FoldAnswer::Media(snapshot)) => snapshot,
+    _ => None,
+  };
+  match snapshot {
     Some(snapshot) => {
       let label = format!(
         "{} — {}",
@@ -601,13 +633,15 @@ async fn now_playing_outcome(app: &Arc<Mutex<App>>) -> ToolOutcome {
   }
 }
 
-async fn queue_outcome(app: &Arc<Mutex<App>>) -> ToolOutcome {
-  let app = app.lock().await;
-  if app.native_queue.is_empty() {
+async fn queue_outcome(spine: &Spine) -> ToolOutcome {
+  let tracks = match spine.query(FoldQuery::QueueTracks).await {
+    Ok(FoldAnswer::QueueTracks(tracks)) => tracks,
+    _ => Vec::new(),
+  };
+  if tracks.is_empty() {
     return ToolOutcome::with_data("The queue is empty", json!({"tracks": []}));
   }
-  let labels = app
-    .native_queue
+  let labels = tracks
     .iter()
     .map(|track| format!("{} — {}", track.name, track.artists.join(", ")))
     .collect::<Vec<_>>();
@@ -623,7 +657,11 @@ async fn queue_outcome(app: &Arc<Mutex<App>>) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::infra::history::RecapPeriod;
+  // Batch 2 removed App/Arc/Mutex from the parent's imports; the tests still
+  // build an App directly (they drive the spine without a full boot).
+  use crate::core::app::App;
+  use std::sync::Arc;
+  use tokio::sync::Mutex;
 
   #[test]
   fn every_tool_schema_is_a_valid_object_schema() {

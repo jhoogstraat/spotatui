@@ -1,8 +1,11 @@
 use crate::core::user_config::UserConfig;
 use crate::infra::network::{IoEvent, Network};
+use crate::runtime::engine::{FoldAnswer, FoldQuery, SessionFact};
 
 use super::util::{Flag, Format, FormatType, JumpDirection, Type};
 
+use crate::core::plugin_api::{PlaylistInfo, TrackInfo};
+use crate::runtime::engine::DeviceList;
 use anyhow::{anyhow, Result};
 use rspotify::model::{
   context::CurrentPlaybackContext, idtypes::Id, playlist::FullPlaylist, PlayableItem,
@@ -22,6 +25,43 @@ impl CliApp {
     Self { net, config }
   }
 
+  // Ticket 17: every read below goes through the fold's published state
+  // (the CLI mode runs its own fold task); nothing here locks App.
+  async fn playback_context(&self) -> Option<CurrentPlaybackContext> {
+    match self.net.fold_query(FoldQuery::PlaybackContext).await? {
+      FoldAnswer::Playback(context) => context.map(|boxed| *boxed),
+      _ => None,
+    }
+  }
+
+  async fn devices(&self) -> Option<DeviceList> {
+    match self.net.fold_query(FoldQuery::Devices).await? {
+      FoldAnswer::Devices(payload) => payload,
+      _ => None,
+    }
+  }
+
+  async fn search_results(&self) -> Option<crate::core::app::SearchResult> {
+    match self.net.fold_query(FoldQuery::SearchResults).await? {
+      FoldAnswer::Search(results) => Some(*results),
+      _ => None,
+    }
+  }
+
+  async fn track_info_playlists(&self) -> Option<Vec<PlaylistInfo>> {
+    match self.net.fold_query(FoldQuery::Playlists).await? {
+      FoldAnswer::Playlists(paged) => paged.map(|p| p.items),
+      _ => None,
+    }
+  }
+
+  async fn table_tracks(&self) -> Vec<TrackInfo> {
+    match self.net.fold_query(FoldQuery::TableTracks).await {
+      Some(FoldAnswer::Tracks(tracks)) => tracks,
+      _ => Vec::new(),
+    }
+  }
+
   async fn is_a_saved_track(&mut self, id: &str) -> Result<bool> {
     // Tracks without an ID (e.g. local files) can't be saved; asking the API
     // about `spotify:track:` would only fail the whole status output.
@@ -29,9 +69,11 @@ impl CliApp {
       return Ok(false);
     }
     // The IoEvent handler defers to a detached worker (it must not block the
-    // TUI's serial pump); the CLI needs the answer before returning.
-    self.net.resolve_liked_state_now(&[id.to_string()]).await?;
-    Ok(self.net.app.lock().await.liked_song_ids_set.contains(id))
+    // window's serial pump); the CLI needs the answer before returning, so
+    // it resolves now and takes the API's own answer (the fold's liked set
+    // is updated by the same merge).
+    let saved = self.net.resolve_liked_state_now(&[id.to_string()]).await?;
+    Ok(saved.first().copied().unwrap_or(false))
   }
 
   pub fn format_output(&self, mut format: String, values: Vec<Format>) -> String {
@@ -47,8 +89,7 @@ impl CliApp {
 
   // spt playback -t
   pub async fn toggle_playback(&mut self) {
-    let context = self.net.app.lock().await.current_playback_context.clone();
-    if let Some(c) = context {
+    if let Some(c) = self.playback_context().await {
       if c.is_playing {
         self.net.handle_network_event(IoEvent::PausePlayback).await;
         return;
@@ -63,10 +104,9 @@ impl CliApp {
   // spt pb --share-track (share the current playing song)
   // Basically copy-pasted the 'copy_song_url' function
   pub async fn share_track_or_episode(&mut self) -> Result<String> {
-    let app = self.net.app.lock().await;
     if let Some(CurrentPlaybackContext {
       item: Some(item), ..
-    }) = &app.current_playback_context
+    }) = self.playback_context().await
     {
       match item {
         PlayableItem::Track(track) => {
@@ -92,10 +132,9 @@ impl CliApp {
   // spt pb --share-album (share the current album)
   // Basically copy-pasted the 'copy_album_url' function
   pub async fn share_album_or_show(&mut self) -> Result<String> {
-    let app = self.net.app.lock().await;
     if let Some(CurrentPlaybackContext {
       item: Some(item), ..
-    }) = &app.current_playback_context
+    }) = self.playback_context().await
     {
       match item {
         PlayableItem::Track(track) => {
@@ -121,8 +160,7 @@ impl CliApp {
   // spt ... -d ... (specify device to control)
   pub async fn set_device(&mut self, name: String) -> Result<()> {
     // Change the device if specified by user
-    let app = self.net.app.lock().await;
-    if let Some(dp) = &app.devices {
+    if let Some(dp) = self.devices().await {
       for d in &dp.devices {
         if d.name == name {
           // Save the id of the device
@@ -189,7 +227,7 @@ impl CliApp {
   pub async fn list(&mut self, item: Type, format: &str) -> String {
     match item {
       Type::Device => {
-        if let Some(devices) = &self.net.app.lock().await.devices {
+        if let Some(devices) = self.devices().await {
           devices
             .devices
             .iter()
@@ -210,9 +248,8 @@ impl CliApp {
       }
       Type::Playlist => {
         self.net.handle_network_event(IoEvent::GetPlaylists).await;
-        if let Some(playlists) = &self.net.app.lock().await.playlists {
+        if let Some(playlists) = self.track_info_playlists().await {
           playlists
-            .items
             .iter()
             .map(|p| {
               self.format_output(
@@ -232,12 +269,8 @@ impl CliApp {
           .handle_network_event(IoEvent::GetCurrentSavedTracks(None))
           .await;
         let liked_songs = self
-          .net
-          .app
-          .lock()
+          .table_tracks()
           .await
-          .track_table
-          .tracks
           .iter()
           .map(|t| {
             self.format_output(
@@ -262,7 +295,7 @@ impl CliApp {
   pub async fn transfer_playback(&mut self, device: &str) -> Result<()> {
     // Get the device id by name
     let mut id = String::new();
-    if let Some(devices) = &self.net.app.lock().await.devices {
+    if let Some(devices) = self.devices().await {
       for d in &devices.devices {
         if d.name == device {
           if let Some(device_id) = &d.id {
@@ -296,12 +329,11 @@ impl CliApp {
         .net
         .handle_network_event(IoEvent::GetCurrentPlayback)
         .await;
-      let app = self.net.app.lock().await;
       if let Some(CurrentPlaybackContext {
         progress: Some(ms),
         item: Some(item),
         ..
-      }) = &app.current_playback_context
+      }) = self.playback_context().await
       {
         let duration = match item {
           PlayableItem::Track(track) => track.duration.num_milliseconds() as u32,
@@ -346,13 +378,10 @@ impl CliApp {
 
   // spt playback --like / --dislike / --shuffle / --repeat
   pub async fn mark(&mut self, flag: Flag) -> Result<()> {
-    let c = {
-      let app = self.net.app.lock().await;
-      app
-        .current_playback_context
-        .clone()
-        .ok_or_else(|| anyhow!("no context available"))?
-    };
+    let c = self
+      .playback_context()
+      .await
+      .ok_or_else(|| anyhow!("no context available"))?;
 
     match flag {
       Flag::Like(s) => {
@@ -413,12 +442,8 @@ impl CliApp {
       .await;
 
     let context = self
-      .net
-      .app
-      .lock()
+      .playback_context()
       .await
-      .current_playback_context
-      .clone()
       .ok_or_else(|| anyhow!("no context available"))?;
 
     let playing_item = context.item.ok_or_else(|| anyhow!("no track playing"))?;
@@ -486,12 +511,12 @@ impl CliApp {
               Some(rand::random_range(0..num) as usize)
             }
             Err(e) => {
+              // Acked: the command's success/failure verdict below reads the
+              // fold's error surface, so a dropped event must not lie.
               self
                 .net
-                .app
-                .lock()
-                .await
-                .handle_error(anyhow!(e.to_string()));
+                .emit_session_acked(SessionFact::Error(e.to_string()))
+                .await;
               return;
             }
           }
@@ -539,8 +564,8 @@ impl CliApp {
       .await;
     // Get the uri of the first found
     // item + the offset or return an error message
+    let results = self.search_results().await.unwrap_or_default();
     let uri = {
-      let results = &self.net.app.lock().await.search_results;
       match item {
         Type::Track => {
           if let Some(r) = &results.tracks {
@@ -616,10 +641,10 @@ impl CliApp {
       .handle_network_event(IoEvent::GetSearchResults(search.clone(), None))
       .await;
 
-    let app = self.net.app.lock().await;
+    let results = self.search_results().await.unwrap_or_default();
     match item {
       Type::Playlist => {
-        if let Some(results) = &app.search_results.playlists {
+        if let Some(results) = &results.playlists {
           results
             .items
             .iter()
@@ -636,7 +661,7 @@ impl CliApp {
         }
       }
       Type::Track => {
-        if let Some(results) = &app.search_results.tracks {
+        if let Some(results) = &results.tracks {
           results
             .items
             .iter()
@@ -653,7 +678,7 @@ impl CliApp {
         }
       }
       Type::Artist => {
-        if let Some(results) = &app.search_results.artists {
+        if let Some(results) = &results.artists {
           results
             .items
             .iter()
@@ -670,7 +695,7 @@ impl CliApp {
         }
       }
       Type::Show => {
-        if let Some(results) = &app.search_results.shows {
+        if let Some(results) = &results.shows {
           results
             .items
             .iter()
@@ -687,7 +712,7 @@ impl CliApp {
         }
       }
       Type::Album => {
-        if let Some(results) = &app.search_results.albums {
+        if let Some(results) = &results.albums {
           results
             .items
             .iter()

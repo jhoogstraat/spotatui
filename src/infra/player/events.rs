@@ -1462,16 +1462,12 @@ async fn disconnect_streaming_player(
   app_lock.is_streaming_active = false;
   app_lock.native_activation_pending = false;
   app_lock.native_device_id = None;
-  app_lock.native_is_playing = Some(false);
-  app_lock.native_track_info = None;
   app_lock.native_playback_origin = None;
   // Clearing the session below bumps its generation, which would turn a
   // shuffled queue suspension into a silent no-op at resume time; convert it
   // to a context snapshot first (while the cached context is still around).
   app_lock.convert_shuffled_suspension_to_context(None);
   app_lock.clear_native_shuffle_session();
-  app_lock.song_progress_ms = 0;
-  app_lock.last_track_id = None;
   app_lock.last_device_activation = None;
   app_lock.seek_ms = None;
   // The cached API context may still point at the stale native session; the
@@ -1480,12 +1476,14 @@ async fn disconnect_streaming_player(
   app_lock.set_status_message(status_message, 8);
   app_lock.dispatch(IoEvent::GetCurrentPlayback);
 
-  // Publish the reset as one typed fact for the fold (ticket 14). The direct
-  // writes above remain until tickets 15–17 migrate the recovery task off
-  // App locks entirely; the event keeps the fold's mirror copy in step today.
+  // Publish the reset as one typed fact for the fold (ticket 14). Ticket 17
+  // deleted the direct mirror writes here: the transport flag, track info,
+  // identity, and progress are fold-owned now, and the acked Teardown fact
+  // below replays their reset before the recovery task proceeds — a dropped
+  // event would leave the mirrors stale with nothing repopulating them.
   if let Some(spine) = spine {
     spine
-      .emit(crate::runtime::engine::EngineEvent::Streaming(
+      .emit_acked(crate::runtime::engine::EngineEvent::Streaming(
         crate::core::streaming::StreamingStateEvent::Teardown,
       ))
       .await;
