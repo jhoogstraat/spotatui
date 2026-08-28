@@ -467,10 +467,19 @@ impl MetadataNetwork for Network {
       .await
     {
       Ok(res) => {
+        // Ticket 16 batch 2: the page lands as an event; the fold writes
+        // the cache (single writer).
         let domain_page =
           crate::infra::network::mapping::map_cursor_page(&res.artists, |a| ArtistInfo::from(a));
-        let mut app = self.app.lock().await;
-        app.library.saved_artists.add_pages(domain_page);
+        if let Some(spine) = self.spine.as_ref() {
+          spine
+            .emit(crate::runtime::engine::EngineEvent::Catalog(
+              crate::core::catalog::CatalogStateEvent::SavedArtistsPageUpserted {
+                page: Some(domain_page),
+              },
+            ))
+            .await;
+        }
       }
       Err(e) => self.handle_error(anyhow!(e)).await,
     }
