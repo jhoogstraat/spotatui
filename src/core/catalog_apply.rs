@@ -7,7 +7,8 @@
 //! [`crate::core::catalog::CatalogState::absorb`] before any mirror write.
 
 use crate::core::app::{App, SearchResultBlock, TrackTableContext};
-use crate::core::catalog::{CatalogOutcome, CatalogStateEvent};
+use crate::core::catalog::{CatalogOutcome, CatalogStateEvent, SavedSetKind};
+use crate::infra::network::IoEvent;
 
 /// The fold's single write path for catalog facts.
 pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogOutcome {
@@ -92,7 +93,201 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         ..CatalogOutcome::default()
       }
     }
-    _ => CatalogOutcome::default(),
+    CatalogStateEvent::LibraryPageUpserted { section } => {
+      // Legacy arm from batch 1's placeholder shape: producers now carry
+      // full payloads through the dedicated variants below. Nothing to do
+      // beyond acknowledging the surface moved.
+      let _ = section;
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::SavedTracksReset => {
+      // Ticket 16 batch 2: the liked-songs view re-opened. Bump the
+      // generation (invalidating in-flight page fetches), clear the claimed
+      // offsets and pages, and drop the visible rows — the exact writes
+      // `App::reset_saved_tracks_view` made under the handler's lock, minus
+      // the dispatch (the producer emits the fetch event itself).
+      app.saved_tracks_prefetch_generation =
+        app.saved_tracks_prefetch_generation.wrapping_add(1);
+      app.saved_tracks_prefetch_in_flight.clear();
+      app.library.saved_tracks.clear();
+      app.pending_track_table_selection = None;
+      app.track_table.selected_index = 0;
+      app.track_table.tracks.clear();
+      app.track_table.context = Some(TrackTableContext::SavedTracks);
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::SavedTracksPageUpserted {
+      offset,
+      total,
+      limit,
+      next,
+      page,
+      liked_ids_from_page,
+      generation,
+    } => {
+      let (offset, total, limit, next, generation) =
+        (*offset, *total, *limit, next.clone(), *generation);
+      // Stale-page enforcement (ticket 10 as enforcement): a page fetched
+      // under an older request-generation never lands — the cache it would
+      // extend was cleared after this fetch started.
+      if app.saved_tracks_prefetch_generation != generation {
+        log::info!(
+          "catalog fold dropped stale saved-tracks page: offset={offset} fetched-gen={generation} live-gen={}",
+          app.saved_tracks_prefetch_generation
+        );
+        return CatalogOutcome {
+          stale_event_dropped: true,
+          ..CatalogOutcome::default()
+        };
+      }
+      for id in liked_ids_from_page.clone() {
+        app.liked_song_ids_set.insert(id);
+      }
+      let domain_page = crate::core::pagination::Paged {
+        items: page.clone(),
+        total,
+        limit,
+        next,
+        offset,
+        previous: None,
+      };
+      app.library.saved_tracks.upsert_page_by_offset(domain_page);
+      app.set_saved_tracks_to_table_continuous();
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::SavedTracks);
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::LikedEpochBumped => {
+      // A local like/unlike landed: in-flight contains-reads that predate
+      // the mutation must not clobber it. The fold stamps the epoch here;
+      // the worker compares the token it captured before its request.
+      app.liked_state_epoch = app.liked_state_epoch.wrapping_add(1);
+      CatalogOutcome::default()
+    }
+    CatalogStateEvent::PlaylistTracksPageUpserted {
+      playlist_id,
+      page,
+      track_ids_for_like_check,
+    } => {
+      // Stale-page enforcement: only the playlist whose track table is the
+      // active browse surface may land pages (the old inline generation +
+      // `is_playlist_track_table_active_for` guard, now fold-side).
+      let active = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
+        .ok()
+        .map(|id| id.into_static())
+        .is_some_and(|id| app.is_playlist_track_table_active_for(&id));
+      if !active {
+        return CatalogOutcome {
+          stale_event_dropped: true,
+          ..CatalogOutcome::default()
+        };
+      }
+      app
+        .playlist_tracks_prefetch_in_flight
+        .remove(&page.offset);
+      if app.pending_playlist_open.as_deref() == Some(playlist_id.as_str()) {
+        app.pending_playlist_open = None;
+      }
+      let track_ids = track_ids_for_like_check.clone();
+      app
+        .playlist_track_pages
+        .upsert_page_by_offset(page.clone());
+      app.set_playlist_tracks_to_table_continuous();
+      if !track_ids.is_empty() {
+        app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_ids));
+      }
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::SavedAlbumsPageUpserted { page } => {
+      if let Some(page) = page {
+        app.library.saved_albums.add_pages(page.clone());
+      }
+      // Bump even on an empty page: completion is the signal plugin data
+      // requests wait on, and an empty library never writes a page.
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::SavedAlbums);
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::SavedShowsPageUpserted { page } => {
+      if let Some(page) = page {
+        app.library.saved_shows.add_pages(page.clone());
+      }
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::SavedShows);
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::SavedArtistsPageUpserted { page } => {
+      if let Some(page) = page {
+        app.library.saved_artists.add_pages(page.clone());
+      }
+      // No plugin-data bump: followed artists never had a kind (the old
+      // inline write bumped nothing either); scripting reads it via the
+      // artists cache refresh instead.
+      CatalogOutcome {
+        library_page_upserted: true,
+        ..CatalogOutcome::default()
+      }
+    }
+    CatalogStateEvent::SavedSetMerged {
+      kind,
+      saved_ids,
+      unsaved_ids,
+    } => {
+      for id in saved_ids {
+        match kind {
+          SavedSetKind::LikedTracks => {
+            app.liked_song_ids_set.insert(id.clone());
+          }
+          SavedSetKind::FollowedArtists => {
+            app.followed_artist_ids_set.insert(id.clone());
+          }
+          SavedSetKind::Albums => {
+            app.saved_album_ids_set.insert(id.clone());
+          }
+          SavedSetKind::Shows => {
+            app.saved_show_ids_set.insert(id.clone());
+          }
+        }
+      }
+      for id in unsaved_ids {
+        match kind {
+          SavedSetKind::LikedTracks => {
+            app.liked_song_ids_set.remove(id);
+          }
+          SavedSetKind::FollowedArtists => {
+            app.followed_artist_ids_set.remove(id);
+          }
+          SavedSetKind::Albums => {
+            app.saved_album_ids_set.remove(id);
+          }
+          SavedSetKind::Shows => {
+            app.saved_show_ids_set.remove(id);
+          }
+        }
+      }
+      CatalogOutcome::default()
+    }
   }
 }
 
@@ -224,5 +419,106 @@ mod tests {
       explicit: false,
       image_url: None,
     }
+  }
+
+  // ── Ticket 16 batch 2: library pages fold-side ────────────────────────────
+
+  fn saved_tracks_page_event(offset: u32, generation: u64, name: &str) -> CatalogStateEvent {
+    CatalogStateEvent::SavedTracksPageUpserted {
+      offset,
+      total: 2,
+      limit: 2,
+      next: None,
+      page: vec![track("spotify:track:x", name)],
+      liked_ids_from_page: vec!["liked-id".to_string()],
+      generation,
+    }
+  }
+
+  #[test]
+  fn saved_tracks_page_under_a_live_generation_lands() {
+    let mut app = app_with_io();
+    apply_catalog_state(
+      &mut app,
+      &CatalogStateEvent::SavedTracksReset,
+    );
+    let generation = app.saved_tracks_prefetch_generation;
+    let outcome = apply_catalog_state(&mut app, &saved_tracks_page_event(0, generation, "row"));
+    assert!(!outcome.stale_event_dropped);
+    assert!(outcome.library_page_upserted);
+    assert_eq!(app.track_table.tracks.len(), 1);
+    assert!(app.liked_song_ids_set.contains("liked-id"));
+  }
+
+  #[test]
+  fn saved_tracks_page_under_a_superseded_generation_never_lands() {
+    // The view was re-opened (generation bumped) while a fetch was in
+    // flight: its page must be dropped wholesale, rows and liked ids alike.
+    let mut app = app_with_io();
+    apply_catalog_state(&mut app, &CatalogStateEvent::SavedTracksReset);
+    let outcome = apply_catalog_state(&mut app, &saved_tracks_page_event(0, 999, "stale"));
+    assert!(outcome.stale_event_dropped);
+    assert!(app.track_table.tracks.is_empty());
+    assert!(!app.liked_song_ids_set.contains("liked-id"));
+  }
+
+  #[test]
+  fn saved_tracks_reset_clears_pages_and_visible_rows() {
+    let mut app = app_with_io();
+    // Land a page, then re-open the view: the cache and the table reset.
+    apply_catalog_state(&mut app, &saved_tracks_page_event(0, 0, "first"));
+    assert!(!app.track_table.tracks.is_empty());
+    let before = app.saved_tracks_prefetch_generation;
+    apply_catalog_state(&mut app, &CatalogStateEvent::SavedTracksReset);
+    assert_eq!(app.saved_tracks_prefetch_generation, before + 1);
+    assert!(app.library.saved_tracks.pages.is_empty());
+    assert!(app.track_table.tracks.is_empty());
+    assert!(app.saved_tracks_prefetch_in_flight.is_empty());
+  }
+
+  #[test]
+  fn liked_epoch_bump_advances_the_re_read_counter() {
+    let mut app = app_with_io();
+    let before = app.liked_state_epoch;
+    apply_catalog_state(&mut app, &CatalogStateEvent::LikedEpochBumped);
+    assert_eq!(app.liked_state_epoch, before + 1);
+  }
+
+  #[test]
+  fn playlist_page_for_an_inactive_table_is_dropped() {
+    let mut app = app_with_io();
+    let outcome = apply_catalog_state(
+      &mut app,
+      &CatalogStateEvent::PlaylistTracksPageUpserted {
+        playlist_id: "not-open".to_string(),
+        page: crate::core::pagination::Paged::default(),
+        track_ids_for_like_check: vec![],
+      },
+    );
+    assert!(outcome.stale_event_dropped);
+  }
+
+  #[test]
+  fn saved_set_merge_inserts_and_removes() {
+    use crate::core::catalog::SavedSetKind;
+    let mut app = app_with_io();
+    apply_catalog_state(
+      &mut app,
+      &CatalogStateEvent::SavedSetMerged {
+        kind: SavedSetKind::Albums,
+        saved_ids: vec!["a1".to_string()],
+        unsaved_ids: vec![],
+      },
+    );
+    assert!(app.saved_album_ids_set.contains("a1"));
+    apply_catalog_state(
+      &mut app,
+      &CatalogStateEvent::SavedSetMerged {
+        kind: SavedSetKind::Albums,
+        saved_ids: vec![],
+        unsaved_ids: vec!["a1".to_string()],
+      },
+    );
+    assert!(!app.saved_album_ids_set.contains("a1"));
   }
 }

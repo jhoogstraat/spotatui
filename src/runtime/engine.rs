@@ -15,14 +15,16 @@
 //! two-hop publish (fork publish → adapter re-map/re-publish) collapses to
 //! one equality-checked publication per genuine change.
 //!
-//! Positions still move at driver cadence inside [`crate::core::app::App`] —
-//! stage 3 of ADR 0016 dissolves that struct into domain owners. This spine
-//! replaces the *timing model* first: nothing wakes unless an event arrives.
+//! Ticket 16: producers stop writing shared state entirely. A Web API
+//! handler fetches, then emits a result event — including error paths. Reads
+//! that a producer needs to *decide* (was this request superseded? what is
+//! the next missing page offset?) go through [`Spine::query`], which the
+//! fold answers under its existing lock; no producer locks `App` any more.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::core::app::App;
 #[allow(unused_imports)]
@@ -51,6 +53,103 @@ pub enum EngineEvent {
   /// the dispatchers and network layer, folded with stale-request
   /// enforcement.
   Catalog(crate::core::catalog::CatalogStateEvent),
+  /// A session fact (ticket 16): auth transitions, notices, and the loading
+  /// spinner, emitted by the network layer instead of written under the App
+  /// lock.
+  Session(SessionFact),
+}
+
+/// One session-level fact (ticket 16). The fold applies these through the
+/// same methods the old inline writes used, so behavior is byte-for-byte
+/// parity while the lock sites disappear. Debug and Clone are manual:
+/// `IoEvent` has no Debug and must not grow one.
+#[derive(Clone)]
+pub enum SessionFact {
+  /// An auth-state transition (token refreshed, login completed, session
+  /// lost). The fold runs `AuthState::transition` + the legacy mirror sync.
+  Auth {
+    transition: crate::core::auth::AuthTransition,
+    new_expiry: Option<std::time::SystemTime>,
+    /// Post-transition wiring the old `complete_spotify_login` did under the
+    /// same lock: dispatch the post-connect data fetches.
+    post_connect_fetches: Vec<PostConnectFetch>,
+  },
+  /// A status-bar notice with a TTL, scaled by the config at the fold.
+  Status {
+    message: String,
+    ttl_secs: u64,
+    is_error: bool,
+  },
+  /// The generic end-of-handler reset: global spinner down.
+  LoadingCleared,
+  /// Direct mirror sync for the token-refresh path (requests.rs), whose
+  /// closure only knows the expiry: the fold reconciles the auth domain and
+  /// the legacy mirrors from this.
+  AuthMirrors {
+    token_expiry: Option<std::time::SystemTime>,
+    refresh_in_progress: bool,
+    connected: bool,
+  },
+  /// Route a failure through `App::handle_error` (the old inline
+  /// `self.handle_error(e)` call sites): error page hint + 60s TTL.
+  Error(String),
+  /// Clear `pending_playlist_open` when it still names `id` (`None` clears
+  /// unconditionally — the auth-gate paths).
+  ClearPendingPlaylistOpen(Option<String>),
+  /// Dispatch `GetPlaylists` from the fold (the post-create refresh and
+  /// other places that re-pull the sidebar list after a mutation).
+  DispatchPlaylistRefresh,
+}
+
+/// The data fetches `complete_spotify_login` used to dispatch under the same
+/// lock that connected the session (Clonable by construction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostConnectFetch {
+  User,
+  Playlists,
+  CurrentPlayback,
+}
+
+impl std::fmt::Debug for SessionFact {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      SessionFact::Auth {
+        transition,
+        new_expiry,
+        ..
+      } => f
+        .debug_struct("Auth")
+        .field("transition", transition)
+        .field("new_expiry", new_expiry)
+        .finish_non_exhaustive(),
+      SessionFact::Status {
+        message,
+        ttl_secs,
+        is_error,
+      } => f
+        .debug_struct("Status")
+        .field("message", message)
+        .field("ttl_secs", ttl_secs)
+        .field("is_error", is_error)
+        .finish(),
+      SessionFact::LoadingCleared => f.write_str("LoadingCleared"),
+      SessionFact::AuthMirrors {
+        token_expiry,
+        refresh_in_progress,
+        connected,
+      } => f
+        .debug_struct("AuthMirrors")
+        .field("token_expiry", token_expiry)
+        .field("refresh_in_progress", refresh_in_progress)
+        .field("connected", connected)
+        .finish(),
+      SessionFact::Error(message) => f.debug_tuple("Error").field(message).finish(),
+      SessionFact::ClearPendingPlaylistOpen(id) => {
+        f.debug_tuple("ClearPendingPlaylistOpen").field(id).finish()
+      }
+      SessionFact::DispatchPlaylistRefresh => f.write_str("DispatchPlaylistRefresh"),
+    }
+  }
 }
 
 /// Which state surface produced an event. Coarse on purpose: publication
@@ -125,18 +224,232 @@ pub enum EngineCommand {
 
 pub use crate::core::action::LibraryTarget;
 
-/// Read the producer spine off `App` and emit one catalog event (ticket 15).
-///
-/// Producers run under their own locks; the spine handle lives on `App`
-/// (installed at boot), so emitting is lock-free. `None` in tests that never
-/// installed a spine: callers treat that as "fold absent, nothing to do".
-pub(crate) async fn emit_catalog_event(
-  app: &Arc<Mutex<App>>,
-  event: crate::core::catalog::CatalogStateEvent,
-) {
-  if let Some(spine) = app.lock().await.spine.as_ref() {
-    spine.emit(EngineEvent::Catalog(event)).await;
+/// A read a producer needs answered against the fold's authoritative state
+/// (ticket 16). The fold answers under its existing App lock; the producer
+/// never locks. Every variant names the exact decision it feeds, so the
+/// protocol stays auditable.
+#[derive(Debug)]
+pub enum FoldQuery {
+  /// Was this library request superseded before it even fetched? The
+  /// detached prefetch workers check their generation against the fold's
+  /// (the old `app.saved_tracks_prefetch_generation == generation` read).
+  LibraryRequestLive {
+    section: crate::core::catalog::LibrarySection,
+    generation: u64,
+  },
+  /// The next missing page offset for an offset-keyed library cache, plus
+  /// the live generation to carry into the follow-up claim.
+  NextLibraryOffset {
+    section: crate::core::catalog::LibrarySection,
+  },
+  /// Claim an offset for fetching (the old `in_flight.insert(offset)` RMW):
+  /// true when the claim was free and is now held.
+  ClaimLibraryOffset {
+    section: crate::core::catalog::LibrarySection,
+    generation: u64,
+  },
+  /// Release a claimed offset (fetch failed or the task is exiting).
+  ReleaseLibraryOffset {
+    section: crate::core::catalog::LibrarySection,
+  },
+  /// Liked membership for these ids (the like toggle reads it to decide
+  /// save-vs-delete; the detached worker used to merge under one lock).
+  LikedState {
+    ids: Vec<String>,
+  },
+  /// The current user id, for handlers that need it in a payload (playlist
+  /// creation).
+  UserId,
+  /// Whether a playlist's track table is the active browse surface (the
+  /// stale-page contract check `is_playlist_track_table_active_for`).
+  PlaylistTrackTableActive {
+    playlist_id: String,
+  },
+  /// Merge a contains-response into the liked set (the CLI's inline resolve
+  /// path): each id is inserted or removed per the API's answer.
+  MergeLikedState {
+    ids: Vec<String>,
+    is_saved: Vec<bool>,
+  },
+  /// Atomically drain up to 40 pending liked-state ids for the detached
+  /// worker; `None` in the payload means the set is empty and the worker
+  /// should exit.
+  ClaimLikedLookupBatch,
+  /// Merge a worker's contains-response, re-pending it when a local
+  /// like/unlike (epoch bump) landed while the read was in flight.
+  ApplyLikedLookup {
+    epoch: u64,
+    batch: Vec<String>,
+    is_saved: Vec<bool>,
+  },
+  /// Put a failed batch back in the pending set (transient failure).
+  RependLikedLookup { batch: Vec<String> },
+  /// Clear the single-worker running flag (persistent failure path).
+  StopLikedLookupWorker,
+  /// Release a playlist-sort fetch slot (the detached sort task exited or
+  /// its fetch failed).
+  ReleasePlaylistSortFetch { playlist_id: String },
+  /// Atomically claim the playlist-sort fetch slot (the detached sort task
+  /// start; `false` when one is already in flight for this playlist).
+  ClaimPlaylistSortFetch { playlist_id: String },
+  /// A track was added to a playlist: refresh the visible table when that
+  /// playlist is on screen; answer with the status text the old inline
+  /// block produced.
+  PlaylistTrackAdded { playlist_id: String },
+  /// Enqueue liked-state ids for the detached worker; `true` when the
+  /// caller must spawn the worker (it made the first claim).
+  EnqueueLikedLookup { ids: Vec<String> },
+  /// Is this playlist-refresh generation still the live one?
+  PlaylistRefreshLive { generation: u64 },
+  /// Release a playlist page-1 fetch slot + clear the pending open (the
+  /// error path of `GetPlaylistItems`).
+  ReleasePlaylistTracksPage { playlist_id: String, offset: u32 },
+  /// Clear the playlist track filter (the empty-query branch of
+  /// `SearchPlaylistTracks`); the fold rebuilds the unfiltered table.
+  ClearPlaylistTrackFilter,
+  /// Apply playlist-track search results (the completed-filter branch).
+  PlaylistTrackSearchApplied {
+    playlist_id: String,
+    query: String,
+    matches: Vec<(rspotify::model::track::FullTrack, usize)>,
+  },
+  /// Clear a pending playlist track search that can no longer land (the
+  /// playlist changed mid-search).
+  ClearPendingPlaylistTrackSearch,
+  /// The saved-tracks view was re-opened (fold resets the cache + bumps
+  /// the generation before the page-1 fetch dispatches).
+  OpenSavedTracksView,
+  /// Register a playlist refresh: snapshot the previous complete list,
+  /// bump the generation, install page 1, reconcile the selection, and
+  /// capture the page-1 selection for the background task. The old three
+  /// lock sections of `get_current_user_playlists`, one atomic step.
+  RegisterPlaylistRefresh {
+    /// The mapped page-1 listing (installed as `app.playlists`).
+    first_page: crate::core::pagination::Paged<crate::core::plugin_api::PlaylistInfo>,
+    /// The page-1 items (installed as the visible list when there is no
+    /// previous complete list to preserve).
+    first_items: Vec<crate::core::plugin_api::PlaylistInfo>,
+  },
+  /// The live streaming player handle (rootlist fetch; `None` when native
+  /// streaming is down).
+  #[cfg(feature = "streaming")]
+  StreamingPlayerHandle,
+  /// Publish a completed playlist refresh (or restore the previous list on
+  /// pagination failure). The fold owns the generation check, folder
+  /// structure, selection reconcile, and the community-pin prompt.
+  PublishPlaylistRefresh {
+    generation: u64,
+    playlists: Vec<crate::core::plugin_api::PlaylistInfo>,
+    original_selection: crate::core::catalog::PlaylistSelection,
+    pagination_error: Option<String>,
+    /// The rootlist folder tree fetched by the producer task (async, off
+    /// the fold); `None` falls back to the flat list. Streaming-only: the
+    /// slim build has no rootlist source, so the field vanishes there.
+    folder_nodes: FolderNodes,
+  },
+  /// Apply the full-playlist sort: reads the live sort state + active-table
+  /// check, replaces the visible rows when current, releases the slot.
+  ApplySortedPlaylistTracks {
+    playlist_id: String,
+    tracks: Vec<rspotify::model::track::FullTrack>,
+  },
+  /// The live saved-tracks cache generation (the page-1 handler stamps its
+  /// fetch with it; the fold invalidates against it).
+  SavedTracksGeneration,
+  /// Whether a Spotify session exists (the network layer's auth gate).
+  SpotifyConnected,
+  /// Claim a playlist-tracks page offset for fetching (the old
+  /// `playlist_tracks_prefetch_in_flight.insert(offset)` RMW, combined with
+  /// the generation + still-open checks into one atomic fold decision).
+  ClaimPlaylistTracksOffset { playlist_id: String, offset: u32 },
+  /// Release a claimed playlist-tracks offset (fetch failed).
+  ReleasePlaylistTracksOffset { playlist_id: String, offset: u32 },
+  /// The saved-tracks view state the `GetCurrentSavedTracks` handler needs
+  /// to decide what to do with a fresh page 1: is the table already
+  /// showing this section, and which offset should the user's pending
+  /// selection apply to. Replaces the lock-and-branch the handler did.
+  SavedTracksViewInfo,
+}
+
+/// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
+/// match exhaustively and producers cannot mis-cast.
+/// Debug is manual: `StreamingPlayer` has no Debug.
+pub enum FoldAnswer {
+  Bool(bool),
+  U64(u64),
+  Offset(Option<u32>),
+  Liked(Vec<bool>),
+  User(Option<String>),
+  /// A claimed liked-lookup batch plus the epoch it was captured under.
+  LikedBatch(Option<(Vec<String>, u64)>),
+  /// Status text a fold query computed (the add-to-playlist ack).
+  StatusText(String),
+  /// The registration result for a playlist refresh (the page-1 install).
+  PlaylistRefreshRegistered {
+    /// The freshly bumped refresh generation.
+    generation: u64,
+    /// The selection as of before the refresh (for the background task).
+    original_selection: crate::core::catalog::PlaylistSelection,
+    /// The selection after page 1 landed (the background task compares it
+    /// to decide whether the user has navigated since).
+    page_one_selection: crate::core::catalog::PlaylistSelection,
+    /// The previous complete list, if pagination fails partway.
+    previous_complete: PlaylistRefreshPrevious,
+  },
+  /// A cloned handle to the live streaming player (rootlist query).
+  #[cfg(feature = "streaming")]
+  StreamingPlayer(Option<std::sync::Arc<crate::infra::player::StreamingPlayer>>),
+}
+
+impl std::fmt::Debug for FoldAnswer {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      FoldAnswer::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+      FoldAnswer::U64(v) => f.debug_tuple("U64").field(v).finish(),
+      FoldAnswer::Offset(v) => f.debug_tuple("Offset").field(v).finish(),
+      FoldAnswer::Liked(v) => f.debug_tuple("Liked").field(v).finish(),
+      FoldAnswer::User(v) => f.debug_tuple("User").field(v).finish(),
+      FoldAnswer::LikedBatch(v) => f.debug_tuple("LikedBatch").field(v).finish(),
+      FoldAnswer::StatusText(v) => f.debug_tuple("StatusText").field(v).finish(),
+      FoldAnswer::PlaylistRefreshRegistered { generation, .. } => f
+        .debug_struct("PlaylistRefreshRegistered")
+        .field("generation", generation)
+        .finish_non_exhaustive(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::StreamingPlayer(player) => f
+        .debug_tuple("StreamingPlayer")
+        .field(&player.is_some())
+        .finish(),
+    }
   }
+}
+
+/// The rootlist folder tree payload: `Some` under `streaming`, `None` on
+/// slim legs (no field plumbing there).
+#[cfg(feature = "streaming")]
+pub type FolderNodes = Option<Vec<crate::core::app::PlaylistFolderNode>>;
+#[cfg(not(feature = "streaming"))]
+pub type FolderNodes = ();
+
+/// The previous complete playlist list, snapshotted by the fold when
+/// background pagination may fail partway.
+#[derive(Debug, Default)]
+pub struct PlaylistRefreshPrevious {
+  pub playlists: Vec<crate::core::plugin_api::PlaylistInfo>,
+  pub folder_nodes: Option<Vec<crate::core::app::PlaylistFolderNode>>,
+  pub folder_items: Vec<crate::core::app::PlaylistFolderItem>,
+}
+
+/// The result of an acked emit: the fold has *applied* the event, and hands
+/// back what the producer used to read after its own write. Today: the next
+/// missing offset for both offset-keyed library caches (`None` when the
+/// event was dropped as stale or the cache is complete).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldAck {
+  /// The next missing saved-tracks offset after the folded upsert.
+  pub next_saved_tracks_offset: Option<u32>,
+  /// The next missing playlist-tracks offset after the folded upsert.
+  pub next_playlist_tracks_offset: Option<u32>,
 }
 
 /// Channel bounds: the engine never blocks the window on a full channel, but
@@ -160,12 +473,43 @@ impl Default for SpineBounds {
 #[derive(Debug, Clone)]
 pub struct Spine {
   events_tx: mpsc::Sender<EngineEvent>,
+  queries_tx: mpsc::Sender<(
+    FoldQuery,
+    oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
+  )>,
+  acks_tx: mpsc::Sender<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>,
 }
 
+/// The query channel is closed: the fold task is gone (boot order or
+/// shutdown). Producers treat this as "no answer; skip the fetch" — the
+/// same stance as a `None` spine in tests.
+#[derive(Debug)]
+pub struct SpineClosed;
+
+impl std::fmt::Display for SpineClosed {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("engine fold is closed")
+  }
+}
+impl std::error::Error for SpineClosed {}
+
 impl Spine {
-  pub fn open(bounds: SpineBounds) -> (Spine, mpsc::Receiver<EngineEvent>) {
+  pub fn open(bounds: SpineBounds) -> (Spine, mpsc::Receiver<EngineEvent>, QueryReceiver) {
     let (events_tx, events_rx) = mpsc::channel(bounds.event_capacity);
-    (Spine { events_tx }, events_rx)
+    let (queries_tx, queries_rx) = mpsc::channel(bounds.event_capacity);
+    let (acks_tx, acks_rx) = mpsc::channel(bounds.event_capacity);
+    (
+      Spine {
+        events_tx,
+        queries_tx,
+        acks_tx,
+      },
+      events_rx,
+      QueryReceiver {
+        queries_rx: Mutex::new(Some(queries_rx)),
+        acks_rx: Mutex::new(Some(acks_rx)),
+      },
+    )
   }
 
   /// Push an event. Never blocks: if the buffer is momentarily full the
@@ -180,8 +524,111 @@ impl Spine {
     let _ = self.events_tx.try_send(event);
   }
 
+  /// Emit one event and wait until the fold has applied it, receiving the
+  /// post-fold facts the producer used to read under its own lock after the
+  /// write (the prefetch loop's next-missing-offset read). The ack waits on
+  /// the fold's queue order, so the answer reflects every event queued
+  /// before this one — stream order is preserved, no lock needed.
+  pub async fn emit_acked(&self, event: EngineEvent) -> Option<FoldAck> {
+    let (tx, rx) = oneshot::channel();
+    self
+      .acks_tx
+      .send((event, tx))
+      .await
+      .ok()?;
+    rx.await.ok().flatten()
+  }
+
+  /// Ask the fold for the state a decision needs, awaiting the answer.
+  /// Errors only when the fold task is gone (boot ordering or shutdown).
+  pub async fn query(&self, query: FoldQuery) -> Result<FoldAnswer, SpineClosed> {
+    let (tx, rx) = oneshot::channel();
+    self
+      .queries_tx
+      .send((query, tx))
+      .await
+      .map_err(|_| SpineClosed)?;
+    rx.await.map_err(|_| SpineClosed)?
+  }
+
   /// Resolve once the receiving end is up, for boot ordering asserts.
   pub async fn settled(&self, timeout: Duration) -> bool {
     self.events_tx.capacity() > 0 || timeout > Duration::ZERO
   }
 }
+
+/// The receive half of the query channel; the fold task drains it between
+/// events. Interior mutability so the fold can hold it beside `events_rx`.
+pub struct QueryReceiver {
+  queries_rx: Mutex<
+    Option<
+      mpsc::Receiver<(
+        FoldQuery,
+        oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
+      )>,
+    >,
+  >,
+  acks_rx: Mutex<Option<mpsc::Receiver<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>>>,
+}
+
+impl QueryReceiver {
+  pub fn take(&self) -> Option<FoldHandles> {
+    let queries = self
+      .queries_rx
+      .blocking_lock()
+      .take()
+      .map(|rx| FoldQueries { rx });
+    let acks = self
+      .acks_rx
+      .blocking_lock()
+      .take()
+      .map(|rx| FoldAcks { rx });
+    Some(FoldHandles { queries: queries?, acks: acks? })
+  }
+}
+
+/// The fold's receive halves, taken once at boot by the fold task.
+pub struct FoldHandles {
+  pub queries: FoldQueries,
+  pub acks: FoldAcks,
+}
+
+/// Drain helper: `recv().await` / `try_recv()` on the taken receiver.
+pub struct FoldQueries {
+  pub(crate) rx: mpsc::Receiver<(
+    FoldQuery,
+    oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
+  )>,
+}
+
+/// The acked-emit receive half: pairs an event with the responder the fold
+/// completes after applying it.
+pub struct FoldAcks {
+  pub(crate) rx: mpsc::Receiver<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>,
+}
+impl FoldQueries {
+  pub async fn recv(
+    &mut self,
+  ) -> Option<(
+    FoldQuery,
+    oneshot::Sender<Result<FoldAnswer, SpineClosed>>,
+  )> {
+    self.rx.recv().await
+  }
+}
+
+/// Read the producer spine off `App` and emit one catalog event (ticket 15).
+///
+/// Producers run under their own locks; the spine handle lives on `App`
+/// (installed at boot), so emitting is lock-free. `None` in tests that never
+/// installed a spine: callers treat that as "fold absent, nothing to do".
+pub(crate) async fn emit_catalog_event(
+  app: &Arc<Mutex<App>>,
+  event: crate::core::catalog::CatalogStateEvent,
+) {
+  if let Some(spine) = app.lock().await.spine.as_ref() {
+    spine.emit(EngineEvent::Catalog(event)).await;
+  }
+}
+
+

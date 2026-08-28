@@ -611,6 +611,9 @@ pub(super) struct Services {
   /// channel; the frontend's fold task takes the receiving half.
   pub spine: crate::runtime::engine::Spine,
   pub spine_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::EngineEvent>,
+  /// The fold-query receive half: the fold task answers producer reads here
+  /// (ticket 16), replacing every lock-then-read outside the fold.
+  pub spine_queries: crate::runtime::engine::QueryReceiver,
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub user_config: UserConfig,
   /// Real-time position updates from the native player event handler;
@@ -766,13 +769,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // One spine for every producer: streaming (player events, recovery) plus
   // catalog (dispatchers, network layer). The fold task in `frontend` takes
   // the receiving half via Services.
-  let (spine_for_events, spine_rx) = crate::runtime::engine::Spine::open(Default::default());
-  {
-    let mut app_mut = app.lock().await;
-    app_mut.spine = Some(spine_for_events.clone());
-  }
-  // Catalog producers (all five dispatchers + the network layer) emit through
-  // the same spine; they read the handle off App under their existing lock.
+  let (spine_for_events, spine_rx, spine_queries) =
+    crate::runtime::engine::Spine::open(Default::default());
   {
     let mut app_mut = app.lock().await;
     app_mut.spine = Some(spine_for_events.clone());
@@ -1116,6 +1114,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   Ok(Services {
     spine: spine_for_events.clone(),
     spine_rx,
+    spine_queries,
     app,
     user_config,
     shared_position_for_ui,

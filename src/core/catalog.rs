@@ -15,7 +15,17 @@
 
 #![allow(dead_code)]
 
-use crate::core::plugin_api::TrackInfo;
+use crate::core::plugin_api::{PlayableInfo, TrackInfo};
+
+/// A selection snapshot for the playlist refresh flow (ticket 16 batch 2):
+/// which playlist, which folder, and the folder's display index. The fold
+/// carries these between the page-1 install and the background completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistSelection {
+  pub playlist_id: Option<String>,
+  pub folder_id: usize,
+  pub selected_index: Option<usize>,
+}
 use crate::core::source::Source;
 
 use crate::core::pagination::Paged;
@@ -61,12 +71,75 @@ pub enum CatalogStateEvent {
   /// Library pages landed in an owned cache (`upsert_page_by_offset` runs in
   /// the fold; the event carries everything needed to build one page).
   LibraryPageUpserted { section: LibrarySection },
+  /// The saved-tracks view was re-opened: drop cached pages, claimed
+  /// offsets, and visible rows; invalidate in-flight fetches (ticket 16
+  /// batch 2; the exact writes of the old `reset_saved_tracks_view`).
+  SavedTracksReset,
+  /// One saved-tracks page landed (ticket 16 batch 2). The fold upserts it
+  /// by offset, rebuilds the continuous visible table, merges the page's
+  /// liked-state ids, and drops the whole event when the cache epoch moved
+  /// since this fetch was stamped.
+  SavedTracksPageUpserted {
+    offset: u32,
+    total: u32,
+    limit: u32,
+    /// Spotify's next-page link, resolved to "there is a next page" (the
+    /// domain page carries the link but nothing reads its text).
+    next: Option<String>,
+    page: Vec<TrackInfo>,
+    /// Bare track ids from the page, merged into `liked_song_ids_set` by
+    /// the fold (the old inline `populate_liked_song_ids_from_saved_tracks`).
+    liked_ids_from_page: Vec<String>,
+    /// The cache epoch this fetch was stamped with at dispatch time.
+    generation: u64,
+  },
+  /// A local like/unlike landed: in-flight liked-state reads predating the
+  /// mutation re-read instead of clobbering it.
+  LikedEpochBumped,
+  /// A saved-albums page landed (index-keyed cache; `None` = empty page —
+  /// the completion bump still fires, plugin data waits on it).
+  SavedAlbumsPageUpserted {
+    page: Option<crate::core::pagination::Paged<crate::core::plugin_api::SavedAlbumInfo>>,
+  },
+  /// A saved-shows page landed (same completion contract as albums).
+  SavedShowsPageUpserted {
+    page: Option<crate::core::pagination::Paged<crate::core::plugin_api::ShowInfo>>,
+  },
+  /// A saved-albums page landed (same completion contract as albums).
+  SavedArtistsPageUpserted {
+    page: Option<crate::core::pagination::CursorPaged<crate::core::plugin_api::ArtistInfo>>,
+  },
+  /// Merge membership changes into one of the saved-id sets (contains
+  /// responses and optimistic add/remove outcomes).
+  SavedSetMerged {
+    kind: SavedSetKind,
+    saved_ids: Vec<String>,
+    unsaved_ids: Vec<String>,
+  },
+  /// A playlist's track pages landed (offset-keyed cache), with everything
+  /// the fold needs to rebuild the visible table: the owning playlist id
+  /// (staleness), the upserted page, and the liked-state ids the old inline
+  /// path dispatched a contains-check for.
+  PlaylistTracksPageUpserted {
+    playlist_id: String,
+    page: crate::core::pagination::Paged<(u32, PlayableInfo)>,
+    track_ids_for_like_check: Vec<String>,
+  },
 }
 
 /// Which library cache a page belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibrarySection {
   SavedTracks { offset: u32 },
+}
+
+/// Which saved-id set a membership merge applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedSetKind {
+  LikedTracks,
+  FollowedArtists,
+  Albums,
+  Shows,
 }
 
 /// Authoritative catalog facts folded in stream order.

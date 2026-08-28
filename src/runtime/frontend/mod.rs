@@ -113,6 +113,17 @@ impl Options {
 
 use super::engine::{Changed, EngineCommand, EngineEvent, Spine};
 
+use crate::core::app::App;
+use crate::core::catalog::PlaylistSelection;
+#[cfg(feature = "streaming")]
+use crate::infra::network::library::structurize_playlist_folders;
+use crate::infra::network::library::{
+  build_flat_playlist_items, maybe_prompt_community_pin, reconcile_playlist_selection,
+};
+use crate::core::catalog::CatalogStateEvent;
+use crate::infra::network::IoEvent;
+use crate::runtime::engine::{FoldAck, PlaylistRefreshPrevious};
+
 pub use super::engine::EngineCommand as FrontendEngineCommand;
 
 /// An embedded Spotatui runtime: shared service startup, the driver loop on
@@ -136,7 +147,6 @@ pub struct Runtime {
   tick_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
-use crate::core::app::App;
 
 impl Runtime {
   /// Boot the runtime synchronously. Runs the full shared bootstrap
@@ -177,6 +187,9 @@ impl Runtime {
     // The event spine is opened by `start_services` so every producer shares
     // one channel; this side receives events, the fold reduces them.
     let events_rx = services.spine_rx;
+    // The fold also answers producer queries (ticket 16): claim/release,
+    // staleness checks, and the small read set detached workers need.
+    let folds = services.spine_queries.take();
     // The frontend's own spine handle for command-side pokes: on streaming
     // legs the command path reuses the shared producer spine so ordering with
     // player events is preserved.
@@ -190,7 +203,7 @@ impl Runtime {
       let app = Arc::clone(&app);
       let tx = snapshot_tx.clone();
       rt.spawn(async move {
-        fold_loop(app, tx, events_rx).await;
+        fold_loop(app, tx, events_rx, folds).await;
       });
     }
     // Legacy-bell wake: `apply`, the pump, and remaining direct writers ring
@@ -486,13 +499,45 @@ impl Default for Snapshot {
 /// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
 /// writer of published state. Typed streaming events are reduced through the
 /// domain before the snapshot rebuild; coarse `StateChanged` pokes just
-/// trigger a rebuild.
+/// trigger a rebuild. Session facts (ticket 16) replay the exact old handler
+/// code under the fold's lock; producer queries are answered here too, so no
+/// producer outside this task ever locks `App`.
 async fn fold_loop(
   app: Arc<Mutex<App>>,
   tx: watch::Sender<Snapshot>,
   mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
+  folds: Option<crate::runtime::engine::FoldHandles>,
 ) {
+  let (mut queries, mut acks) = match folds {
+    Some(handles) => (Some(handles.queries), Some(handles.acks)),
+    None => (None, None),
+  };
   loop {
+    // Answer any producer query that arrived since the last event before
+    // (possibly) blocking on the next one: the query loop is driven by
+    // event arrivals, so a quiet spine with a pending query still answers.
+    if let Some(queries) = queries.as_mut() {
+      while let Ok((query, responder)) = queries.rx.try_recv() {
+        let answer = {
+          let mut guard = app.lock().await;
+          answer_query(&mut guard, query)
+        };
+        let _ = responder.send(Ok(answer));
+      }
+    }
+    // Apply any acked event the same way: fold it, then complete the
+    // responder with the post-fold facts (stream order is queue order, so
+    // the answer reflects every event queued before it).
+    if let Some(acks) = acks.as_mut() {
+      while let Ok((event, responder)) = acks.rx.try_recv() {
+        let ack = {
+          let mut guard = app.lock().await;
+          apply_acked(&mut guard, &event)
+        };
+        let _ = responder.send(ack);
+        publish(&app, &tx).await;
+      }
+    }
     let event = tokio::select! {
       event = events_rx.recv() => match event {
         Some(event) => event,
@@ -516,21 +561,560 @@ async fn fold_loop(
         let mut app = app.lock().await;
         crate::core::apply_catalog_state(&mut app, catalog);
       }
+      EngineEvent::Session(fact) => {
+        let mut app = app.lock().await;
+        apply_session_fact(&mut app, fact.clone());
+      }
       EngineEvent::StateChanged(_) => {}
     }
-    let guard = app.lock().await;
-    let next = build_snapshot(&guard);
-    drop(guard);
-    tx.send_if_modified(|current| {
-      if *current == next {
-        false
-      } else {
-        *current = next;
-        true
-      }
-    });
+    publish(&app, &tx).await;
     if tx.is_closed() {
       break;
+    }
+  }
+}
+
+/// Rebuild the snapshot and equality-dedup the publication.
+async fn publish(app: &Arc<Mutex<App>>, tx: &watch::Sender<Snapshot>) {
+  let guard = app.lock().await;
+  let next = build_snapshot(&guard);
+  drop(guard);
+  tx.send_if_modified(|current| {
+    if *current == next {
+      false
+    } else {
+      *current = next;
+      true
+    }
+  });
+}
+fn apply_acked(app: &mut App, event: &EngineEvent) -> Option<FoldAck> {
+  match event {
+    EngineEvent::Catalog(CatalogStateEvent::SavedTracksPageUpserted { .. }) => {
+      let outcome = crate::core::apply_catalog_state(app, event_catalog(event));
+      Some(FoldAck {
+        next_saved_tracks_offset: if outcome.stale_event_dropped {
+          None
+        } else {
+          app.next_missing_saved_tracks_offset_continuous()
+        },
+        next_playlist_tracks_offset: None,
+      })
+    }
+    EngineEvent::Catalog(CatalogStateEvent::PlaylistTracksPageUpserted { .. }) => {
+      let outcome = crate::core::apply_catalog_state(app, event_catalog(event));
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: if outcome.stale_event_dropped {
+          None
+        } else {
+          app.next_missing_playlist_tracks_offset_continuous()
+        },
+      })
+    }
+    _ => {
+      // Only catalog upserts carry post-fold facts today; other acked
+      // events fold normally and answer the default ack.
+      fold_one(app, event);
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+      })
+    }
+  }
+}
+
+/// Fold-side publisher for a completed playlist refresh (ticket 16 batch 2):
+/// generation check, folder structure, selection reconcile, community-pin
+/// prompt — the whole write section the old detached task locked for.
+fn publish_playlist_refresh(
+  app: &mut App,
+  generation: u64,
+  playlists: Vec<crate::core::plugin_api::PlaylistInfo>,
+  original_selection: PlaylistSelection,
+  pagination_error: Option<String>,
+  folder_nodes: crate::runtime::engine::FolderNodes,
+) {
+  if app.playlist_refresh_generation != generation {
+    return;
+  }
+  if let Some(error) = pagination_error {
+    log::warn!("playlist refresh incomplete: {error}");
+    if !app.all_playlists.is_empty() {
+      // The fold snapshotted nothing extra here: the visible list *is* the
+      // previous complete list (page 1 replaced it only when safe), so
+      // restoring means reconciling the selection against it.
+      reconcile_playlist_selection(
+        app,
+        original_selection.playlist_id.as_deref(),
+        original_selection.folder_id,
+        original_selection.selected_index,
+      );
+    }
+    app.set_status_message("Playlist refresh incomplete; kept the previous list.", 8);
+    return;
+  }
+
+  let folder_items = build_folder_items(app, &playlists, folder_nodes);
+
+  app.all_playlists = playlists;
+  app
+    .plugin_data_generations
+    .bump(crate::core::app::PluginDataKind::Playlists);
+  app.playlist_folder_items = folder_items;
+
+  reconcile_playlist_selection(
+    app,
+    original_selection.playlist_id.as_deref(),
+    original_selection.folder_id,
+    original_selection.selected_index,
+  );
+
+  maybe_prompt_community_pin(app);
+}
+
+/// Derive the sidebar folder items: from the fetched rootlist tree when one
+/// arrived, otherwise a flat list. On a pagination failure the previous
+/// nodes stay in place (nothing is written).
+#[cfg(feature = "streaming")]
+fn build_folder_items(
+  app: &mut App,
+  playlists: &[crate::core::plugin_api::PlaylistInfo],
+  folder_nodes: crate::runtime::engine::FolderNodes,
+) -> Vec<crate::core::app::PlaylistFolderItem> {
+  if let Some(nodes) = folder_nodes {
+    app._playlist_folder_nodes = Some(nodes.clone());
+    return structurize_playlist_folders(&nodes, playlists);
+  }
+  build_flat_playlist_items(playlists)
+}
+
+#[cfg(not(feature = "streaming"))]
+fn build_folder_items(
+  _app: &mut App,
+  playlists: &[crate::core::plugin_api::PlaylistInfo],
+  _folder_nodes: crate::runtime::engine::FolderNodes,
+) -> Vec<crate::core::app::PlaylistFolderItem> {
+  build_flat_playlist_items(playlists)
+}
+/// Rebuild a `&CatalogStateEvent` reference from an owned event match arm.
+fn event_catalog(event: &EngineEvent) -> &CatalogStateEvent {
+  match event {
+    EngineEvent::Catalog(catalog) => catalog,
+    _ => unreachable!("apply_acked only passes catalog events here"),
+  }
+}
+
+/// Fold one event without publishing (shared by the acked and plain paths).
+fn fold_one(app: &mut App, event: &EngineEvent) {
+  match event {
+    EngineEvent::Streaming(streaming) => {
+      #[cfg(feature = "streaming")]
+      {
+        app.apply_streaming_state(streaming.clone());
+      }
+      #[cfg(not(feature = "streaming"))]
+      {
+        let _ = streaming;
+      }
+    }
+    EngineEvent::Catalog(catalog) => {
+      crate::core::apply_catalog_state(app, catalog);
+    }
+    EngineEvent::Session(fact) => apply_session_fact(app, fact.clone()),
+    EngineEvent::StateChanged(_) => {}
+  }
+}
+
+/// The fold's reducer for session facts (ticket 16). Byte-for-byte parity
+/// with the inline writes each producer used to make under the App lock.
+pub(crate) fn apply_session_fact(
+  app: &mut App,
+  fact: crate::runtime::engine::SessionFact,
+) {
+  use crate::runtime::engine::{PostConnectFetch, SessionFact};
+  match fact {
+    SessionFact::Auth {
+      transition,
+      new_expiry,
+      post_connect_fetches,
+    } => {
+      let changed = app.auth_state.transition(transition, new_expiry);
+      if changed {
+        app.change_notify.notify_one();
+      }
+      // Legacy mirrors (deleted with App itself in ticket 18).
+      app.spotify_token_expiry = app.auth_state.token_expiry;
+      app.auth_refresh_in_progress = app.auth_state.refresh_in_progress;
+      app.spotify_connected = app.auth_state.connected;
+      for fetch in post_connect_fetches {
+        app.dispatch(match fetch {
+          PostConnectFetch::User => IoEvent::GetUser,
+          PostConnectFetch::Playlists => IoEvent::GetPlaylists,
+          PostConnectFetch::CurrentPlayback => IoEvent::GetCurrentPlayback,
+        });
+      }
+    }
+    SessionFact::Status {
+      message,
+      ttl_secs,
+      is_error,
+    } => {
+      if is_error {
+        app.set_error_status_message(message, ttl_secs);
+      } else {
+        app.set_status_message(message, ttl_secs);
+      }
+    }
+    SessionFact::LoadingCleared => {
+      app.is_loading = false;
+      app.search_loading = false;
+    }
+    SessionFact::AuthMirrors {
+      token_expiry,
+      refresh_in_progress,
+      connected,
+    } => {
+      app.spotify_token_expiry = token_expiry;
+      app.auth_refresh_in_progress = refresh_in_progress;
+      app.spotify_connected = connected;
+    }
+    SessionFact::Error(message) => {
+      app.handle_error(anyhow::anyhow!(message));
+    }
+    SessionFact::ClearPendingPlaylistOpen(id) => {
+      if id.as_deref().is_none_or(|wanted| {
+        app
+          .pending_playlist_open
+          .as_deref()
+          .is_some_and(|current| current == wanted)
+      }) {
+        app.pending_playlist_open = None;
+      }
+    }
+    SessionFact::DispatchPlaylistRefresh => {
+      app.dispatch(IoEvent::GetPlaylists);
+    }
+  }
+}
+
+/// Answer one producer query against the fold's authoritative state
+/// (ticket 16). Runs under the fold's lock; pure reads plus the one
+/// claim-style RMW (`ClaimLibraryOffset`) whose atomicity is the point.
+/// Takes `&mut App` because the claim and generation queries mutate the
+/// fold-owned bookkeeping — which is exactly the single-writer contract.
+pub(crate) fn answer_query(
+  app: &mut App,
+  query: crate::runtime::engine::FoldQuery,
+) -> crate::runtime::engine::FoldAnswer {
+  use crate::core::catalog::LibrarySection;
+  use crate::runtime::engine::{FoldAnswer, FoldQuery};
+  match query {
+    FoldQuery::LibraryRequestLive { generation, .. } => {
+      FoldAnswer::Bool(app.saved_tracks_prefetch_generation == generation)
+    }
+    FoldQuery::ClaimLibraryOffset { section, .. } => {
+      let claimed = match section {
+        LibrarySection::SavedTracks { offset } => {
+          app.saved_tracks_prefetch_in_flight.insert(offset)
+        }
+      };
+      FoldAnswer::Bool(claimed)
+    }
+    FoldQuery::ReleaseLibraryOffset { section } => {
+      let LibrarySection::SavedTracks { offset } = section;
+      app.saved_tracks_prefetch_in_flight.remove(&offset);
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::NextLibraryOffset { section } => {
+      let offset = match section {
+        LibrarySection::SavedTracks { .. } => app.next_missing_saved_tracks_offset_continuous(),
+      };
+      FoldAnswer::Offset(offset)
+    }
+    FoldQuery::LikedState { ids } => FoldAnswer::Liked(
+      ids
+        .iter()
+        .map(|id| app.liked_song_ids_set.contains(id))
+        .collect(),
+    ),
+    FoldQuery::UserId => {
+      FoldAnswer::User(app.user.as_ref().map(|user| user.id.clone()))
+    }
+    FoldQuery::PlaylistTrackTableActive { playlist_id } => {
+      let active = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
+        .ok()
+        .map(|id| id.into_static())
+        .is_some_and(|id| app.is_playlist_track_table_active_for(&id));
+      FoldAnswer::Bool(active)
+    }
+    FoldQuery::PlaylistRefreshLive { generation } => {
+      FoldAnswer::Bool(app.playlist_refresh_generation == generation)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::StreamingPlayerHandle => {
+      FoldAnswer::StreamingPlayer(app.streaming_player.clone())
+    }
+    FoldQuery::PublishPlaylistRefresh {
+      generation,
+      playlists,
+      original_selection,
+      pagination_error,
+      folder_nodes,
+    } => {
+      publish_playlist_refresh(
+        app,
+        generation,
+        playlists,
+        original_selection,
+        pagination_error,
+        folder_nodes,
+      );
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::RegisterPlaylistRefresh {
+      first_page,
+      first_items,
+    } => {
+      let original_selection = PlaylistSelection {
+        playlist_id: app.get_selected_playlist_id(),
+        folder_id: app.current_playlist_folder_id,
+        selected_index: None,
+      };
+      let had_previous_complete = !app.all_playlists.is_empty();
+      // Snapshot the existing complete list only when background pagination
+      // can fail partway and there is something worth restoring.
+      let previous_complete = if had_previous_complete {
+        PlaylistRefreshPrevious {
+          playlists: app.all_playlists.clone(),
+          folder_nodes: app._playlist_folder_nodes.clone(),
+          folder_items: app.playlist_folder_items.clone(),
+        }
+      } else {
+        PlaylistRefreshPrevious::default()
+      };
+      app.playlist_refresh_generation = app.playlist_refresh_generation.wrapping_add(1);
+      app.playlists = Some(first_page);
+      let selected_is_in_first_page = original_selection.playlist_id.as_ref().is_some_and(
+        |selected| first_items.iter().any(|p| p.id.as_deref() == Some(selected.as_str())),
+      );
+      if !had_previous_complete || original_selection.playlist_id.is_none() || selected_is_in_first_page
+      {
+        app.all_playlists = first_items.clone();
+        app
+          .plugin_data_generations
+          .bump(crate::core::app::PluginDataKind::Playlists);
+        app.playlist_folder_items = build_flat_playlist_items(&first_items);
+        reconcile_playlist_selection(
+          app,
+          original_selection.playlist_id.as_deref(),
+          original_selection.folder_id,
+          original_selection.selected_index,
+        );
+      }
+      let page_one_selection = PlaylistSelection {
+        playlist_id: app.get_selected_playlist_id(),
+        folder_id: app.current_playlist_folder_id,
+        selected_index: None,
+      };
+      FoldAnswer::PlaylistRefreshRegistered {
+        generation: app.playlist_refresh_generation,
+        original_selection,
+        page_one_selection,
+        previous_complete,
+      }
+    }
+    FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
+      app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),
+    ),
+    FoldQuery::SavedTracksGeneration => {
+      FoldAnswer::U64(app.saved_tracks_prefetch_generation)
+    }
+    FoldQuery::SpotifyConnected => FoldAnswer::Bool(app.spotify_connected),
+    FoldQuery::ReleasePlaylistTracksPage {
+      playlist_id,
+      offset,
+    } => {
+      app.playlist_tracks_prefetch_in_flight.remove(&offset);
+      if app.pending_playlist_open.as_deref() == Some(playlist_id.as_str()) {
+        app.pending_playlist_open = None;
+      }
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::ClearPlaylistTrackFilter => {
+      app.clear_playlist_track_filter();
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::PlaylistTrackSearchApplied {
+      playlist_id,
+      query,
+      matches,
+    } => {
+      let applied = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
+        .ok()
+        .map(|id| id.into_static())
+        .is_some_and(|id| app.apply_playlist_track_search_results(&id, query.clone(), matches));
+      if !applied {
+        app.pending_playlist_track_search = None;
+      }
+      FoldAnswer::Bool(applied)
+    }
+    FoldQuery::ClearPendingPlaylistTrackSearch => {
+      app.pending_playlist_track_search = None;
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::PlaylistTrackAdded { playlist_id } => {
+      let playlist_name = app
+        .all_playlists
+        .iter()
+        .find(|playlist| playlist.id.as_deref() == Some(playlist_id.as_str()))
+        .map(|playlist| playlist.name.clone());
+
+      if rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
+        .ok()
+        .map(|id| id.into_static())
+        .is_some_and(|id| app.is_current_route_playlist_track_table_for(&id))
+      {
+        let playlist_offset = app.playlist_offset;
+        app.dispatch(IoEvent::GetPlaylistItems(playlist_id, playlist_offset));
+      }
+
+      FoldAnswer::StatusText(
+        playlist_name
+          .map(|name| format!("Added to {name}"))
+          .unwrap_or_else(|| "Added to playlist".to_string()),
+      )
+    }
+    FoldQuery::OpenSavedTracksView => {
+      // The liked-songs view re-opened: the reset is the fold's business
+      // (same writes as the SavedTracksReset event reducer).
+      crate::core::apply_catalog_state(
+        app,
+        &crate::core::catalog::CatalogStateEvent::SavedTracksReset,
+      );
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::MergeLikedState { ids, is_saved } => {
+      for (i, id) in ids.iter().enumerate() {
+        match is_saved.get(i) {
+          Some(true) => {
+            app.liked_song_ids_set.insert(id.clone());
+          }
+          Some(false) => {
+            app.liked_song_ids_set.remove(id);
+          }
+          None => {}
+        }
+      }
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::ClaimLikedLookupBatch => {
+      if app.liked_lookup_pending.is_empty() {
+        app.liked_lookup_worker_running = false;
+        return FoldAnswer::LikedBatch(None);
+      }
+      let batch: Vec<String> = app
+        .liked_lookup_pending
+        .iter()
+        .take(40)
+        .cloned()
+        .collect();
+      for id in &batch {
+        app.liked_lookup_pending.remove(id);
+      }
+      FoldAnswer::LikedBatch(Some((batch, app.liked_state_epoch)))
+    }
+    FoldQuery::ApplyLikedLookup {
+      epoch,
+      batch,
+      is_saved,
+    } => {
+      if app.liked_state_epoch != epoch {
+        // A local like/unlike landed while this read was in flight; the
+        // response may predate it, so re-read instead of applying it.
+        app.liked_lookup_pending.extend(batch);
+      } else {
+        for (i, id) in batch.into_iter().enumerate() {
+          match is_saved.get(i) {
+            Some(true) => {
+              app.liked_song_ids_set.insert(id);
+            }
+            Some(false) => {
+              app.liked_song_ids_set.remove(&id);
+            }
+            None => {}
+          }
+        }
+      }
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::RependLikedLookup { batch } => {
+      app.liked_lookup_pending.extend(batch);
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::StopLikedLookupWorker => {
+      app.liked_lookup_worker_running = false;
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::ReleasePlaylistSortFetch { playlist_id } => {
+      app.playlist_sort_fetch_in_flight.remove(&playlist_id);
+      FoldAnswer::Bool(true)
+    }
+    FoldQuery::ClaimPlaylistSortFetch { playlist_id } => {
+      FoldAnswer::Bool(app.playlist_sort_fetch_in_flight.insert(playlist_id))
+    }
+    FoldQuery::EnqueueLikedLookup { ids } => {
+      for id in &ids {
+        app.liked_lookup_pending.insert(id.clone());
+      }
+      if app.liked_lookup_pending.is_empty() || app.liked_lookup_worker_running {
+        FoldAnswer::Bool(false)
+      } else {
+        app.liked_lookup_worker_running = true;
+        FoldAnswer::Bool(true)
+      }
+    }
+    FoldQuery::ApplySortedPlaylistTracks {
+      playlist_id,
+      tracks,
+    } => {
+      app.playlist_sort_fetch_in_flight.remove(&playlist_id);
+      use crate::core::sort::Sorter;
+      let sort_state = app.playlist_sort;
+      let sorter = Sorter::new(sort_state);
+      let mut tracks = tracks;
+      sorter.sort_tracks(&mut tracks);
+      let applied = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
+        .ok()
+        .map(|id| id.into_static())
+        .is_some_and(|id| app.apply_sorted_playlist_tracks_if_current(&id, tracks));
+      FoldAnswer::Bool(applied)
+    }
+    FoldQuery::ClaimPlaylistTracksOffset {
+      playlist_id,
+      offset,
+    } => {
+      let claimed = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
+        .ok()
+        .map(|id| id.into_static())
+        .is_some_and(|id| {
+          app.playlist_tracks_prefetch_generation == app.playlist_tracks_prefetch_generation
+            && app.is_playlist_track_table_active_for(&id)
+        })
+        && !app
+          .playlist_tracks_prefetch_in_flight
+          .contains(&offset)
+        && app
+          .playlist_tracks_prefetch_in_flight
+          .insert(offset);
+      FoldAnswer::Bool(claimed)
+    }
+    FoldQuery::ReleasePlaylistTracksOffset {
+      playlist_id: _,
+      offset,
+    } => {
+      app.playlist_tracks_prefetch_in_flight.remove(&offset);
+      FoldAnswer::Bool(true)
     }
   }
 }

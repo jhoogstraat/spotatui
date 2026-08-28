@@ -19,6 +19,8 @@ use crate::core::auth;
 use crate::core::config::ClientConfig;
 use crate::core::plugin_api::{ShowInfo, TrackInfo};
 use crate::infra::redirect_uri::redirect_uri_web_server_async;
+use crate::runtime::engine::{EngineEvent, FoldAnswer, FoldQuery};
+use crate::runtime::engine::{PostConnectFetch, SessionFact};
 use anyhow::anyhow;
 use rspotify::model::{
   album::SimplifiedAlbum,
@@ -349,6 +351,10 @@ pub struct Network {
   pub small_search_limit: u32,
   pub client_config: ClientConfig,
   pub app: Arc<Mutex<App>>,
+  /// The engine spine handle (ticket 16): handlers emit result events here
+  /// instead of writing App fields. Populated by `start_services`; tests
+  /// without a fold leave it `None` and handlers skip emitting.
+  pub spine: Option<crate::runtime::engine::Spine>,
   #[cfg(feature = "streaming")]
   native_idle_recovery: playback::NativeIdleRecoveryState,
   pub party_connection: Option<sync::PartyConnection>,
@@ -383,6 +389,7 @@ impl Network {
       small_search_limit: 4,
       client_config,
       app: Arc::clone(app),
+      spine: None,
       native_idle_recovery: playback::NativeIdleRecoveryState::default(),
       party_connection: None,
       party_incoming_rx: None,
@@ -408,6 +415,7 @@ impl Network {
       small_search_limit: 4,
       client_config,
       app: Arc::clone(app),
+      spine: None,
       party_connection: None,
       party_incoming_rx: None,
       token_cache_path,
@@ -539,38 +547,38 @@ impl Network {
       IoEvent::GetPlaylistItems(id, _) => Some(id.clone()),
       _ => None,
     };
-    // Events whose handlers never touch the Spotify client run regardless of
-    // whether a Spotify session exists (see `event_bypasses_spotify_auth`).
-    // Everything else is Spotify-bound: when launched against a free source with
-    // no Spotify session, point the user at the in-TUI login path instead of
-    // failing loudly; otherwise ensure the token is fresh before proceeding.
+    // Ticket 16: the auth gate reads fold-published state, not bare fields.
+    // A session check goes through the fold query; the reject path emits
+    // facts instead of writing App fields.
     let bypass_auth = Self::event_bypasses_spotify_auth(&io_event);
 
     if !bypass_auth {
-      if self.spotify.is_none() {
+      // The fold's published connected state is the gate when a fold is
+      // live; a failed query (no fold: CLI, tests) falls back to client
+      // presence, which is what the pre-fold gate keyed on.
+      let connected = if let Some(spine) = self.spine.as_ref() {
+        match spine.query(FoldQuery::SpotifyConnected).await {
+          Ok(FoldAnswer::Bool(connected)) => connected,
+          _ => self.spotify.is_some(),
+        }
+      } else {
+        self.spotify.is_some()
+      };
+      if !connected {
         self
-          .show_status_message(
+          .emit_status(
             "Spotify not connected. Press `d` and pick Spotify to log in.".to_string(),
             6,
           )
           .await;
-        let mut app = self.app.lock().await;
-        app.is_loading = false;
-        app.search_loading = false;
-        if pending_playlist_id
-          .as_deref()
-          .is_some_and(|id| app.pending_playlist_open.as_deref() == Some(id))
-        {
-          app.pending_playlist_open = None;
-        }
+        self.emit_loading_cleared(&pending_playlist_id).await;
         return;
       }
       if !self.ensure_authentication_fresh(false).await {
         if let Some(id) = pending_playlist_id.as_deref() {
-          let mut app = self.app.lock().await;
-          if app.pending_playlist_open.as_deref() == Some(id) {
-            app.pending_playlist_open = None;
-          }
+          self
+            .emit_session(SessionFact::ClearPendingPlaylistOpen(Some(id.to_string())))
+            .await;
         }
         return;
       }
@@ -964,15 +972,57 @@ impl Network {
     };
 
     {
-      let mut app = self.app.lock().await;
-      app.is_loading = false;
-      app.search_loading = false;
+      // Ticket 16: the end-of-handler reset is a fact; the fold clears the
+      // spinners (it owns `is_loading`/`search_loading` from here on).
+      self.emit_session(SessionFact::LoadingCleared).await;
     }
   }
 
+  /// Emit one session fact through the spine (no-op without a fold, i.e.
+  /// in tests that never installed one).
+  async fn emit_session(&self, fact: SessionFact) {
+    if let Some(spine) = self.spine.as_ref() {
+      spine.emit(EngineEvent::Session(fact)).await;
+    }
+  }
+
+  /// Emit a status notice (the old `show_status_message`, now a fact; the
+  /// fold scales the TTL by the user config exactly as the old inline write
+  /// did through `App::set_status_message`).
+  async fn emit_status(&self, message: String, ttl_secs: u64) {
+    self
+      .emit_session(SessionFact::Status {
+        message,
+        ttl_secs,
+        is_error: false,
+      })
+      .await;
+  }
+
+  /// The post-handler spinner clear, plus the conditional
+  /// `pending_playlist_open` clear the auth-gate reject paths did.
+  async fn emit_loading_cleared(&self, pending_playlist_id: &Option<String>) {
+    if let Some(id) = pending_playlist_id {
+      self
+        .emit_session(SessionFact::ClearPendingPlaylistOpen(Some(id.clone())))
+        .await;
+    }
+    self
+      .emit_session(SessionFact::LoadingCleared)
+      .await;
+  }
+
+  /// Route a handler failure through the fold as a fact (the old inline
+  /// `self.handle_error(e)` lock site).
+  async fn emit_error(&self, e: anyhow::Error) {
+    self
+      .emit_session(SessionFact::Error(format!("{e:#}")))
+      .await;
+  }
+
   async fn handle_error(&mut self, e: anyhow::Error) {
-    let mut app = self.app.lock().await;
-    app.handle_error(e);
+    // Ticket 16: the error page hint + TTL flows through the fold.
+    self.emit_error(e).await;
   }
 
   /// Aggregate local listening history for the Stats screen. Reads the
@@ -1047,12 +1097,9 @@ impl Network {
   }
 
   async fn show_status_message(&self, message: String, ttl_secs: u64) {
-    let mut app = self.app.lock().await;
-    // Scale by status_message_ttl_percent, matching App::set_status_message.
-    let pct = app.user_config.behavior.status_message_ttl_percent as u64;
-    let ttl = ((ttl_secs * pct + 50) / 100).max(1);
-    app.status_message = Some(message);
-    app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(ttl));
+    // Ticket 16: the TTL scaling happened under the lock before; the fold
+    // now does it through the same `App::set_status_message` sink.
+    self.emit_status(message, ttl_secs).await;
   }
 
   async fn refresh_authentication(&mut self) {
@@ -1061,40 +1108,49 @@ impl Network {
 
   async fn ensure_authentication_fresh(&mut self, force: bool) -> bool {
     // No Spotify session (free-source launch): there is no token to refresh.
-    // Spotify-bound events never reach here in that state because the auth gate
-    // in `handle_network_event` rejects them first; the only caller that can hit
-    // this branch is `RefreshAuthentication`, for which a no-op is correct.
+    // Spotify-bound events never reach here in that state because the auth
+    // gate in `handle_network_event` rejects them first; the only caller that
+    // can hit this branch is `RefreshAuthentication`, for which a no-op is
+    // correct.
     let Some(spotify) = self.spotify.as_ref() else {
-      let mut app = self.app.lock().await;
-      app.auth_refresh_in_progress = false;
+      self
+        .emit_session(SessionFact::AuthMirrors {
+          token_expiry: None,
+          refresh_in_progress: false,
+          connected: false,
+        })
+        .await;
       return false;
     };
     match auth::refresh_token_and_cache(spotify, &self.token_cache_path, force).await {
       Ok(expiry) => {
-        let mut app = self.app.lock().await;
-        let changed = app
-          .auth_state
-          .transition(auth::AuthTransition::TokenRefreshed, Some(expiry));
-        if changed {
-          app.change_notify.notify_one();
-        }
-        // Legacy mirrors (deleted with App itself in ticket 11).
-        app.spotify_token_expiry = app.auth_state.token_expiry;
-        app.auth_refresh_in_progress = app.auth_state.refresh_in_progress;
+        self
+          .emit_session(SessionFact::Auth {
+            transition: auth::AuthTransition::TokenRefreshed,
+            new_expiry: Some(expiry),
+            post_connect_fetches: Vec::new(),
+          })
+          .await;
         true
       }
       Err(e) => {
-        {
-          let mut app = self.app.lock().await;
-          app.auth_refresh_in_progress = false;
-          app.is_loading = false;
-        }
+        self
+          .emit_session(SessionFact::AuthMirrors {
+            token_expiry: None,
+            refresh_in_progress: false,
+            connected: true,
+          })
+          .await;
+        // The old inline path cleared the spinner alongside the mirrors;
+        // keep that pairing so a failed gate never leaves it stuck.
+        self
+          .emit_session(SessionFact::LoadingCleared)
+          .await;
         self.handle_error(anyhow!(e)).await;
         false
       }
     }
   }
-
   /// Start an in-TUI Spotify OAuth login: build the PKCE client, open the browser,
   /// and spawn a callback server that reports back via `CompleteSpotifyLogin`
   /// (or `CancelSpotifyLogin` on timeout/failure). Non-blocking: the UI keeps
@@ -1217,24 +1273,22 @@ impl Network {
 
     self.spotify = Some(spotify);
     self.token_cache_path = token_cache_path;
-    {
-      let mut app = self.app.lock().await;
-      let changed = app
-        .auth_state
-        .transition(auth::AuthTransition::Connected, expiry);
-      if changed {
-        app.change_notify.notify_one();
-      }
-      // Legacy mirrors (deleted with App itself in ticket 11).
-      app.spotify_token_expiry = expiry;
-      app.spotify_connected = true;
-      // Load Spotify data now that a session exists.
-      app.dispatch(IoEvent::GetUser);
-      app.dispatch(IoEvent::GetPlaylists);
-      app.dispatch(IoEvent::GetCurrentPlayback);
-    }
+    // Ticket 16: connect is a fact. The fold transitions the auth domain,
+    // syncs the mirrors, and dispatches the post-connect fetches — the
+    // exact sequence the old single lock section ran.
     self
-      .show_status_message(
+      .emit_session(SessionFact::Auth {
+        transition: auth::AuthTransition::Connected,
+        new_expiry: expiry,
+        post_connect_fetches: vec![
+          PostConnectFetch::User,
+          PostConnectFetch::Playlists,
+          PostConnectFetch::CurrentPlayback,
+        ],
+      })
+      .await;
+    self
+      .emit_status(
         "Spotify connected. Restart spotatui to enable native playback.".to_string(),
         10,
       )
@@ -1772,13 +1826,28 @@ mod tests {
       app.auth_refresh_in_progress = true;
     }
 
+    // Ticket 16: the handler emits facts; the fold reduces them. The test
+    // plays the fold: install the spine, run the handler, then drain the
+    // events through the same reducer the fold task uses.
+    // The trailing `_` (not a named binding) drops the query receiver at
+    // once, so a producer query fails fast with `SpineClosed` — there is no
+    // fold task here to answer it.
+    let (spine, mut events_rx, _) = crate::runtime::engine::Spine::open(Default::default());
     let mut network = Network::new(
       Some(spotify),
       ClientConfig::new(),
       &app,
       token_cache_path.clone(),
     );
+    network.spine = Some(spine);
     network.handle_network_event(IoEvent::GetUser).await;
+
+    while let Ok(event) = events_rx.try_recv() {
+      if let crate::runtime::engine::EngineEvent::Session(fact) = event {
+        let mut guard = app.lock().await;
+        crate::runtime::frontend::apply_session_fact(&mut guard, fact);
+      }
+    }
 
     let app = app.lock().await;
     assert!(!app.is_loading);
@@ -1796,11 +1865,22 @@ mod tests {
       Some(SystemTime::now()),
     )));
     app.lock().await.pending_playlist_open = Some("playlist-id".to_string());
+    // Same as above: drop the query receiver so queries fail fast.
+    let (spine, mut events_rx, _) = crate::runtime::engine::Spine::open(Default::default());
     let mut network = Network::new(None, ClientConfig::new(), &app, temp_token_cache_path());
+    network.spine = Some(spine);
 
     network
       .handle_network_event(IoEvent::GetPlaylistItems("playlist-id".to_string(), 0))
       .await;
+
+    // Fold half: reduce what the gate emitted.
+    while let Ok(event) = events_rx.try_recv() {
+      if let crate::runtime::engine::EngineEvent::Session(fact) = event {
+        let mut guard = app.lock().await;
+        crate::runtime::frontend::apply_session_fact(&mut guard, fact);
+      }
+    }
 
     assert!(app.lock().await.pending_playlist_open.is_none());
   }

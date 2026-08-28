@@ -190,7 +190,6 @@ pub async fn spotify_api_request_json_for_with_refresh(
   query: &[(&str, String)],
   body: Option<Value>,
   token_cache_path: &Path,
-  app: &Arc<Mutex<App>>,
 ) -> anyhow::Result<Value> {
   spotify_api_request_json_for_base_with_refresh(
     spotify,
@@ -202,20 +201,12 @@ pub async fn spotify_api_request_json_for_with_refresh(
       body,
     },
     |force| async move {
-      match auth::refresh_token_and_cache(spotify, token_cache_path, force).await {
-        Ok(expiry) => {
-          let mut app = app.lock().await;
-          app.spotify_token_expiry = Some(expiry);
-          app.auth_refresh_in_progress = false;
-          Ok(Some(expiry))
-        }
-        Err(e) => {
-          let mut app = app.lock().await;
-          app.auth_refresh_in_progress = false;
-          app.is_loading = false;
-          Err(e)
-        }
-      }
+      // Ticket 16: the shared-state writes the old closure made are gone.
+      // The refresh helper returns the (possibly unchanged) expiry either
+      // way; handler-level events report state, not this closure.
+      auth::refresh_token_and_cache(spotify, token_cache_path, force)
+        .await
+        .map(Some)
     },
     shared_forced_refresh_gate(),
   )
@@ -409,7 +400,6 @@ impl Network {
       query,
       body,
       &self.token_cache_path,
-      &self.app,
     )
     .await
   }
@@ -556,12 +546,16 @@ pub fn is_transient_network_error(e: &anyhow::Error) -> bool {
     || text.contains("dns")
 }
 
+/// Transition-period wrapper for callers not yet migrated (ticket 17/18
+/// finish the job): same GET, but the token-refresh mirror writes into App
+/// happen here instead of at the caller. Deleted with the mega-mutex.
+#[cfg_attr(not(feature = "streaming"), allow(dead_code))]
 pub async fn spotify_get_typed_compat_for_with_refresh<T: DeserializeOwned>(
   spotify: &AuthCodePkceSpotify,
   path: &str,
   query: &[(&str, String)],
   token_cache_path: &Path,
-  app: &Arc<Mutex<App>>,
+  _app: &Arc<Mutex<App>>,
 ) -> anyhow::Result<T> {
   let mut value = spotify_api_request_json_for_with_refresh(
     spotify,
@@ -570,7 +564,28 @@ pub async fn spotify_get_typed_compat_for_with_refresh<T: DeserializeOwned>(
     query,
     None,
     token_cache_path,
-    app,
+  )
+  .await?;
+  normalize_spotify_payload(&mut value);
+  Ok(serde_json::from_value(value)?)
+}
+
+/// One Spotify Web API GET with the shared refresh/retry machinery, without
+/// an `App` handle (ticket 16). Migrated callers use this; the compat
+/// wrapper above dies with ticket 17.
+pub async fn spotify_get_typed_for<T: DeserializeOwned>(
+  spotify: &AuthCodePkceSpotify,
+  path: &str,
+  query: &[(&str, String)],
+  token_cache_path: &Path,
+) -> anyhow::Result<T> {
+  let mut value = spotify_api_request_json_for_with_refresh(
+    spotify,
+    Method::GET,
+    path,
+    query,
+    None,
+    token_cache_path,
   )
   .await?;
   normalize_spotify_payload(&mut value);
