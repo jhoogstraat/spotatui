@@ -1,10 +1,8 @@
 use super::{ids, IoEvent, Network};
-use crate::core::app::{
-  ActiveBlock, Artist, ArtistBlock, EpisodeTableContext, RouteId, ScrollableResultPages,
-  SelectedFullShow, SelectedShow,
-};
+use crate::core::app::{Artist, ArtistBlock};
 use crate::core::plugin_api::{AlbumInfo, ArtistInfo, EpisodeInfo, ShowInfo, TrackInfo};
 use crate::infra::network::mapping::map_page;
+use crate::runtime::engine::SessionFact;
 use anyhow::anyhow;
 use reqwest::Method;
 use rspotify::model::{
@@ -237,46 +235,46 @@ impl MetadataNetwork for Network {
       related_artists.iter().map(ArtistInfo::from).collect();
     let domain_top_tracks: Vec<TrackInfo> = top_tracks.iter().map(TrackInfo::from).collect();
 
-    let mut app = self.app.lock().await;
-
-    // Check if the top tracks are liked.
+    // Membership checks ride the fold's dispatch fact (ticket 17); the view
+    // write + navigation moved into the fold's reducer.
     let track_check = ids::track_check_ids(top_tracks.iter().map(|t| t.id.as_ref()));
-    if !track_check.is_empty() {
-      app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_check));
-    }
-
-    // Check if the artist's albums are saved.
     let album_check: Vec<String> = albums_rspotify_page
       .items
       .iter()
       .filter_map(|album| album.id.as_ref().map(|id| id.id().to_string()))
       .collect();
-    if !album_check.is_empty() {
-      app.dispatch(IoEvent::CurrentUserSavedAlbumsContains(album_check));
-    }
-
-    // Check if the related artists are followed.
     let follow_check: Vec<String> = related_artists
       .iter()
       .map(|artist| artist.id.id().to_string())
       .collect();
+    let mut checks: Vec<IoEvent> = Vec::new();
+    if !track_check.is_empty() {
+      checks.push(IoEvent::CurrentUserSavedTracksContains(track_check));
+    }
+    if !album_check.is_empty() {
+      checks.push(IoEvent::CurrentUserSavedAlbumsContains(album_check));
+    }
     if !follow_check.is_empty() {
-      app.dispatch(IoEvent::UserArtistFollowCheck(follow_check));
+      checks.push(IoEvent::UserArtistFollowCheck(follow_check));
+    }
+    if !checks.is_empty() {
+      self.emit_session(SessionFact::DispatchIo(checks)).await;
     }
 
-    app.artist = Some(Artist {
-      artist_id: artist_id_str,
-      artist_name: input_artist_name,
-      albums,
-      related_artists: domain_related_artists,
-      top_tracks: domain_top_tracks,
-      selected_album_index: 0,
-      selected_related_artist_index: 0,
-      selected_top_track_index: 0,
-      artist_selected_block: ArtistBlock::TopTracks,
-      artist_hovered_block: ArtistBlock::TopTracks,
-    });
-    app.push_navigation_stack(RouteId::Artist, ActiveBlock::ArtistBlock);
+    self
+      .emit_session(SessionFact::ArtistView(Box::new(Artist {
+        artist_id: artist_id_str,
+        artist_name: input_artist_name,
+        albums,
+        related_artists: domain_related_artists,
+        top_tracks: domain_top_tracks,
+        selected_album_index: 0,
+        selected_related_artist_index: 0,
+        selected_top_track_index: 0,
+        artist_selected_block: ArtistBlock::TopTracks,
+        artist_hovered_block: ArtistBlock::TopTracks,
+      })))
+      .await;
   }
 
   async fn get_album_tracks(&mut self, album: Box<SimplifiedAlbum>) {
@@ -310,17 +308,19 @@ impl MetadataNetwork for Network {
             total,
           };
           let tracks_domain = map_page(&tracks, |t| crate::core::plugin_api::TrackInfo::from(t));
-          let mut app = self.app.lock().await;
           if !track_check.is_empty() {
-            app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_check));
+            self
+              .emit_session(SessionFact::DispatchIo(vec![
+                IoEvent::CurrentUserSavedTracksContains(track_check),
+              ]))
+              .await;
           }
-          app.selected_album_simplified = Some(crate::core::app::SelectedAlbum {
-            album: album_info,
-            tracks: tracks_domain,
-            selected_index: 0,
-          });
-          app.album_table_context = crate::core::app::AlbumTableContext::Simplified;
-          app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+          self
+            .emit_session(SessionFact::AlbumTracksSimplified {
+              album: album_info,
+              tracks: tracks_domain,
+            })
+            .await;
         }
         Err(e) => self.handle_error(anyhow!(e)).await,
       }
@@ -357,18 +357,18 @@ impl MetadataNetwork for Network {
           .album_cache
           .put(album_id.id().to_string(), album.clone());
         let album_info = crate::core::plugin_api::AlbumInfo::from(&album);
-        let mut app = self.app.lock().await;
         // Check if these tracks are liked.
         let track_check = ids::track_check_ids(album.tracks.items.iter().map(|t| t.id.as_ref()));
         if !track_check.is_empty() {
-          app.dispatch(IoEvent::CurrentUserSavedTracksContains(track_check));
+          self
+            .emit_session(SessionFact::DispatchIo(vec![
+              IoEvent::CurrentUserSavedTracksContains(track_check),
+            ]))
+            .await;
         }
-        app.selected_album_full = Some(crate::core::app::SelectedFullAlbum {
-          album: album_info,
-          selected_index: 0,
-        });
-        app.album_table_context = crate::core::app::AlbumTableContext::Full;
-        app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+        self
+          .emit_session(SessionFact::AlbumTracksFull { album: album_info })
+          .await;
       }
       Err(e) => self.handle_error(anyhow!(e)).await,
     }
@@ -390,15 +390,12 @@ impl MetadataNetwork for Network {
       Ok(episodes) => {
         if !episodes.items.is_empty() {
           let domain_page = map_page(&episodes, |e| EpisodeInfo::from(e));
-          let mut app = self.app.lock().await;
-          app.library.show_episodes = ScrollableResultPages::new();
-          app.library.show_episodes.add_pages(domain_page);
-
-          app.selected_show_simplified = Some(SelectedShow { show: *show });
-
-          app.episode_table_context = EpisodeTableContext::Simplified;
-
-          app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+          self
+            .emit_session(SessionFact::ShowEpisodesLanded {
+              page: domain_page,
+              show: *show,
+            })
+            .await;
         }
       }
       Err(e) => {
@@ -414,16 +411,11 @@ impl MetadataNetwork for Network {
       .await
     {
       Ok(show) => {
-        let selected_show = SelectedFullShow {
-          show: ShowInfo::from(&show),
-        };
-
-        let mut app = self.app.lock().await;
-
-        app.selected_show_full = Some(selected_show);
-
-        app.episode_table_context = EpisodeTableContext::Full;
-        app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+        self
+          .emit_session(SessionFact::FullShowLanded {
+            show: ShowInfo::from(&show),
+          })
+          .await;
       }
       Err(e) => {
         self.handle_error(anyhow!(e)).await;
@@ -445,8 +437,9 @@ impl MetadataNetwork for Network {
       Ok(episodes) => {
         if !episodes.items.is_empty() {
           let domain_page = map_page(&episodes, |e| EpisodeInfo::from(e));
-          let mut app = self.app.lock().await;
-          app.library.show_episodes.add_pages(domain_page);
+          self
+            .emit_session(SessionFact::ShowEpisodesAppended { page: domain_page })
+            .await;
         }
       }
       Err(e) => {
@@ -548,13 +541,16 @@ impl MetadataNetwork for Network {
       .await
     {
       Ok(is_following) => {
-        let mut app = self.app.lock().await;
-        for (i, is_following) in is_following.iter().enumerate() {
-          if *is_following {
-            app
-              .followed_artist_ids_set
-              .insert(artist_ids[i].id().to_string());
-          }
+        let confirmed: Vec<String> = artist_ids
+          .iter()
+          .zip(is_following.iter())
+          .filter(|(_, following)| **following)
+          .map(|(id, _)| id.id().to_string())
+          .collect();
+        if !confirmed.is_empty() {
+          self
+            .emit_session(SessionFact::FollowedArtistsConfirmed(confirmed))
+            .await;
         }
       }
       Err(e) => self.handle_error(anyhow!(e)).await,

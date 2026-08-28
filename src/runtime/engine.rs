@@ -164,6 +164,36 @@ pub enum SessionFact {
   RecommendedTracks {
     tracks: Vec<crate::core::plugin_api::TrackInfo>,
   },
+  /// The artist view landed (metadata.rs): the fold writes `app.artist` and
+  /// pushes the navigation route. Boxed — the view bundles three pages.
+  ArtistView(Box<crate::core::app::Artist>),
+  /// An album's tracklist landed. `Simplified` comes from the playlist-style
+  /// listing (context Simplified); `Full` from the album endpoint (context
+  /// Full). Both push the AlbumTracks route with a reset selection.
+  AlbumTracksSimplified {
+    album: crate::core::plugin_api::AlbumInfo,
+    tracks: crate::core::pagination::Paged<crate::core::plugin_api::TrackInfo>,
+  },
+  AlbumTracksFull {
+    album: crate::core::plugin_api::AlbumInfo,
+  },
+  /// Podcast episodes landed: `reset` clears the paged library cache and
+  /// selects the show (entry from a show list); otherwise pages append to the
+  /// existing cache (scroll pagination).
+  ShowEpisodesLanded {
+    page: crate::core::pagination::Paged<crate::core::plugin_api::EpisodeInfo>,
+    show: crate::core::plugin_api::ShowInfo,
+  },
+  ShowEpisodesAppended {
+    page: crate::core::pagination::Paged<crate::core::plugin_api::EpisodeInfo>,
+  },
+  /// The full show landed (metadata.rs).
+  FullShowLanded {
+    show: crate::core::plugin_api::ShowInfo,
+  },
+  /// The follow-check round-trip for ids already known to be followed
+  /// (metadata.rs seeds the set directly; the IoEvent lane covers the rest).
+  FollowedArtistsConfirmed(Vec<String>),
 }
 
 /// The data fetches `complete_spotify_login` used to dispatch under the same
@@ -214,6 +244,16 @@ impl std::fmt::Debug for SessionFact {
       }
       SessionFact::DispatchPlaylistRefresh => f.write_str("DispatchPlaylistRefresh"),
       SessionFact::StatsLoadingCleared => f.write_str("StatsLoadingCleared"),
+      SessionFact::ArtistView(_) => f.write_str("ArtistView"),
+      SessionFact::AlbumTracksSimplified { .. } => f.write_str("AlbumTracksSimplified"),
+      SessionFact::AlbumTracksFull { .. } => f.write_str("AlbumTracksFull"),
+      SessionFact::ShowEpisodesLanded { .. } => f.write_str("ShowEpisodesLanded"),
+      SessionFact::ShowEpisodesAppended { .. } => f.write_str("ShowEpisodesAppended"),
+      SessionFact::FullShowLanded { .. } => f.write_str("FullShowLanded"),
+      SessionFact::FollowedArtistsConfirmed(ids) => f
+        .debug_tuple("FollowedArtistsConfirmed")
+        .field(&ids.len())
+        .finish(),
       SessionFact::ApplyAction(action) => f.debug_tuple("ApplyAction").field(action).finish(),
       #[cfg(feature = "dj-core")]
       SessionFact::DjPushLine { speaker, text } => f

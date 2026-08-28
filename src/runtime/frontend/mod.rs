@@ -114,7 +114,10 @@ impl Options {
 
 use super::engine::{Changed, EngineCommand, EngineEvent, Spine};
 
-use crate::core::app::App;
+use crate::core::app::{
+  ActiveBlock, AlbumTableContext, App, EpisodeTableContext, RouteId, ScrollableResultPages,
+  SelectedAlbum, SelectedFullAlbum, SelectedFullShow, SelectedShow,
+};
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::catalog::PlaylistSelection;
 #[cfg(feature = "streaming")]
@@ -877,6 +880,47 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     }
     SessionFact::StatsLoadingCleared => {
       app.stats_loading = false;
+    }
+    SessionFact::ArtistView(artist) => {
+      app.artist = Some(*artist);
+      app.push_navigation_stack(RouteId::Artist, ActiveBlock::ArtistBlock);
+    }
+    SessionFact::AlbumTracksSimplified { album, tracks } => {
+      app.selected_album_simplified = Some(SelectedAlbum {
+        album,
+        tracks,
+        selected_index: 0,
+      });
+      app.album_table_context = AlbumTableContext::Simplified;
+      app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+    }
+    SessionFact::AlbumTracksFull { album } => {
+      app.selected_album_full = Some(SelectedFullAlbum {
+        album,
+        selected_index: 0,
+      });
+      app.album_table_context = AlbumTableContext::Full;
+      app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+    }
+    SessionFact::ShowEpisodesLanded { page, show } => {
+      app.library.show_episodes = ScrollableResultPages::new();
+      app.library.show_episodes.add_pages(page);
+      app.selected_show_simplified = Some(SelectedShow { show });
+      app.episode_table_context = EpisodeTableContext::Simplified;
+      app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+    }
+    SessionFact::ShowEpisodesAppended { page } => {
+      app.library.show_episodes.add_pages(page);
+    }
+    SessionFact::FullShowLanded { show } => {
+      app.selected_show_full = Some(SelectedFullShow { show });
+      app.episode_table_context = EpisodeTableContext::Full;
+      app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+    }
+    SessionFact::FollowedArtistsConfirmed(ids) => {
+      for id in ids {
+        app.followed_artist_ids_set.insert(id);
+      }
     }
     SessionFact::ApplyAction(action) => {
       // Ticket 17: the DJ tools / MCP executor mutations. The fold is the
