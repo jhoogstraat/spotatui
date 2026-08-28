@@ -7,15 +7,20 @@
 
 use super::Network;
 #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
-use crate::core::action::{ActionOutcome, EngineAction};
+use crate::core::action::EngineAction;
 use crate::core::plugin_api::TrackInfo;
 use crate::infra::dj::resolve::{self, ResolveReport};
 #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
 use crate::infra::dj::tools::{DjToolCall, QueueItem, ToolOutcome};
 #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
 use crate::infra::dj::MAX_BATCH;
-use crate::infra::dj::{library, DjLibrary, DjLine, DjSuggestion};
+use crate::infra::dj::{library, DjLibrary, DjSuggestion};
+#[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
 use crate::infra::network::IoEvent;
+#[cfg(feature = "ai-dj")]
+use crate::runtime::engine::DjTurnSummary;
+#[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
+use crate::runtime::engine::{FoldAnswer, FoldQuery, SessionFact};
 use rspotify::model::track::FullTrack;
 use serde::Deserialize;
 #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
@@ -203,12 +208,11 @@ impl Network {
     }
 
     if !named.is_empty() {
-      let skip_keys = {
-        let app = self.app.lock().await;
-        let mut keys = app.dj_skip_keys();
-        keys.extend(extra_skip_keys);
-        keys
+      let mut skip_keys = match self.fold_query(FoldQuery::DjSkipKeys).await {
+        Some(FoldAnswer::Strings(keys)) => keys.into_iter().collect::<HashSet<String>>(),
+        _ => HashSet::new(),
       };
+      skip_keys.extend(extra_skip_keys);
       let youtube = self.dj_youtube_resolver().await;
       // The library set is empty unless the caller asked for `exclude_owned`: an
       // agent told to queue a named track was told to queue *that* track, and
@@ -257,14 +261,16 @@ impl Network {
     // Read before the take: `summary()` counts `resolved`, and taking it first is
     // what made every queue report "queued 0".
     let summary = report.summary();
-    let accepted = {
-      let mut app = self.app.lock().await;
-      match app.apply(EngineAction::QueueTracks(std::mem::take(
-        &mut report.resolved,
-      ))) {
-        ActionOutcome::Queued { accepted } => accepted,
-        ActionOutcome::Applied => 0,
-      }
+    // The accepted count must be answered atomically with the queueing: a
+    // fire-and-forget apply could not report "queued N" honestly.
+    let accepted = match self
+      .fold_query(FoldQuery::ApplyDjQueueTracks {
+        tracks: std::mem::take(&mut report.resolved),
+      })
+      .await
+    {
+      Some(FoldAnswer::U64(accepted)) => accepted as usize,
+      _ => 0,
     };
     // After the block, not inside it: the network layer's helper takes the lock
     // itself. "DJ:", not "MCP:", because this handler serves both front doors and
@@ -351,11 +357,12 @@ impl Network {
   }
 
   async fn dj_start_playback(&self, uri: &str) {
-    let mut app = self.app.lock().await;
-    app.apply(EngineAction::PlayUris {
-      uris: vec![uri.to_string()],
-      offset: Some(0),
-    });
+    self
+      .emit_session(SessionFact::ApplyAction(EngineAction::PlayUris {
+        uris: vec![uri.to_string()],
+        offset: Some(0),
+      }))
+      .await;
   }
 
   /// Whether the listener already has each of these search results.
@@ -382,9 +389,9 @@ impl Network {
     }
 
     let mut owned = library::liked_among(self, &ids).await;
-    let playlist_ids = {
-      let app = self.app.lock().await;
-      app.dj.library.as_ref().map(|library| library.ids.clone())
+    let playlist_ids = match self.fold_query(FoldQuery::DjLibrary).await {
+      Some(FoldAnswer::DjLibrary(Some(library))) => Some(library.ids),
+      _ => None,
     };
 
     match playlist_ids {
@@ -412,20 +419,18 @@ impl Network {
   /// queues behind the tool call that asked for it rather than extending it; the
   /// channel is unbounded, so the send cannot block the handler it is inside.
   async fn request_library_index(&self) {
-    let app = self.app.lock().await;
-    if app.dj.library.is_some() || app.dj.library_indexing {
+    // The claim and the dispatch stay separate because the dispatch goes
+    // through the fold too (this handler runs on the serial lane, so the crawl
+    // queues behind the tool call that asked for it rather than extending it).
+    if !matches!(
+      self.fold_query(FoldQuery::ClaimDjLibraryIndex).await,
+      Some(FoldAnswer::Bool(true))
+    ) {
       return;
     }
-    match app.io_tx_clone() {
-      Some(sender) => {
-        let _ = sender.send(IoEvent::DjIndexLibrary);
-      }
-      // Shutdown only, and unreachable in practice: `App::new` always sets the
-      // channel, `close_io_channel` is the sole path that clears it, and
-      // `mcp::spawn_listener` refuses to start without it — so an MCP call cannot
-      // arrive before it exists.
-      None => log::debug!("DJ: no event channel, so the library index was not requested"),
-    }
+    self
+      .emit_session(SessionFact::DispatchIo(vec![IoEvent::DjIndexLibrary]))
+      .await;
   }
 }
 
@@ -572,35 +577,19 @@ impl Network {
   /// and an MCP `search_tracks` can all ask for this, and a second crawl would be
   /// pure cost.
   pub async fn dj_index_library(&mut self) {
-    let already = {
-      let mut app = self.app.lock().await;
-      let already = app.dj.library_indexing || app.dj.library.is_some();
-      if !already {
-        app.dj.library_indexing = true;
-      }
-      already
-    };
-    if already {
+    if !matches!(
+      self.fold_query(FoldQuery::ClaimDjLibraryIndex).await,
+      Some(FoldAnswer::Bool(true))
+    ) {
       return;
     }
 
     let outcome = self.build_dj_library().await;
-    let mut app = self.app.lock().await;
-    app.dj.library_indexing = false;
-    match outcome {
-      Ok(library) => {
-        let summary = library.summary();
-        app.dj.library = Some(library);
-        app.dj.push_line(DjLine::system(summary.clone()));
-        app.set_status_message(format!("DJ: {summary}"), 5);
-      }
-      Err(e) => {
-        log::warn!("DJ: could not index the library: {e}");
-        let message = format!("DJ: could not read your playlists ({e}); recommending unfiltered");
-        app.dj.push_line(DjLine::system(message.clone()));
-        app.set_error_status_message(message, 8);
-      }
-    }
+    let fact = match outcome {
+      Ok(library) => SessionFact::DjLibraryIndexed(Ok(Box::new(library))),
+      Err(e) => SessionFact::DjLibraryIndexed(Err(format!("{e}"))),
+    };
+    self.emit_session(fact).await;
   }
 
   /// Run the crawl, resolving the listener's own account ID first.
@@ -608,20 +597,11 @@ impl Network {
     if self.spotify.is_none() {
       anyhow::bail!("no Spotify session");
     }
-    let cached = {
-      self
-        .app
-        .lock()
-        .await
-        .user
-        .as_ref()
-        .map(|user| user.id.clone())
-    };
-    let owner_id = match cached {
-      Some(id) => id,
+    let owner_id = match self.fold_query(FoldQuery::UserId).await {
+      Some(FoldAnswer::User(Some(id))) => id,
       // Not fetched yet (or a source other than Spotify was browsed first). One
       // cheap call rather than filtering against nothing.
-      None => {
+      _ => {
         #[derive(serde::Deserialize)]
         struct Me {
           id: String,
@@ -644,11 +624,15 @@ impl Network {
   /// and `search_tracks` all dispatch `DjIndexLibrary` instead of waiting for
   /// this.
   async fn dj_library_index(&mut self) -> Option<DjLibrary> {
-    if let Some(library) = { self.app.lock().await.dj.library.clone() } {
-      return Some(library);
+    if let Some(FoldAnswer::DjLibrary(Some(library))) = self.fold_query(FoldQuery::DjLibrary).await
+    {
+      return Some(*library);
     }
     self.dj_index_library().await;
-    self.app.lock().await.dj.library.clone()
+    match self.fold_query(FoldQuery::DjLibrary).await {
+      Some(FoldAnswer::DjLibrary(Some(library))) => Some(*library),
+      _ => None,
+    }
   }
 
   /// Drop resolved tracks the listener already owns, moving them to the
@@ -669,14 +653,9 @@ impl Network {
       return;
     }
 
-    let playlist_ids = {
-      let app = self.app.lock().await;
-      app
-        .dj
-        .library
-        .as_ref()
-        .map(|library| library.ids.clone())
-        .unwrap_or_default()
+    let playlist_ids = match self.fold_query(FoldQuery::DjLibrary).await {
+      Some(FoldAnswer::DjLibrary(Some(library))) => library.ids,
+      _ => HashSet::new(),
     };
     let liked = library::liked_among(self, &ids).await;
 
@@ -946,76 +925,38 @@ mod in_tui {
     /// brain. See `AskDjRequest::extra_instruction`.
     pub async fn ask_dj(&mut self, request: AskDjRequest) {
       let outcome = self.run_turn(&request).await;
-      let mut app = self.app.lock().await;
-      // Whether this turn is still the current one. Read before `finish_turn`
-      // purely for clarity — that call does not touch `turn_seq`.
-      let owned = app.dj.turn_seq == request.turn_seq;
-      // Only if this turn still owns the flag: an abandoned turn finishing would
-      // otherwise clear the flag its replacement had already set, and the refill
-      // tick gates on exactly that flag.
-      app.dj.finish_turn(request.turn_seq);
-      match outcome {
-        Ok(turn) => {
-          // The listener's words only become the standing auto-queue direction
-          // when the turn actually did something. Otherwise "what did I play last
-          // week?" would silently steer every later refill. A vibe the model set
-          // itself is more considered than the raw sentence, so it wins.
-          if turn.acted && !turn.abandoned && !turn.vibe_set {
-            if let Some(vibe) = request.vibe_on_success {
-              app.dj.vibe = Some(vibe);
-            }
-          }
-          // A refill happens while the listener is on another screen, so the
-          // transcript is not a surface they can see. The interactive case is
-          // deliberately left transcript-only.
-          if request.must_act && !turn.abandoned {
-            if turn.acted {
-              app.set_status_message("DJ: topped up the queue".to_string(), 5);
-            } else {
-              // A turn that had to queue and did not is a failure, not a quiet
-              // success. A vibe shift has just *emptied* the queue, and with
-              // auto-queue off nothing retries — so saying nothing leaves the
-              // listener with silence and no explanation.
-              let message = "DJ: nothing was queued that time. Ask again, or try a different \
-                             direction.";
-              app.dj.push_line(DjLine::system(message));
-              app.set_error_status_message(message.to_string(), 6);
-            }
-          }
-        }
-        Err(e) => {
-          log::warn!("DJ: turn failed: {e}");
-          // Silent when the turn has been superseded. An agent CLI hits its
-          // timeout a minute and a half after the listener moved on, and a
-          // failure toast for a turn they abandoned would land over the
-          // conversation they are now having.
-          if !owned {
-            return;
-          }
-          // Naming the backend matters when several are configurable: "DJ error"
-          // alone does not say whether to check the CLI or the key.
-          let backend = session::build_brain(&app.user_config.behavior)
-            .map(|brain| brain.label())
-            .unwrap_or("DJ");
-          let message = format!("DJ error ({backend}): {e}");
-          app.dj.push_line(DjLine::system(message.clone()));
-          // A toast, never `handle_error` — that pushes a modal error page over
-          // whatever the user was doing.
-          app.set_error_status_message(message, 8);
-        }
-      }
+      // The epilogue is a fact: the fold releases the turn's flag (only its own
+      // generation may) and does the success/failure reporting.
+      let outcome = match outcome {
+        Ok(turn) => Ok(DjTurnSummary {
+          acted: turn.acted,
+          abandoned: turn.abandoned,
+          vibe_set: turn.vibe_set,
+        }),
+        Err(e) => Err(format!("{e}")),
+      };
+      self
+        .emit_session(SessionFact::DjTurnFinished {
+          turn_seq: request.turn_seq,
+          outcome,
+          vibe_on_success: request.vibe_on_success,
+          must_act: request.must_act,
+        })
+        .await;
     }
 
     async fn run_turn(
       &mut self,
       request: &AskDjRequest,
     ) -> anyhow::Result<crate::infra::dj::agent::TurnOutcome> {
-      let (brain, io_tx): (DjBrain, _) = {
-        let app = self.app.lock().await;
-        (
-          session::build_brain(&app.user_config.behavior)?,
-          app.io_tx_clone(),
-        )
+      let brain = match self.fold_query(FoldQuery::DjBrain).await {
+        Some(FoldAnswer::DjBrain(Ok(brain))) => *brain,
+        Some(FoldAnswer::DjBrain(Err(e))) => anyhow::bail!("{e}"),
+        _ => anyhow::bail!("no engine fold"),
+      };
+      let io_tx = match self.fold_query(FoldQuery::IoTx).await {
+        Some(FoldAnswer::IoTx(io_tx)) => io_tx,
+        _ => None,
       };
       let Some(io_tx) = io_tx else {
         anyhow::bail!("no event channel available");
@@ -1043,14 +984,19 @@ mod in_tui {
 
     /// Service lane: refill the queue because it is running low.
     pub async fn dj_top_up(&mut self, generation: u64, turn_seq: u64) {
-      // Cheap early bail before spending a brain call on a stale request.
-      {
-        let mut app = self.app.lock().await;
-        if app.dj.generation != generation || !app.dj.auto_queue {
-          log::debug!("DJ: dropping a stale top-up (generation {generation})");
-          app.dj.finish_turn(turn_seq);
-          return;
-        }
+      // Cheap early bail before spending a brain call on a stale request; the
+      // fold released the progress flag if this one was stale.
+      let stale = matches!(
+        self
+          .fold_query(FoldQuery::ClaimDjTopUp {
+            generation,
+            turn_seq,
+          })
+          .await,
+        Some(FoldAnswer::Bool(true))
+      );
+      if stale {
+        return;
       }
       self
         .ask_dj(AskDjRequest {

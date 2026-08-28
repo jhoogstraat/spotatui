@@ -934,6 +934,89 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         session.pending_reload_index = None;
       }
     }
+    #[cfg(feature = "dj-core")]
+    SessionFact::DjLibraryIndexed(result) => {
+      use crate::infra::dj::DjLine;
+      app.dj.library_indexing = false;
+      match result {
+        Ok(library) => {
+          let summary = library.summary();
+          app.dj.library = Some(*library);
+          app.dj.push_line(DjLine::system(summary.clone()));
+          app.set_status_message(format!("DJ: {summary}"), 5);
+        }
+        Err(e) => {
+          log::warn!("DJ: could not index the library: {e}");
+          let message = format!("DJ: could not read your playlists ({e}); recommending unfiltered");
+          app.dj.push_line(DjLine::system(message.clone()));
+          app.set_error_status_message(message, 8);
+        }
+      }
+    }
+    #[cfg(feature = "ai-dj")]
+    SessionFact::DjTurnFinished {
+      turn_seq,
+      outcome,
+      vibe_on_success,
+      must_act,
+    } => {
+      use crate::infra::dj::DjLine;
+      // Whether this turn is still the current one. Only if it still owns the
+      // flag: an abandoned turn finishing would otherwise clear the flag its
+      // replacement had already set, and the refill tick gates on exactly that
+      // flag.
+      let owned = app.dj.turn_seq == turn_seq;
+      app.dj.finish_turn(turn_seq);
+      match outcome {
+        Ok(summary) => {
+          // The listener's words only become the standing auto-queue direction
+          // when the turn actually did something. Otherwise "what did I play
+          // last week?" would silently steer every later refill. A vibe the
+          // model set itself is more considered than the raw sentence, so it
+          // wins.
+          if summary.acted && !summary.abandoned && !summary.vibe_set {
+            if let Some(vibe) = vibe_on_success {
+              app.dj.vibe = Some(vibe);
+            }
+          }
+          // A refill happens while the listener is on another screen, so the
+          // transcript is not a surface they can see. The interactive case is
+          // deliberately left transcript-only.
+          if must_act && !summary.abandoned {
+            if summary.acted {
+              app.set_status_message("DJ: topped up the queue".to_string(), 5);
+            } else {
+              // A turn that had to queue and did not is a failure, not a quiet
+              // success. A vibe shift has just *emptied* the queue, and with
+              // auto-queue off nothing retries — so saying nothing leaves the
+              // listener with silence and no explanation.
+              let message = "DJ: nothing was queued that time. Ask again, or try a different \
+                             direction.";
+              app.dj.push_line(DjLine::system(message));
+              app.set_error_status_message(message.to_string(), 6);
+            }
+          }
+        }
+        Err(e) => {
+          // Silent when the turn has been superseded. An agent CLI hits its
+          // timeout a minute and a half after the listener moved on, and a
+          // failure toast for a turn they abandoned would land over the
+          // conversation they are now having.
+          if owned {
+            // Naming the backend matters when several are configurable: "DJ
+            // error" alone does not say whether to check the CLI or the key.
+            let backend = crate::infra::dj::session::build_brain(&app.user_config.behavior)
+              .map(|brain| brain.label())
+              .unwrap_or("DJ");
+            let message = format!("DJ error ({backend}): {e}");
+            app.dj.push_line(DjLine::system(message.clone()));
+            // A toast, never `handle_error` — that pushes a modal error page
+            // over whatever the user was doing.
+            app.set_error_status_message(message, 8);
+          }
+        }
+      }
+    }
     SessionFact::ApplyAction(action) => {
       // Ticket 17: the DJ tools / MCP executor mutations. The fold is the
       // single writer, so their old inline `app.apply(...)` under the lock
@@ -1433,6 +1516,50 @@ pub(crate) fn answer_query(
         )
         .map(Box::new),
       )
+    }
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjSkipKeys => FoldAnswer::Strings(app.dj_skip_keys().into_iter().collect()),
+    #[cfg(feature = "dj-core")]
+    FoldQuery::ClaimDjLibraryIndex => {
+      // Idempotent by way of `library_indexing`: the in-TUI toggle, the first
+      // turn, and an MCP `search_tracks` can all ask for this, and a second
+      // crawl would be pure cost.
+      let claimed = !(app.dj.library_indexing || app.dj.library.is_some());
+      if claimed {
+        app.dj.library_indexing = true;
+      }
+      FoldAnswer::Bool(claimed)
+    }
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjLibrary => FoldAnswer::DjLibrary(app.dj.library.clone().map(Box::new)),
+    #[cfg(feature = "dj-core")]
+    FoldQuery::ApplyDjQueueTracks { tracks } => {
+      use crate::core::action::ActionOutcome;
+      match app.apply(crate::core::action::EngineAction::QueueTracks(tracks)) {
+        ActionOutcome::Queued { accepted } => FoldAnswer::U64(accepted as u64),
+        ActionOutcome::Applied => FoldAnswer::U64(0),
+      }
+    }
+    #[cfg(feature = "ai-dj")]
+    FoldQuery::DjBrain => FoldAnswer::DjBrain(
+      crate::infra::dj::session::build_brain(&app.user_config.behavior)
+        .map(Box::new)
+        .map_err(|e| format!("{e}")),
+    ),
+    #[cfg(feature = "ai-dj")]
+    FoldQuery::ClaimDjTopUp {
+      generation,
+      turn_seq,
+    } => {
+      // Cheap early bail before spending a brain call on a stale request, and
+      // the `finish_turn` in that bail is load-bearing: the dispatcher already
+      // set `thinking`, and `wants_top_up` gates on it.
+      let stale = app.dj.generation != generation || !app.dj.auto_queue;
+      if stale {
+        log::debug!("DJ: dropping a stale top-up (generation {generation})");
+        app.dj.finish_turn(turn_seq);
+      }
+      FoldAnswer::Bool(stale)
     }
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),

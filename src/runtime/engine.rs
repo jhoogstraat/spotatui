@@ -201,6 +201,20 @@ pub enum SessionFact {
   /// failed): drop the session's pending reload confirmation so a later
   /// genuine `TrackChanged` is not mistaken for it.
   ClearNativeShufflePendingReload,
+  /// A finished DJ playlist crawl: the fold releases the in-flight flag and
+  /// installs the library (or reports the failure in transcript + toast).
+  #[cfg(feature = "dj-core")]
+  DjLibraryIndexed(Result<Box<crate::infra::dj::DjLibrary>, String>),
+  /// A finished DJ turn: release the turn's progress flag (only its own
+  /// turn may), then apply the success/failure reporting the old `ask_dj`
+  /// epilogue did.
+  #[cfg(feature = "ai-dj")]
+  DjTurnFinished {
+    turn_seq: u64,
+    outcome: Result<DjTurnSummary, String>,
+    vibe_on_success: Option<String>,
+    must_act: bool,
+  },
   /// The device list landed (user.rs `get_devices`). The fold runs the whole
   /// old lock section: navigation, the native recovery interlock (a
   /// check-and-set must not be split from the write it gates), the
@@ -210,6 +224,15 @@ pub enum SessionFact {
     devices: Vec<rspotify::model::device::Device>,
     navigate: bool,
   },
+}
+
+/// The parts of a DJ turn outcome the epilogue reports on.
+#[cfg(feature = "ai-dj")]
+#[derive(Debug, Clone)]
+pub struct DjTurnSummary {
+  pub acted: bool,
+  pub abandoned: bool,
+  pub vibe_set: bool,
 }
 
 /// The data fetches `complete_spotify_login` used to dispatch under the same
@@ -274,6 +297,19 @@ impl std::fmt::Debug for SessionFact {
       SessionFact::ClearNativeShufflePendingReload => {
         f.write_str("ClearNativeShufflePendingReload")
       }
+      #[cfg(feature = "dj-core")]
+      SessionFact::DjLibraryIndexed(result) => f
+        .debug_tuple("DjLibraryIndexed")
+        .field(&result.is_ok())
+        .finish(),
+      #[cfg(feature = "ai-dj")]
+      SessionFact::DjTurnFinished {
+        turn_seq, outcome, ..
+      } => f
+        .debug_struct("DjTurnFinished")
+        .field("turn_seq", turn_seq)
+        .field("ok", &outcome.is_ok())
+        .finish_non_exhaustive(),
       SessionFact::DevicesLanded { navigate, .. } => f
         .debug_struct("DevicesLanded")
         .field("navigate", navigate)
@@ -633,6 +669,36 @@ pub enum FoldQuery {
     generation: u64,
     result: Result<(Vec<String>, bool), String>,
   },
+  // --- Ticket 17 (playback family): DJ auto-queue claims.
+  /// The dedupe keys the DJ's suggestion gate skips against (queued, playing,
+  /// recently played).
+  #[cfg(feature = "dj-core")]
+  DjSkipKeys,
+  /// Claim the playlist crawl that backs `exclude_owned` (the old
+  /// `library_indexing` check-and-flip): `true` when the claim was free and
+  /// is now held.
+  #[cfg(feature = "dj-core")]
+  ClaimDjLibraryIndex,
+  /// The cached avoid-library index, if the crawl finished. Decides whether
+  /// ownership checks are complete and carries the crawled id set.
+  #[cfg(feature = "dj-core")]
+  DjLibrary,
+  /// Queue these tracks through `App::apply` and answer with how many the
+  /// queue engine accepted (the DJ's report must say, atomically with the
+  /// queueing).
+  #[cfg(feature = "dj-core")]
+  ApplyDjQueueTracks {
+    tracks: Vec<crate::core::plugin_api::TrackInfo>,
+  },
+  /// Build the agent brain from the live user config (the turn loop needs it
+  /// without locking App).
+  #[cfg(feature = "ai-dj")]
+  DjBrain,
+  /// Is this auto-queue top-up stale, releasing its progress flag if so (the
+  /// old check-and-`finish_turn` bail — a bail that skipped the release would
+  /// wedge auto-queue for the rest of the session)?
+  #[cfg(feature = "ai-dj")]
+  ClaimDjTopUp { generation: u64, turn_seq: u64 },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -710,6 +776,15 @@ pub enum FoldAnswer {
   /// nothing to reload (lap reshuffle denied, stale resume, no session).
   #[cfg(feature = "streaming")]
   NativeShuffleReload(Option<Box<NativeShuffleReload>>),
+  /// A set of strings (DJ skip keys).
+  #[cfg(feature = "dj-core")]
+  Strings(Vec<String>),
+  /// The avoid-library index, if the crawl finished.
+  #[cfg(feature = "dj-core")]
+  DjLibrary(Option<Box<crate::infra::dj::DjLibrary>>),
+  /// The configured agent brain, `Err` carrying the config error.
+  #[cfg(feature = "ai-dj")]
+  DjBrain(Result<Box<crate::infra::dj::brain::DjBrain>, String>),
 }
 
 impl std::fmt::Debug for FoldAnswer {
@@ -774,6 +849,12 @@ impl std::fmt::Debug for FoldAnswer {
         .debug_tuple("NativeShuffleReload")
         .field(&v.is_some())
         .finish(),
+      #[cfg(feature = "dj-core")]
+      FoldAnswer::Strings(v) => f.debug_tuple("Strings").field(&v.len()).finish(),
+      #[cfg(feature = "dj-core")]
+      FoldAnswer::DjLibrary(v) => f.debug_tuple("DjLibrary").field(&v.is_some()).finish(),
+      #[cfg(feature = "ai-dj")]
+      FoldAnswer::DjBrain(v) => f.debug_tuple("DjBrain").field(&v.is_ok()).finish(),
     }
   }
 }
