@@ -73,10 +73,21 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         app.search_results.hovered_block = SearchResultBlock::SongSearch;
         app.search_results.selected_block = SearchResultBlock::Empty;
       }
-      app.search_results.artists = pages.artists.clone();
-      app.search_results.albums = pages.albums.clone();
-      app.search_results.playlists = pages.playlists.clone();
-      app.search_results.shows = pages.shows.clone();
+      // A completion with no track rows is the search-failure fact: it
+      // retires the spinner but must not wipe the previous surface (the old
+      // fold only replaced pages alongside a fresh track page).
+      if pages.tracks.is_some() {
+        app.search_results.artists = pages.artists.clone();
+        app.search_results.albums = pages.albums.clone();
+        app.search_results.playlists = pages.playlists.clone();
+        app.search_results.shows = pages.shows.clone();
+      }
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::Search);
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::Search);
       // A replaced page can be shorter than the previous one (or empty),
       // which would otherwise leave a stale selected-index pointing past the
       // end of the new results (panic-1: unchecked `.items[selected_index]`

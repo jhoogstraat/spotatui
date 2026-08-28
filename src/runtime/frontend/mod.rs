@@ -875,6 +875,9 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     SessionFact::DispatchPlaylistRefresh => {
       app.dispatch(IoEvent::GetPlaylists);
     }
+    SessionFact::StatsLoadingCleared => {
+      app.stats_loading = false;
+    }
     SessionFact::ApplyAction(action) => {
       // Ticket 17: the DJ tools / MCP executor mutations. The fold is the
       // single writer, so their old inline `app.apply(...)` under the lock
@@ -975,7 +978,11 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
               session.guests.push(name.clone());
             }
           }
-          app.set_status_message(format!("{name} joined the party"), 3);
+          // The old relay handlers wrote the toast fields directly (unscaled
+          // TTL, error message untouched) — keep that parity, not the
+          // `set_status_message` sink's scaling and error-suppression rules.
+          app.status_message = Some(format!("{name} joined the party"));
+          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
         }
         PartySessionFact::GuestLeft(name) => {
           if let Some(session) = &mut app.party_session {
@@ -983,7 +990,8 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
               session.guests.remove(pos);
             }
           }
-          app.set_status_message(format!("{name} left the party"), 3);
+          app.status_message = Some(format!("{name} left the party"));
+          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
         }
         PartySessionFact::ControlMode(mode) => {
           if let Some(session) = &mut app.party_session {
@@ -993,7 +1001,9 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         PartySessionFact::Ended(message) => {
           app.party_status = crate::infra::network::sync::PartyStatus::Disconnected;
           app.party_session = None;
-          app.set_status_message(message, 5);
+          // Direct write for parity with the old relay handler (see above).
+          app.status_message = Some(message);
+          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(5));
         }
         PartySessionFact::Error(message) => {
           app.party_status = crate::infra::network::sync::PartyStatus::Disconnected;

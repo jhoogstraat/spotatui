@@ -1074,8 +1074,10 @@ impl Network {
           .await;
       }
       Err(error) => {
-        // Acked: the loading flag must be down before the caller decides.
-        self.emit_session_acked(SessionFact::LoadingCleared).await;
+        // Acked: the loading flags must be down before the caller decides.
+        self
+          .emit_session_acked(SessionFact::StatsLoadingCleared)
+          .await;
         self
           .handle_error(anyhow!("failed to load listening history: {}", error))
           .await;

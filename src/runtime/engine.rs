@@ -99,6 +99,8 @@ pub enum SessionFact {
   /// Dispatch `GetPlaylists` from the fold (the post-create refresh and
   /// other places that re-pull the sidebar list after a mutation).
   DispatchPlaylistRefresh,
+  /// The stats screen's load ended without rows: drop its scoped spinner.
+  StatsLoadingCleared,
   /// Apply an in-process producer's action through the fold (ticket 17:
   /// DJ tools, MCP executor). The fold runs `App::apply`'s ownership-aware
   /// arm under its own lock — the exact old inline `app.apply(...)` writes.
@@ -211,6 +213,7 @@ impl std::fmt::Debug for SessionFact {
         f.debug_tuple("ClearPendingPlaylistOpen").field(id).finish()
       }
       SessionFact::DispatchPlaylistRefresh => f.write_str("DispatchPlaylistRefresh"),
+      SessionFact::StatsLoadingCleared => f.write_str("StatsLoadingCleared"),
       SessionFact::ApplyAction(action) => f.debug_tuple("ApplyAction").field(action).finish(),
       #[cfg(feature = "dj-core")]
       SessionFact::DjPushLine { speaker, text } => f
@@ -521,12 +524,8 @@ pub enum FoldQuery {
   /// The guest's current playback identity: (uri, is_playing, progress).
   GuestSyncCurrent,
   /// The announcement-surface sources: whether the feature is enabled, the
-  /// loading flip in one atomic fold step) — see [`Self::ClaimLyricsFetch`].
-  AnnouncementSources {
-    /// Whether to also snapshot the seen-announcement ids (the fetch path's
-    /// dedup set; `false` for the cheap enabled/url-only probe).
-    seen_ids: bool,
-  },
+  /// configured feed URL, and the seen-announcement dedup set.
+  AnnouncementSources { seen_ids: bool },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can

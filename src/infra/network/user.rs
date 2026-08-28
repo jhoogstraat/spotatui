@@ -83,11 +83,12 @@ impl UserNetwork for Network {
       Err(e) => {
         let err = anyhow!(e);
         if is_rate_limited_error(&err) {
-          // Acked: the notice is the handler's whole outcome.
+          // A benign toast, not the error page: the old inline write was a
+          // bare status message, and the 429 recovers on the next poll.
           self
-            .emit_session_acked(SessionFact::Error(
+            .emit_session(SessionFact::User(Err(
               "Spotify rate limit hit while loading profile. Retrying automatically.".to_string(),
-            ))
+            )))
             .await;
           return;
         }
