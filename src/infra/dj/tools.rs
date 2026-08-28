@@ -657,7 +657,11 @@ async fn queue_outcome(spine: &Spine) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::infra::history::RecapPeriod;
+  // Batch 2 removed App/Arc/Mutex from the parent's imports; the tests still
+  // build an App directly (they drive the spine without a full boot).
+  use crate::core::app::App;
+  use std::sync::Arc;
+  use tokio::sync::Mutex;
 
   #[test]
   fn every_tool_schema_is_a_valid_object_schema() {

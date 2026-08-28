@@ -1478,11 +1478,12 @@ async fn disconnect_streaming_player(
 
   // Publish the reset as one typed fact for the fold (ticket 14). Ticket 17
   // deleted the direct mirror writes here: the transport flag, track info,
-  // identity, and progress are fold-owned now, and the Teardown fact below
-  // replays their reset (idempotently, so an already-clear fold is fine).
+  // identity, and progress are fold-owned now, and the acked Teardown fact
+  // below replays their reset before the recovery task proceeds — a dropped
+  // event would leave the mirrors stale with nothing repopulating them.
   if let Some(spine) = spine {
     spine
-      .emit(crate::runtime::engine::EngineEvent::Streaming(
+      .emit_acked(crate::runtime::engine::EngineEvent::Streaming(
         crate::core::streaming::StreamingStateEvent::Teardown,
       ))
       .await;

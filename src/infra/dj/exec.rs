@@ -122,6 +122,11 @@ impl ToolExecutor for AppExecutor {
 #[cfg(test)]
 mod tests {
   use super::*;
+  // Batch 2 removed App/Arc/Mutex from the parent's imports; the tests still
+  // build an App directly (they drive the spine without a full boot).
+  use crate::core::app::App;
+  use std::sync::Arc;
+  use tokio::sync::Mutex;
 
   #[tokio::test]
   async fn app_executor_reports_a_closed_pump() {

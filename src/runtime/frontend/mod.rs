@@ -188,7 +188,7 @@ impl Runtime {
     let events_rx = services.spine_rx;
     // The fold also answers producer queries (ticket 16): claim/release,
     // staleness checks, and the small read set detached workers need.
-    let folds = services.spine_queries.take();
+    let folds = rt.block_on(services.spine_queries.take());
     // The frontend's own spine handle for command-side pokes: on streaming
     // legs the command path reuses the shared producer spine so ordering with
     // player events is preserved.
@@ -513,6 +513,7 @@ pub(crate) async fn spawn_fold(
 ) {
   let (spine, events_rx, spine_queries) = crate::runtime::engine::Spine::open(Default::default());
   app.lock().await.spine = Some(spine.clone());
+  let spine_queries = spine_queries.take().await;
   let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Snapshot {
     playback: None,
     library: Default::default(),
@@ -531,7 +532,7 @@ pub(crate) async fn spawn_fold(
     app.clone(),
     snapshot_tx,
     events_rx,
-    spine_queries.take(),
+    spine_queries,
   ));
   (spine, snapshot_rx)
 }
@@ -552,8 +553,9 @@ pub(super) async fn fold_loop(
   };
   loop {
     // Answer any producer query that arrived since the last event before
-    // (possibly) blocking on the next one: the query loop is driven by
-    // event arrivals, so a quiet spine with a pending query still answers.
+    // (possibly) blocking on the next one: the try_recv drain below clears a
+    // backlog, and the select watches the same channels so a quiet spine
+    // with a pending query still answers.
     if let Some(queries) = queries.as_mut() {
       while let Ok((query, responder)) = queries.rx.try_recv() {
         let answer = {
@@ -576,11 +578,53 @@ pub(super) async fn fold_loop(
         publish(&app, &tx).await;
       }
     }
+    // The select keeps queries and acks responsive while parked on events:
+    // producers on quiet surfaces (CLI mode, DJ turn loop, MCP tools) block
+    // on answers, so the fold must not wait for an unrelated event first.
     let event = tokio::select! {
       event = events_rx.recv() => match event {
         Some(event) => event,
         None => break, // spine closed
       },
+      answer = async {
+        match queries.as_mut() {
+          Some(queries) => queries.rx.recv().await,
+          None => std::future::pending().await,
+        }
+      } => {
+        match answer {
+          Some((query, responder)) => {
+            let answer = {
+              let mut guard = app.lock().await;
+              answer_query(&mut guard, query)
+            };
+            let _ = responder.send(Ok(answer));
+          }
+          // Query channel closed (spine dropped): stop watching it.
+          None => queries = None,
+        }
+        continue;
+      }
+      acked = async {
+        match acks.as_mut() {
+          Some(acks) => acks.rx.recv().await,
+          None => std::future::pending().await,
+        }
+      } => {
+        match acked {
+          Some((event, responder)) => {
+            let ack = {
+              let mut guard = app.lock().await;
+              apply_acked(&mut guard, &event)
+            };
+            let _ = responder.send(ack);
+            publish(&app, &tx).await;
+          }
+          // Ack channel closed: stop watching it.
+          None => acks = None,
+        }
+        continue;
+      }
       _ = tx.closed() => break,
     };
     match &event {
@@ -1223,5 +1267,37 @@ fn build_snapshot(app: &App) -> Snapshot {
     audio_pending: app.native_backend_pending,
     #[cfg(not(feature = "streaming"))]
     audio_pending: false,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::core::app::App;
+  use std::sync::Arc;
+  use tokio::sync::Mutex;
+
+  /// A query sent while the fold is parked on an empty event stream must
+  /// still be answered (ticket 17 regression): CLI mode, the DJ turn loop,
+  /// and the MCP tools all block on queries from quiet surfaces. Before the
+  /// fold's select watched the query channels, this test hung.
+  #[tokio::test]
+  async fn a_parked_fold_still_answers_queries() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _rx) = spawn_fold(&app).await;
+    // Let the fold task run to its park point (no events flowing).
+    for _ in 0..10 {
+      tokio::task::yield_now().await;
+    }
+    let answered = tokio::time::timeout(
+      std::time::Duration::from_secs(2),
+      spine.query(crate::runtime::engine::FoldQuery::QueueDepth),
+    )
+    .await
+    .expect("the parked fold must answer the query instead of hanging");
+    assert!(matches!(
+      answered,
+      Ok(crate::runtime::engine::FoldAnswer::U64(0))
+    ));
   }
 }

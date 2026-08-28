@@ -986,6 +986,17 @@ impl Network {
     }
   }
 
+  /// Emit one session fact and wait for the fold to apply it, so a
+  /// write-then-decide path cannot report success for a dropped event
+  /// (ticket 17: the CLI's error surfacing). `true` when applied, or when
+  /// no fold is live (facts are no-ops there).
+  pub(crate) async fn emit_session_acked(&self, fact: SessionFact) -> bool {
+    match self.spine.as_ref() {
+      Some(spine) => spine.emit_acked(EngineEvent::Session(fact)).await.is_some(),
+      None => true,
+    }
+  }
+
   /// Ask the fold for published state (ticket 17: command surfaces read
   /// here instead of locking App). `None` when no fold is live — the same
   /// contract as `emit_session`'s no-op, and the reason CLI mode opens one.

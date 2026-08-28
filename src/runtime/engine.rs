@@ -672,17 +672,17 @@ pub struct QueryReceiver {
 }
 
 impl QueryReceiver {
-  pub fn take(&self) -> Option<FoldHandles> {
+  /// Take the receive halves for the fold task. `async` because the CLI and
+  /// spine-driven tests take these from inside a runtime (ticket 17); boot
+  /// awaits it inside its `block_on`.
+  pub async fn take(&self) -> Option<FoldHandles> {
     let queries = self
       .queries_rx
-      .blocking_lock()
+      .lock()
+      .await
       .take()
       .map(|rx| FoldQueries { rx });
-    let acks = self
-      .acks_rx
-      .blocking_lock()
-      .take()
-      .map(|rx| FoldAcks { rx });
+    let acks = self.acks_rx.lock().await.take().map(|rx| FoldAcks { rx });
     Some(FoldHandles {
       queries: queries?,
       acks: acks?,

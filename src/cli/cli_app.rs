@@ -511,9 +511,11 @@ impl CliApp {
               Some(rand::random_range(0..num) as usize)
             }
             Err(e) => {
+              // Acked: the command's success/failure verdict below reads the
+              // fold's error surface, so a dropped event must not lie.
               self
                 .net
-                .emit_session(SessionFact::Error(e.to_string()))
+                .emit_session_acked(SessionFact::Error(e.to_string()))
                 .await;
               return;
             }
