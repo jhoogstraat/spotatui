@@ -6,6 +6,7 @@ use crate::core::{
 };
 #[cfg(feature = "streaming")]
 use crate::infra::player::{select_native, PlaybackBackend};
+use crate::runtime::engine::{FoldAnswer, FoldQuery, SessionFact};
 use anyhow::anyhow;
 use chrono::TimeDelta;
 use log::{info, warn};
@@ -427,13 +428,12 @@ fn is_no_active_device_error(e: &anyhow::Error) -> bool {
 async fn native_can_claim_player_command(network: &Network) -> bool {
   #[cfg(feature = "streaming")]
   {
-    let app = network.app.lock().await;
-    app
-      .streaming_player
-      .as_ref()
-      .is_some_and(|p| p.is_available())
-      || app.native_backend_pending
-      || app.native_activation_pending
+    matches!(
+      network
+        .fold_query(FoldQuery::NativeCanClaimPlayerCommand)
+        .await,
+      Some(FoldAnswer::Bool(true))
+    )
   }
   #[cfg(not(feature = "streaming"))]
   {
@@ -507,15 +507,14 @@ async fn player_command_with_saved_device_retry(
 /// handled that way.
 #[cfg(feature = "streaming")]
 async fn suppressed_no_device_error_while_pending(network: &Network, e: &anyhow::Error) -> bool {
-  if !is_no_active_device_error(e) {
-    return false;
-  }
-  let mut app = network.app.lock().await;
-  if !app.native_backend_pending {
-    return false;
-  }
-  app.set_status_message("Reconnecting native streaming…", 5);
-  true
+  matches!(
+    network
+      .fold_query(FoldQuery::ClaimNativeReconnectingStatus {
+        is_no_active_device: is_no_active_device_error(e),
+      })
+      .await,
+    Some(FoldAnswer::Bool(true))
+  )
 }
 
 #[cfg(feature = "streaming")]
@@ -531,19 +530,14 @@ async fn suppressed_restriction_violation_while_pending(
   network: &Network,
   e: &anyhow::Error,
 ) -> bool {
-  if !is_restriction_violated_error(e) {
-    return false;
-  }
-  {
-    let app = network.app.lock().await;
-    if !(app.native_backend_pending || app.native_activation_pending) {
-      return false;
-    }
-  }
-  network
-    .show_status_message("Native streaming is still settling…".to_string(), 5)
-    .await;
-  true
+  matches!(
+    network
+      .fold_query(FoldQuery::ClaimNativeSettlingStatus {
+        is_restriction_violated: is_restriction_violated_error(e),
+      })
+      .await,
+    Some(FoldAnswer::Bool(true))
+  )
 }
 
 /// Transient native-session errors (`NO_ACTIVE_DEVICE` 404 or `Restriction
@@ -600,27 +594,33 @@ fn stale_api_item_should_preserve_native_context(context: StaleApiItemContext) -
 async fn current_streaming_player(
   network: &Network,
 ) -> Option<Arc<crate::infra::player::StreamingPlayer>> {
-  let app = network.app.lock().await;
-  app.streaming_player.clone()
+  match network.fold_query(FoldQuery::StreamingPlayerHandle).await {
+    Some(FoldAnswer::StreamingPlayer(player)) => player,
+    _ => None,
+  }
 }
 
-#[cfg(feature = "streaming")]
-async fn is_native_streaming_active_for_playback(network: &Network) -> bool {
-  let app = network.app.lock().await;
-  let streaming_player = app.streaming_player.clone();
-  let player_connected = streaming_player.as_ref().is_some_and(|p| p.is_available());
+// --- Ticket 17: fold-side transport-backend resolution. The fold's
+// `answer_query` arms call these so the whole backend decision (context
+// reads, device matching, activation heuristics) stays one atomic read under
+// the fold's lock, and the producer never locks App to route a command.
 
+/// The symmetric-operation native check, fold-side.
+#[cfg(feature = "streaming")]
+pub(crate) fn fold_is_native_streaming_active_for_playback(app: &App) -> bool {
+  let Some(streaming_player) = app.streaming_player.as_ref() else {
+    return false;
+  };
+  let player_connected = streaming_player.is_available();
   if !player_connected {
     return false;
   }
 
-  let native_device_name = streaming_player
-    .as_ref()
-    .map(|p| p.device_name().to_lowercase());
+  let native_device_name = streaming_player.device_name().to_lowercase();
 
   // If no context yet (e.g., at startup), use the app state flag which is
   // set when the native streaming device is activated/selected.
-  let Some(ref ctx) = app.current_playback_context else {
+  let Some(ctx) = app.current_playback_context.as_ref() else {
     return app.is_streaming_active;
   };
 
@@ -637,116 +637,49 @@ async fn is_native_streaming_active_for_playback(network: &Network) -> bool {
   // fresh native activity or a recent explicit activation. After a recovery,
   // Spotify can keep returning the old "spotatui" device while the new native
   // player is connected but stopped/not active.
-  if let Some(native_name) = native_device_name.as_ref() {
-    let current_device_name = ctx.device.name.to_lowercase();
-    if current_device_name == native_name.as_str() && app.has_fresh_native_activity() {
-      return true;
-    }
+  let current_device_name = ctx.device.name.to_lowercase();
+  if current_device_name == native_device_name && app.has_fresh_native_activity() {
+    return true;
   }
 
   // The user explicitly selected the native device very recently; honor that
   // intent even when the API context hasn't caught up yet (the brief pre-poll
   // window). `is_streaming_active` is re-derived from real Spotify state on the
   // next poll, so this cannot reintroduce the #254 device hijack. (#282)
-  if app.is_streaming_active
+  app.is_streaming_active
     && app
       .last_device_activation
       .is_some_and(|instant| instant.elapsed() < Duration::from_secs(5))
-  {
-    return true;
-  }
-
-  // No match - not the active device
-  false
 }
 
-/// Resolve the transport backend for a *symmetric* playback operation
-/// (pause/next/previous/seek/shuffle/repeat/volume).
-///
-/// Native streaming is chosen only when it is the active device *and* a player
-/// handle is present; otherwise the operation falls through to the Spotify Web
-/// API. This wraps the existing selection logic without changing it: the two
-/// awaited lookups happen in the same order as the original inline
-/// `if is_native_streaming_active_for_playback(..).await { if let Some(player) =
-/// current_streaming_player(..).await { .. } }` guard, so behaviour is identical.
+/// Symmetric transport backend, fold-side: the native player when native is
+/// selected (player present), else `None` for the Web API route.
 #[cfg(feature = "streaming")]
-async fn symmetric_playback_backend(network: &Network) -> PlaybackBackend {
-  let is_native_active = is_native_streaming_active_for_playback(network).await;
+pub(crate) fn fold_symmetric_playback_backend(
+  app: &App,
+) -> Option<Arc<crate::infra::player::StreamingPlayer>> {
+  let is_native_active = fold_is_native_streaming_active_for_playback(app);
   // Only look up the player when native is active, mirroring the original
-  // short-circuit (`if is_native { if let Some(player) ... }`) so the Connect
-  // path does not take the app lock the inline code never acquired.
+  // short-circuit so the Connect path does not take the lock it never took.
   let player = if is_native_active {
-    current_streaming_player(network).await
+    app.streaming_player.clone()
   } else {
     None
   };
   if select_native(is_native_active, player.is_some()) {
-    // `select_native` guarantees `player` is `Some` here.
-    PlaybackBackend::Native(player.expect("player present when native selected"))
-  } else {
-    PlaybackBackend::Connect
-  }
-}
-
-/// Resolve the transport backend for `start_playback`.
-///
-/// Unlike the symmetric operations, native streaming is selected when it is
-/// already active *or* when the activation heuristics say it should be
-/// activated for this playback. The `||` short-circuit and "fetch the player
-/// only when native applies" ordering are preserved exactly; a true predicate
-/// with a missing player still falls through to the Web API.
-#[cfg(feature = "streaming")]
-async fn start_playback_backend(network: &Network) -> PlaybackBackend {
-  let is_native_active = is_native_streaming_active_for_playback(network).await
-    || should_activate_native_streaming_for_playback(network).await;
-  let player = if is_native_active {
-    current_streaming_player(network).await
+    player
   } else {
     None
-  };
-  if select_native(is_native_active, player.is_some()) {
-    PlaybackBackend::Native(player.expect("player present when native selected"))
-  } else {
-    PlaybackBackend::Connect
   }
 }
 
-/// Resolve the transport backend for `transfert_playback_to_device`.
-///
-/// The native player is selected only when the *transfer target* `device_id`
-/// refers to the native streaming device, identified either by matching a
-/// cached device whose name equals the native device name, or by matching the
-/// recorded `native_device_id`. This mirrors the previous inline
-/// `is_native_transfer` computation exactly; an unrelated target falls through
-/// to the Web API transfer.
+/// Start-playback activation heuristic, fold-side. `saved_device_id` is the
+/// Web API client's saved device (lives on the producer's client config).
 #[cfg(feature = "streaming")]
-async fn transfer_playback_backend(network: &Network, device_id: &str) -> PlaybackBackend {
-  let player = current_streaming_player(network).await;
-  let is_native_transfer = if let Some(ref player) = player {
-    let native_name = player.device_name().to_lowercase();
-    let app = network.app.lock().await;
-    let matches_cached_device = app.devices.as_ref().is_some_and(|payload| {
-      payload
-        .devices
-        .iter()
-        .any(|d| d.id.as_deref() == Some(device_id) && d.name.to_lowercase() == native_name)
-    });
-    matches_cached_device || app.native_device_id.as_deref() == Some(device_id)
-  } else {
-    false
-  };
-
-  if select_native(is_native_transfer, player.is_some()) {
-    PlaybackBackend::Native(player.expect("player present when native selected"))
-  } else {
-    PlaybackBackend::Connect
-  }
-}
-
-#[cfg(feature = "streaming")]
-async fn should_activate_native_streaming_for_playback(network: &Network) -> bool {
-  let saved_device_id = network.client_config.device_id.as_deref();
-  let app = network.app.lock().await;
+pub(crate) fn fold_should_activate_native_streaming_for_playback(
+  app: &App,
+  saved_device_id: Option<&str>,
+) -> bool {
   let Some(player) = app.streaming_player.as_ref() else {
     return false;
   };
@@ -790,10 +723,133 @@ async fn should_activate_native_streaming_for_playback(network: &Network) -> boo
   })
 }
 
+/// Start-playback backend, fold-side.
+#[cfg(feature = "streaming")]
+pub(crate) fn fold_start_playback_backend(
+  app: &App,
+  saved_device_id: Option<&str>,
+) -> Option<Arc<crate::infra::player::StreamingPlayer>> {
+  let is_native_active = fold_is_native_streaming_active_for_playback(app)
+    || fold_should_activate_native_streaming_for_playback(app, saved_device_id);
+  let player = if is_native_active {
+    app.streaming_player.clone()
+  } else {
+    None
+  };
+  if select_native(is_native_active, player.is_some()) {
+    player
+  } else {
+    None
+  }
+}
+
+/// Transfer backend, fold-side: native only when the transfer target refers
+/// to the native streaming device.
+#[cfg(feature = "streaming")]
+pub(crate) fn fold_transfer_playback_backend(
+  app: &App,
+  device_id: &str,
+) -> Option<Arc<crate::infra::player::StreamingPlayer>> {
+  let player = app.streaming_player.clone();
+  let is_native_transfer = if let Some(ref player) = player {
+    let native_name = player.device_name().to_lowercase();
+    let matches_cached_device = app.devices.as_ref().is_some_and(|payload| {
+      payload
+        .devices
+        .iter()
+        .any(|d| d.id.as_deref() == Some(device_id) && d.name.to_lowercase() == native_name)
+    });
+    matches_cached_device || app.native_device_id.as_deref() == Some(device_id)
+  } else {
+    false
+  };
+
+  if select_native(is_native_transfer, player.is_some()) {
+    player
+  } else {
+    None
+  }
+}
+
+#[cfg(feature = "streaming")]
+async fn is_native_streaming_active_for_playback(network: &Network) -> bool {
+  matches!(
+    network
+      .fold_query(FoldQuery::IsNativeStreamingActiveForPlayback)
+      .await,
+    Some(FoldAnswer::Bool(true))
+  )
+}
+
+/// Resolve the transport backend for a *symmetric* playback operation
+/// (pause/next/previous/seek/shuffle/repeat/volume).
+///
+/// Native streaming is chosen only when it is the active device *and* a player
+/// handle is present; otherwise the operation falls through to the Spotify Web
+/// API. This wraps the existing selection logic without changing it: the two
+/// awaited lookups happen in the same order as the original inline
+/// `if is_native_streaming_active_for_playback(..).await { if let Some(player) =
+/// current_streaming_player(..).await { .. } }` guard, so behaviour is identical.
+#[cfg(feature = "streaming")]
+async fn symmetric_playback_backend(network: &Network) -> PlaybackBackend {
+  match network
+    .fold_query(FoldQuery::SymmetricPlaybackBackend)
+    .await
+  {
+    Some(FoldAnswer::StreamingPlayer(Some(player))) => PlaybackBackend::Native(player),
+    _ => PlaybackBackend::Connect,
+  }
+}
+
+/// Resolve the transport backend for `start_playback`.
+///
+/// Unlike the symmetric operations, native streaming is selected when it is
+/// already active *or* when the activation heuristics say it should be
+/// activated for this playback. The `||` short-circuit and "fetch the player
+/// only when native applies" ordering are preserved exactly; a true predicate
+/// with a missing player still falls through to the Web API.
+#[cfg(feature = "streaming")]
+async fn start_playback_backend(network: &Network) -> PlaybackBackend {
+  match network
+    .fold_query(FoldQuery::StartPlaybackBackend {
+      saved_device_id: network.client_config.device_id.clone(),
+    })
+    .await
+  {
+    Some(FoldAnswer::StreamingPlayer(Some(player))) => PlaybackBackend::Native(player),
+    _ => PlaybackBackend::Connect,
+  }
+}
+
+/// Resolve the transport backend for `transfert_playback_to_device`.
+///
+/// The native player is selected only when the *transfer target* `device_id`
+/// refers to the native streaming device, identified either by matching a
+/// cached device whose name equals the native device name, or by matching the
+/// recorded `native_device_id`. This mirrors the previous inline
+/// `is_native_transfer` computation exactly; an unrelated target falls through
+/// to the Web API transfer.
+#[cfg(feature = "streaming")]
+async fn transfer_playback_backend(network: &Network, device_id: &str) -> PlaybackBackend {
+  match network
+    .fold_query(FoldQuery::TransferPlaybackBackend {
+      device_id: device_id.to_string(),
+    })
+    .await
+  {
+    Some(FoldAnswer::StreamingPlayer(Some(player))) => PlaybackBackend::Native(player),
+    _ => PlaybackBackend::Connect,
+  }
+}
+
 #[cfg(feature = "streaming")]
 async fn request_native_streaming_recovery_if_disconnected(network: &Network) -> bool {
-  let mut app = network.app.lock().await;
-  app.request_native_streaming_recovery_if_disconnected(true)
+  matches!(
+    network
+      .fold_query(FoldQuery::ClaimNativeRecoveryIfDisconnected)
+      .await,
+    Some(FoldAnswer::Bool(true))
+  )
 }
 
 #[cfg(feature = "streaming")]
@@ -810,20 +866,12 @@ async fn requested_native_playback_origin(
     return NativePlaybackOrigin::RawList;
   }
 
-  let app = network.app.lock().await;
-  if let Some(origin) = app.native_playback_origin {
-    return origin;
-  }
-
-  if app
-    .current_playback_context
-    .as_ref()
-    .and_then(|ctx| ctx.context.as_ref())
-    .is_some()
+  match network
+    .fold_query(FoldQuery::NativePlaybackOriginFallback)
+    .await
   {
-    NativePlaybackOrigin::Context
-  } else {
-    NativePlaybackOrigin::RawList
+    Some(FoldAnswer::NativeOrigin(origin)) => origin,
+    _ => NativePlaybackOrigin::RawList,
   }
 }
 
@@ -1990,21 +2038,16 @@ impl PlaybackNetwork for Network {
   async fn pause_playback(&mut self) {
     #[cfg(feature = "streaming")]
     {
-      let mut app = self.app.lock().await;
-      app.pending_start_playback = None;
-      app.native_load_watchdog = None;
+      self
+        .emit_session(SessionFact::ClearStartPlaybackReplay)
+        .await;
     }
     // Check if using native streaming
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
       player.pause();
       // Update UI state immediately
-      let mut app = self.app.lock().await;
-      app.set_native_playback_intent(false);
-      app.native_is_playing = Some(false);
-      if let Some(ctx) = &mut app.current_playback_context {
-        ctx.is_playing = false;
-      }
+      self.emit_session(SessionFact::NativePauseMirrored).await;
       return;
     }
 
@@ -2012,18 +2055,21 @@ impl PlaybackNetwork for Network {
       .await
     {
       Ok(_) => {
-        let mut app = self.app.lock().await;
-        if let Some(ctx) = &mut app.current_playback_context {
-          ctx.is_playing = false;
-        }
+        self
+          .emit_session(SessionFact::TransportStateMirrored {
+            is_playing: Some(false),
+            shuffle: None,
+            repeat: None,
+            volume: None,
+          })
+          .await;
       }
       Err(e) => {
         #[cfg(feature = "streaming")]
         if suppressed_transient_native_command_error(self, &e).await {
           return;
         }
-        let mut app = self.app.lock().await;
-        app.handle_error(anyhow!(e));
+        self.handle_error(anyhow!(e)).await;
       }
     }
   }
@@ -2031,9 +2077,9 @@ impl PlaybackNetwork for Network {
   async fn next_track(&mut self) {
     #[cfg(feature = "streaming")]
     {
-      let mut app = self.app.lock().await;
-      app.pending_start_playback = None;
-      app.native_load_watchdog = None;
+      self
+        .emit_session(SessionFact::ClearStartPlaybackReplay)
+        .await;
     }
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
@@ -2048,17 +2094,16 @@ impl PlaybackNetwork for Network {
       if suppressed_transient_native_command_error(self, &e).await {
         return;
       }
-      let mut app = self.app.lock().await;
-      app.handle_error(anyhow!(e));
+      self.handle_error(anyhow!(e)).await;
     }
   }
 
   async fn previous_track(&mut self) {
     #[cfg(feature = "streaming")]
     {
-      let mut app = self.app.lock().await;
-      app.pending_start_playback = None;
-      app.native_load_watchdog = None;
+      self
+        .emit_session(SessionFact::ClearStartPlaybackReplay)
+        .await;
     }
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
@@ -2074,8 +2119,7 @@ impl PlaybackNetwork for Network {
       if suppressed_transient_native_command_error(self, &e).await {
         return;
       }
-      let mut app = self.app.lock().await;
-      app.handle_error(anyhow!(e));
+      self.handle_error(anyhow!(e)).await;
     }
   }
 
@@ -2104,8 +2148,7 @@ impl PlaybackNetwork for Network {
       if suppressed_transient_native_command_error(self, &e).await {
         return;
       }
-      let mut app = self.app.lock().await;
-      app.handle_error(anyhow!(e));
+      self.handle_error(anyhow!(e)).await;
       return;
     }
 
@@ -2113,7 +2156,10 @@ impl PlaybackNetwork for Network {
     // pump: a plain PreviousTrack with the position back at 0 skips to the
     // previous track, which is exactly the second half of the double-press
     // semantics.
-    let io_tx = self.app.lock().await.io_tx_clone();
+    let io_tx = match self.fold_query(FoldQuery::IoTx).await {
+      Some(FoldAnswer::IoTx(io_tx)) => io_tx,
+      _ => None,
+    };
     tokio::spawn(async move {
       tokio::time::sleep(std::time::Duration::from_millis(500)).await;
       if let Some(io_tx) = io_tx {
@@ -2127,10 +2173,8 @@ impl PlaybackNetwork for Network {
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
       player.seek(position_ms);
       self
-        .app
-        .lock()
-        .await
-        .set_native_recovery_position(position_ms);
+        .emit_session(SessionFact::NativeSeekMirrored { position_ms })
+        .await;
       return;
     }
 
@@ -2147,8 +2191,7 @@ impl PlaybackNetwork for Network {
       if suppressed_transient_native_command_error(self, &e).await {
         return;
       }
-      let mut app = self.app.lock().await;
-      app.handle_error(anyhow!(e));
+      self.handle_error(anyhow!(e)).await;
     }
   }
 
@@ -2156,15 +2199,11 @@ impl PlaybackNetwork for Network {
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
       let _ = player.set_shuffle(shuffle_state);
-      let mut app = self.app.lock().await;
-      app.set_native_recovery_shuffle(shuffle_state);
-      if let Some(ctx) = &mut app.current_playback_context {
-        ctx.shuffle_state = shuffle_state;
-      }
-      app.runtime_state.shuffle_enabled = shuffle_state;
-      app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
-        shuffle_state,
-      ));
+      self
+        .emit_session(SessionFact::NativeShuffleMirrored {
+          state: shuffle_state,
+        })
+        .await;
       return;
     }
 
@@ -2178,22 +2217,21 @@ impl PlaybackNetwork for Network {
     .await
     {
       Ok(_) => {
-        let mut app = self.app.lock().await;
-        if let Some(ctx) = &mut app.current_playback_context {
-          ctx.shuffle_state = shuffle_state;
-        }
-        app.runtime_state.shuffle_enabled = shuffle_state;
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
-          shuffle_state,
-        ));
+        self
+          .emit_session(SessionFact::TransportStateMirrored {
+            is_playing: None,
+            shuffle: Some(shuffle_state),
+            repeat: None,
+            volume: None,
+          })
+          .await;
       }
       Err(e) => {
         #[cfg(feature = "streaming")]
         if suppressed_transient_native_command_error(self, &e).await {
           return;
         }
-        let mut app = self.app.lock().await;
-        app.handle_error(anyhow!(e));
+        self.handle_error(anyhow!(e)).await;
       }
     }
   }
@@ -2202,11 +2240,11 @@ impl PlaybackNetwork for Network {
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
       let _ = player.set_repeat(repeat_state);
-      let mut app = self.app.lock().await;
-      app.set_native_recovery_repeat(repeat_state);
-      if let Some(ctx) = &mut app.current_playback_context {
-        ctx.repeat_state = repeat_state;
-      }
+      self
+        .emit_session(SessionFact::NativeRepeatMirrored {
+          state: repeat_state,
+        })
+        .await;
       return;
     }
 
@@ -2221,18 +2259,21 @@ impl PlaybackNetwork for Network {
     .await
     {
       Ok(_) => {
-        let mut app = self.app.lock().await;
-        if let Some(ctx) = &mut app.current_playback_context {
-          ctx.repeat_state = repeat_state;
-        }
+        self
+          .emit_session(SessionFact::TransportStateMirrored {
+            is_playing: None,
+            shuffle: None,
+            repeat: Some(repeat_state),
+            volume: None,
+          })
+          .await;
       }
       Err(e) => {
         #[cfg(feature = "streaming")]
         if suppressed_transient_native_command_error(self, &e).await {
           return;
         }
-        let mut app = self.app.lock().await;
-        app.handle_error(anyhow!(e));
+        self.handle_error(anyhow!(e)).await;
       }
     }
   }
@@ -2250,17 +2291,9 @@ impl PlaybackNetwork for Network {
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = symmetric_playback_backend(self).await {
       player.set_volume(volume);
-      let mut app = self.app.lock().await;
-      if let Some(ctx) = &mut app.current_playback_context {
-        ctx.device.volume_percent = Some(volume.into());
-      }
-      app.runtime_state.volume_percent = volume.min(100);
-      app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-        volume.min(100),
-      ));
-      app.is_volume_change_in_flight = false;
-      app.last_dispatched_volume = Some(volume);
-      // Keep pending_volume set — cleared when API confirms the value matches
+      self
+        .emit_session(SessionFact::NativeVolumeMirrored { volume })
+        .await;
       return;
     }
 
@@ -2274,31 +2307,22 @@ impl PlaybackNetwork for Network {
     .await
     {
       Ok(_) => {
-        let mut app = self.app.lock().await;
-        if let Some(ctx) = &mut app.current_playback_context {
-          ctx.device.volume_percent = Some(volume.into());
-        }
-        app.runtime_state.volume_percent = volume.min(100);
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-          volume.min(100),
-        ));
-        app.is_volume_change_in_flight = false;
-        app.last_dispatched_volume = Some(volume);
-        // Keep pending_volume set — cleared when get_current_playback confirms
+        self
+          .emit_session(SessionFact::TransportStateMirrored {
+            is_playing: None,
+            shuffle: None,
+            repeat: None,
+            volume: Some(volume),
+          })
+          .await;
       }
       Err(e) => {
-        {
-          let mut app = self.app.lock().await;
-          app.is_volume_change_in_flight = false;
-          app.pending_volume = None;
-          app.last_dispatched_volume = None;
-        }
+        self.emit_session(SessionFact::VolumeChangeDropped).await;
         #[cfg(feature = "streaming")]
         if suppressed_transient_native_command_error(self, &e).await {
           return;
         }
-        let mut app = self.app.lock().await;
-        app.handle_error(anyhow!(e));
+        self.handle_error(anyhow!(e)).await;
       }
     }
   }
@@ -2307,7 +2331,9 @@ impl PlaybackNetwork for Network {
     // A device change moves playback off the session's `from_tracks` load;
     // the app-owned shuffle order no longer describes what plays.
     #[cfg(feature = "streaming")]
-    self.app.lock().await.clear_native_shuffle_session();
+    self
+      .emit_session(SessionFact::ClearNativeShuffleSession)
+      .await;
     #[cfg(feature = "streaming")]
     if let PlaybackBackend::Native(player) = transfer_playback_backend(self, &device_id).await {
       let activation_time = Instant::now();
@@ -2641,8 +2667,7 @@ impl PlaybackNetwork for Network {
         self.start_playback(None, Some(vec![track]), None).await;
       }
       (None, None) => {
-        let mut app = self.app.lock().await;
-        app.set_status_message("Queue finished", 3);
+        self.emit_status("Queue finished".to_string(), 3).await;
       }
     }
   }
@@ -2658,17 +2683,21 @@ impl PlaybackNetwork for Network {
       .await
     {
       Ok(_) => {
-        let mut app = self.app.lock().await;
-        app.status_message = Some("Added to queue".to_string());
-        app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+        // Raw write for parity: the old handler stored the message directly
+        // (unscaled TTL), not through the status sink.
+        self
+          .emit_session(SessionFact::TransientStatus {
+            message: "Added to queue".to_string(),
+            ttl_secs: 3,
+          })
+          .await;
       }
       Err(e) => {
         #[cfg(feature = "streaming")]
         if suppressed_transient_native_command_error(self, &e).await {
           return;
         }
-        let mut app = self.app.lock().await;
-        app.handle_error(anyhow!(e));
+        self.handle_error(anyhow!(e)).await;
       }
     }
   }
@@ -2688,22 +2717,20 @@ impl PlaybackNetwork for Network {
             .and_then(mapping::playable_info),
           queue: q.queue.iter().filter_map(mapping::playable_info).collect(),
         };
-        let mut app = self.app.lock().await;
-        app.queue = Some(domain_queue);
-        app
-          .plugin_data_generations
-          .bump(crate::core::app::PluginDataKind::Queue);
+        self
+          .emit_session(SessionFact::QueueLanded(Some(domain_queue)))
+          .await;
       }
       Err(e) => {
-        let mut app = self.app.lock().await;
-        app.queue = None;
         // Bump on failure too: completion (not success) is what plugin data
         // requests wait on.
-        app
-          .plugin_data_generations
-          .bump(crate::core::app::PluginDataKind::Queue);
-        app.status_message = Some("Could not load queue (no active device?)".to_string());
-        app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
+        self.emit_session(SessionFact::QueueLanded(None)).await;
+        self
+          .emit_session(SessionFact::TransientStatus {
+            message: "Could not load queue (no active device?)".to_string(),
+            ttl_secs: 3,
+          })
+          .await;
         log::warn!("get_queue failed: {}", e);
       }
     }
@@ -3458,14 +3485,25 @@ mod tests {
       Some(SystemTime::now()),
     )));
     // No Spotify client is needed: the both-None arm never reaches `spotify()`.
+    // Ticket 17: the handler emits the status as a fact; the test plays the
+    // fold by draining the events through the same reducer the fold task uses.
+    let (spine, mut events_rx, _) = crate::runtime::engine::Spine::open(Default::default());
     let mut network = Network::new(
       None,
       ClientConfig::new(),
       &app,
       std::env::temp_dir().join("spotatui_resume_context_test.json"),
     );
+    network.spine = Some(spine);
 
     network.resume_spotify_context(None, None).await;
+
+    while let Ok(event) = events_rx.try_recv() {
+      if let crate::runtime::engine::EngineEvent::Session(fact) = event {
+        let mut guard = app.lock().await;
+        crate::runtime::frontend::apply_session_fact(&mut guard, fact);
+      }
+    }
 
     let guard = app.lock().await;
     assert_eq!(guard.status_message.as_deref(), Some("Queue finished"));

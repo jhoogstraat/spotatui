@@ -1180,6 +1180,110 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         crate::core::app::ActiveBlock::TrackTable,
       );
     }
+    SessionFact::QueueLanded(queue) => {
+      app.queue = queue;
+      // Completion, not success, is what plugin data requests wait on.
+      app
+        .plugin_data_generations
+        .bump(crate::core::app::PluginDataKind::Queue);
+    }
+    SessionFact::TransientStatus { message, ttl_secs } => {
+      // Raw write for parity with the old direct `status_message` stores: no
+      // TTL scaling, no error coupling.
+      app.status_message = Some(message);
+      app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(ttl_secs));
+    }
+    SessionFact::VolumeChangeDropped => {
+      app.is_volume_change_in_flight = false;
+      app.pending_volume = None;
+      app.last_dispatched_volume = None;
+    }
+    SessionFact::TransportStateMirrored {
+      is_playing,
+      shuffle,
+      repeat,
+      volume,
+    } => {
+      if let Some(v) = is_playing {
+        if let Some(ctx) = &mut app.current_playback_context {
+          ctx.is_playing = v;
+        }
+      }
+      if let Some(v) = shuffle {
+        if let Some(ctx) = &mut app.current_playback_context {
+          ctx.shuffle_state = v;
+        }
+        app.runtime_state.shuffle_enabled = v;
+        app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
+          v,
+        ));
+      }
+      if let Some(v) = repeat {
+        if let Some(ctx) = &mut app.current_playback_context {
+          ctx.repeat_state = v;
+        }
+      }
+      if let Some(v) = volume {
+        if let Some(ctx) = &mut app.current_playback_context {
+          ctx.device.volume_percent = Some(u32::from(v));
+        }
+        app.runtime_state.volume_percent = v.min(100);
+        app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
+          v.min(100),
+        ));
+        app.is_volume_change_in_flight = false;
+        app.last_dispatched_volume = Some(v);
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::ClearStartPlaybackReplay => {
+      // A new transport command supersedes any parked replay.
+      app.pending_start_playback = None;
+      app.native_load_watchdog = None;
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativePauseMirrored => {
+      app.set_native_playback_intent(false);
+      app.native_is_playing = Some(false);
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.is_playing = false;
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeSeekMirrored { position_ms } => {
+      app.set_native_recovery_position(position_ms);
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeShuffleMirrored { state } => {
+      app.set_native_recovery_shuffle(state);
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.shuffle_state = state;
+      }
+      app.runtime_state.shuffle_enabled = state;
+      app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
+        state,
+      ));
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeRepeatMirrored { state } => {
+      app.set_native_recovery_repeat(state);
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.repeat_state = state;
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeVolumeMirrored { volume } => {
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.device.volume_percent = Some(u32::from(volume));
+      }
+      app.runtime_state.volume_percent = volume.min(100);
+      app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
+        volume.min(100),
+      ));
+      app.is_volume_change_in_flight = false;
+      app.last_dispatched_volume = Some(volume);
+      // pending_volume stays set — cleared when the API confirms the value.
+    }
     SessionFact::DevicesLanded { devices, navigate } => {
       if navigate {
         app.push_navigation_stack(RouteId::SelectedDevice, ActiveBlock::SelectDevice);
@@ -1560,6 +1664,79 @@ pub(crate) fn answer_query(
         app.dj.finish_turn(turn_seq);
       }
       FoldAnswer::Bool(stale)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativeCanClaimPlayerCommand => FoldAnswer::Bool(
+      app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| p.is_available())
+        || app.native_backend_pending
+        || app.native_activation_pending,
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeReconnectingStatus {
+      is_no_active_device,
+    } => {
+      // Expected noise while a native backend materializes: surface a status
+      // message instead of routing to the full-screen Error. The check and
+      // the notice stay one step.
+      if !is_no_active_device || !app.native_backend_pending {
+        FoldAnswer::Bool(false)
+      } else {
+        app.set_status_message("Reconnecting native streaming…", 5);
+        FoldAnswer::Bool(true)
+      }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeSettlingStatus {
+      is_restriction_violated,
+    } => {
+      // De-escalate a `403 Restriction violated` while the native session is
+      // still settling; a steady-state restriction stays fatal.
+      if !is_restriction_violated || !(app.native_backend_pending || app.native_activation_pending)
+      {
+        FoldAnswer::Bool(false)
+      } else {
+        app.set_status_message("Native streaming is still settling…", 5);
+        FoldAnswer::Bool(true)
+      }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::IsNativeStreamingActiveForPlayback => FoldAnswer::Bool(
+      crate::infra::network::playback::fold_is_native_streaming_active_for_playback(app),
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::SymmetricPlaybackBackend => FoldAnswer::StreamingPlayer(
+      crate::infra::network::playback::fold_symmetric_playback_backend(app),
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::StartPlaybackBackend { saved_device_id } => FoldAnswer::StreamingPlayer(
+      crate::infra::network::playback::fold_start_playback_backend(app, saved_device_id.as_deref()),
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::TransferPlaybackBackend { device_id } => FoldAnswer::StreamingPlayer(
+      crate::infra::network::playback::fold_transfer_playback_backend(app, &device_id),
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeRecoveryIfDisconnected => {
+      FoldAnswer::Bool(app.request_native_streaming_recovery_if_disconnected(true))
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlaybackOriginFallback => {
+      let origin = app.native_playback_origin.unwrap_or_else(|| {
+        if app
+          .current_playback_context
+          .as_ref()
+          .and_then(|ctx| ctx.context.as_ref())
+          .is_some()
+        {
+          crate::core::app::NativePlaybackOrigin::Context
+        } else {
+          crate::core::app::NativePlaybackOrigin::RawList
+        }
+      });
+      FoldAnswer::NativeOrigin(origin)
     }
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),

@@ -224,6 +224,52 @@ pub enum SessionFact {
     devices: Vec<rspotify::model::device::Device>,
     navigate: bool,
   },
+  // --- Ticket 17 (playback family): transport-command mirrors. Each fact
+  // names the outcome whose UI/recovery writes it folds. The native-backed
+  // mirrors are streaming-only; `TransportStateMirrored` and the volume-drop
+  // also serve the Web API legs that run on slim builds.
+  /// A new transport command supersedes any parked replay: drop
+  /// `pending_start_playback` and the load watchdog.
+  #[cfg(feature = "streaming")]
+  ClearStartPlaybackReplay,
+  /// A native pause landed: mirror it into the play intent, native play
+  /// state, and the context.
+  #[cfg(feature = "streaming")]
+  NativePauseMirrored,
+  /// A native seek landed: record the recovery position.
+  #[cfg(feature = "streaming")]
+  NativeSeekMirrored { position_ms: u32 },
+  /// A native shuffle toggle landed: recovery state + context + runtime
+  /// state + the persisted save.
+  #[cfg(feature = "streaming")]
+  NativeShuffleMirrored { state: bool },
+  /// A native repeat toggle landed: recovery state + context.
+  #[cfg(feature = "streaming")]
+  NativeRepeatMirrored { state: rspotify::model::RepeatState },
+  /// A native volume change landed: context, runtime state, persisted save,
+  /// and the in-flight bookkeeping (`pending_volume` stays until the API
+  /// confirms the value).
+  #[cfg(feature = "streaming")]
+  NativeVolumeMirrored { volume: u8 },
+  /// A Web API transport command landed: mirror whichever of play state,
+  /// shuffle, repeat, volume the command wrote (each `Some` mirrors exactly
+  /// the writes its success path did).
+  TransportStateMirrored {
+    is_playing: Option<bool>,
+    shuffle: Option<bool>,
+    repeat: Option<rspotify::model::RepeatState>,
+    volume: Option<u8>,
+  },
+  /// A Web API volume change failed: drop the in-flight bookkeeping so the UI
+  /// falls back to whatever the API last reported.
+  VolumeChangeDropped,
+  /// A raw, unscaled status notice (the old direct `status_message` writes —
+  /// no TTL scaling, no error-flag coupling).
+  TransientStatus { message: String, ttl_secs: u64 },
+  /// A Web API queue load landed: install (or clear) the queue and bump its
+  /// plugin-data generation (completion, not success, is what requests wait
+  /// on).
+  QueueLanded(Option<crate::core::app::QueueState>),
 }
 
 /// The parts of a DJ turn outcome the epilogue reports on.
@@ -314,6 +360,51 @@ impl std::fmt::Debug for SessionFact {
         .debug_struct("DevicesLanded")
         .field("navigate", navigate)
         .finish_non_exhaustive(),
+      #[cfg(feature = "streaming")]
+      SessionFact::ClearStartPlaybackReplay => f.write_str("ClearStartPlaybackReplay"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativePauseMirrored => f.write_str("NativePauseMirrored"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeSeekMirrored { position_ms } => f
+        .debug_struct("NativeSeekMirrored")
+        .field("position_ms", position_ms)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeShuffleMirrored { state } => f
+        .debug_struct("NativeShuffleMirrored")
+        .field("state", state)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeRepeatMirrored { state } => f
+        .debug_struct("NativeRepeatMirrored")
+        .field("state", state)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeVolumeMirrored { volume } => f
+        .debug_struct("NativeVolumeMirrored")
+        .field("volume", volume)
+        .finish(),
+      SessionFact::TransportStateMirrored {
+        is_playing,
+        shuffle,
+        repeat,
+        volume,
+      } => f
+        .debug_struct("TransportStateMirrored")
+        .field("is_playing", &is_playing.is_some())
+        .field("shuffle", &shuffle.is_some())
+        .field("repeat", &repeat.is_some())
+        .field("volume", volume)
+        .finish(),
+      SessionFact::VolumeChangeDropped => f.write_str("VolumeChangeDropped"),
+      SessionFact::TransientStatus { ttl_secs, .. } => f
+        .debug_struct("TransientStatus")
+        .field("ttl_secs", ttl_secs)
+        .finish_non_exhaustive(),
+      SessionFact::QueueLanded(queue) => f
+        .debug_tuple("QueueLanded")
+        .field(&queue.is_some())
+        .finish(),
       SessionFact::ApplyAction(action) => f.debug_tuple("ApplyAction").field(action).finish(),
       #[cfg(feature = "dj-core")]
       SessionFact::DjPushLine { speaker, text } => f
@@ -699,6 +790,50 @@ pub enum FoldQuery {
   /// wedge auto-queue for the rest of the session)?
   #[cfg(feature = "ai-dj")]
   ClaimDjTopUp { generation: u64, turn_seq: u64 },
+  // --- Ticket 17 (playback family): transport-command claims and reads.
+  /// Can a native backend claim a failed player command (available player, or
+  /// a backend/activation still materializing)? Decides the saved-device
+  /// retry gate.
+  #[cfg(feature = "streaming")]
+  NativeCanClaimPlayerCommand,
+  /// Was the NO_ACTIVE_DEVICE error expected noise while a native backend
+  /// materializes, showing the reconnecting notice if so? The producer
+  /// classifies the error text (no lock needed); the fold runs the
+  /// check-and-notice, so the pending flag is not split from the status it
+  /// gates.
+  #[cfg(feature = "streaming")]
+  ClaimNativeReconnectingStatus { is_no_active_device: bool },
+  /// Was the 403 restriction violation de-escalated while the native session
+  /// is still settling, showing the settling notice if so? The producer
+  /// classifies the error text; the fold runs the check-and-notice.
+  #[cfg(feature = "streaming")]
+  ClaimNativeSettlingStatus { is_restriction_violated: bool },
+  /// Is native streaming the active playback device per the context/heuristic
+  /// rules? (The fold runs the same logic the producer's read used.)
+  #[cfg(feature = "streaming")]
+  IsNativeStreamingActiveForPlayback,
+  /// Resolve the transport backend for a symmetric playback operation: the
+  /// native player handle when native is selected, `None` for the Web API.
+  #[cfg(feature = "streaming")]
+  SymmetricPlaybackBackend,
+  /// Resolve the transport backend for `start_playback` (native is selected
+  /// when already active *or* when the activation heuristics say so). The
+  /// saved device id feeds the activation heuristic (it lives on the
+  /// producer's client config).
+  #[cfg(feature = "streaming")]
+  StartPlaybackBackend { saved_device_id: Option<String> },
+  /// Resolve the transport backend for a device transfer: native only when
+  /// the target `device_id` refers to the native streaming device.
+  #[cfg(feature = "streaming")]
+  TransferPlaybackBackend { device_id: String },
+  /// Claim a native streaming recovery if the player is disconnected (the old
+  /// `request_native_streaming_recovery_if_disconnected` check-and-set).
+  #[cfg(feature = "streaming")]
+  ClaimNativeRecoveryIfDisconnected,
+  /// The requested playback origin for a bare resume (no context, no uris):
+  /// the recorded origin, else derived from the current context.
+  #[cfg(feature = "streaming")]
+  NativePlaybackOriginFallback,
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -785,6 +920,9 @@ pub enum FoldAnswer {
   /// The configured agent brain, `Err` carrying the config error.
   #[cfg(feature = "ai-dj")]
   DjBrain(Result<Box<crate::infra::dj::brain::DjBrain>, String>),
+  /// The playback origin a bare resume should record.
+  #[cfg(feature = "streaming")]
+  NativeOrigin(crate::core::app::NativePlaybackOrigin),
 }
 
 impl std::fmt::Debug for FoldAnswer {
@@ -836,6 +974,8 @@ impl std::fmt::Debug for FoldAnswer {
         .field(&player.is_some())
         .finish(),
       FoldAnswer::IoTx(io_tx) => f.debug_tuple("IoTx").field(&io_tx.is_some()).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeOrigin(origin) => f.debug_tuple("NativeOrigin").field(origin).finish(),
       #[cfg(feature = "streaming")]
       FoldAnswer::NativeShuffleInstall { generation, reload } => f
         .debug_struct("NativeShuffleInstall")
