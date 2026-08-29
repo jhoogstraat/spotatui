@@ -479,17 +479,25 @@ async fn release_other_backends(app: &Arc<Mutex<App>>) {
     #[cfg(feature = "internet-radio")]
     radio,
     #[cfg(feature = "youtube")]
-    youtube: _,
+      youtube: _,
   })) = answer
   {
     #[cfg(feature = "streaming")]
-    if let Some(player) = streaming { player.pause(); }
+    if let Some(player) = streaming {
+      player.pause();
+    }
     #[cfg(feature = "local-files")]
-    if let Some(state) = local { state.player.stop(); }
+    if let Some(state) = local {
+      state.player.stop();
+    }
     #[cfg(feature = "subsonic")]
-    if let Some(state) = subsonic { state.player.stop(); }
+    if let Some(state) = subsonic {
+      state.player.stop();
+    }
     #[cfg(feature = "internet-radio")]
-    if let Some(state) = radio { state.player.stop(); }
+    if let Some(state) = radio {
+      state.player.stop();
+    }
   }
 }
 

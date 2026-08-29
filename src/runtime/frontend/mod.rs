@@ -467,7 +467,9 @@ async fn driver_loop(
     driver.on_quit(&mut app);
   }
   // Persistence scheduling is fold-owned; producers only request the flush.
-  let _ = spine.query(crate::runtime::engine::FoldQuery::FlushStateSave).await;
+  let _ = spine
+    .query(crate::runtime::engine::FoldQuery::FlushStateSave)
+    .await;
   #[cfg(feature = "streaming")]
   super::startup::pause_native_playback_before_exit(&app).await;
   history_collector.shutdown().await;
