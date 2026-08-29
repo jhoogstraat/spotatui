@@ -63,16 +63,17 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
         crate::infra::queue::dispatch::route_queue_event(&network.app, &io_event).await;
       // Local-file playback is intercepted before the Spotify network so the
       // network stays Spotify-only (see infra::local::dispatch).
-      let handled_locally = !handled_queue && {
-        #[cfg(feature = "local-files")]
-        {
-          crate::infra::local::dispatch::route_local_event(&network.app, &io_event).await
+      #[cfg(feature = "local-files")]
+      let handled_locally = if !handled_queue {
+        match network.spine.as_ref() {
+          Some(spine) => crate::infra::local::dispatch::route_local_event(spine, &io_event).await,
+          None => false,
         }
-        #[cfg(not(feature = "local-files"))]
-        {
-          false
-        }
+      } else {
+        false
       };
+      #[cfg(not(feature = "local-files"))]
+      let handled_locally = false;
       // Subsonic is intercepted after local and before the Spotify network. A
       // `subsonic:` URI falls through the local dispatch (its `is_file_uri` is
       // false) and is caught here (see infra::subsonic::dispatch). Skipped when

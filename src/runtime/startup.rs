@@ -1051,9 +1051,11 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   }
 
   let network_app = Arc::clone(&app);
+  let network_spine = spine_for_events.clone();
   info!("spawning spotify network event handler");
   tokio::spawn(async move {
     let mut network = Network::new(spotify, client_config, &network_app, final_token_cache_path);
+    network.spine = Some(network_spine.clone());
 
     // The saved-device startup decision moved into
     // `deferred_streaming_startup` (it needs the native player's device
@@ -1075,8 +1077,15 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       // source's own start path, which serializes on the `App` lock like every
       // other event, so running it concurrently is safe.
       let restore_app = Arc::clone(&network.app);
+      let restore_spine = network_spine.clone();
       tokio::spawn(async move {
-        restore_playback_session(&restore_app, session, initial_startup_behavior).await;
+        restore_playback_session(
+          &restore_app,
+          &restore_spine,
+          session,
+          initial_startup_behavior,
+        )
+        .await;
       });
     } else if network.spotify.is_some() {
       // Spotify startup play/pause only applies with a Spotify session; a
@@ -1181,6 +1190,7 @@ pub(crate) async fn pause_native_playback_before_exit(app: &Arc<Mutex<App>>) {
 #[allow(unused_variables)]
 async fn restore_playback_session(
   app: &Arc<Mutex<App>>,
+  spine: &crate::runtime::engine::Spine,
   session: crate::core::persisted_playback::PersistedPlayback,
   startup_behavior: StartupBehavior,
 ) {
@@ -1215,7 +1225,7 @@ async fn restore_playback_session(
       }
       // Local reads tags from disk, so the URI queue alone drives the start.
       crate::infra::local::dispatch::route_local_event(
-        app,
+        spine,
         &IoEvent::StartPlayback(None, Some(queue), Some(index)),
       )
       .await;

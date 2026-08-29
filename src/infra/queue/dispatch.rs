@@ -856,7 +856,9 @@ async fn resume_local(
   }
   // Local has no retained tempfile; play_index re-reads from disk (restarting
   // the track), then we seek to the saved position for a mid-track resume.
-  crate::infra::local::dispatch::play_index(app, index).await;
+  if let Some(spine) = app.lock().await.spine.clone() {
+    crate::infra::local::dispatch::play_index(&spine, index).await;
+  }
   if resume_position_ms > 0 {
     let guard = app.lock().await;
     if let Some(local) = guard.local_playback.as_ref() {

@@ -106,6 +106,12 @@ pub enum DecodedSourceFact {
     info: Option<crate::core::plugin_api::TrackInfo>,
   },
   #[cfg(feature = "local-files")]
+  LocalFailedIndex { target: usize, message: String },
+  #[cfg(feature = "local-files")]
+  LocalReplaySucceeded,
+  #[cfg(feature = "local-files")]
+  LocalStatus { message: String, ttl_secs: u64 },
+  #[cfg(feature = "local-files")]
   LocalRepeat(crate::infra::queue::RepeatMode),
 }
 
@@ -124,6 +130,14 @@ pub enum DecodedSourceQuery {
   #[cfg(feature = "local-files")]
   LocalShuffle,
   #[cfg(feature = "local-files")]
+  LocalSkip {
+    forward: bool,
+  },
+  #[cfg(feature = "local-files")]
+  LocalPlayIndex(usize),
+  #[cfg(feature = "local-files")]
+  LocalRepeat(rspotify::model::enums::RepeatState),
+  #[cfg(feature = "local-files")]
   BackendPlayers,
   Volume,
 }
@@ -141,9 +155,15 @@ pub enum DecodedSourceAnswer {
     repeat: crate::infra::queue::RepeatMode,
   },
   #[cfg(feature = "local-files")]
-  LocalReplay(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
+  LocalReplay(Option<(Arc<crate::infra::audio::LocalPlayer>, std::path::PathBuf)>),
   #[cfg(feature = "local-files")]
   LocalShuffle(bool),
+  #[cfg(feature = "local-files")]
+  LocalSkip(Option<usize>),
+  #[cfg(feature = "local-files")]
+  LocalPlayIndex(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
+  #[cfg(feature = "local-files")]
+  LocalRepeat(bool),
   #[cfg(feature = "local-files")]
   BackendPlayers {
     #[cfg(feature = "streaming")]
@@ -194,6 +214,12 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::LocalAdvancing(_) => "LocalAdvancing",
       #[cfg(feature = "local-files")]
       Self::LocalIndex { .. } => "LocalIndex",
+      #[cfg(feature = "local-files")]
+      Self::LocalFailedIndex { .. } => "LocalFailedIndex",
+      #[cfg(feature = "local-files")]
+      Self::LocalReplaySucceeded => "LocalReplaySucceeded",
+      #[cfg(feature = "local-files")]
+      Self::LocalStatus { .. } => "LocalStatus",
       #[cfg(feature = "local-files")]
       Self::LocalRepeat(_) => "LocalRepeat",
       Self::Volume(_) => "Volume",

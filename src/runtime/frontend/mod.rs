@@ -863,6 +863,38 @@ pub(crate) fn apply_decoded_source_fact(
       }
     }
     #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalFailedIndex { target, message } => {
+      let exhausted = app.local_playback.as_mut().is_some_and(|local| {
+        local.index = target;
+        local.failed_since_played.insert(target);
+        if local.failed_since_played.len() < local.queue.len() {
+          local.advancing = false;
+          false
+        } else {
+          true
+        }
+      });
+      if exhausted {
+        if let Some(local) = app.local_playback.take() {
+          local.player.stop();
+        }
+        app.set_status_message(format!("{message} — no playable tracks left, stopping"), 6);
+      } else {
+        app.set_status_message(message, 6);
+      }
+    }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalReplaySucceeded => {
+      if let Some(local) = app.local_playback.as_mut() {
+        local.advancing = false;
+        local.failed_since_played.clear();
+      }
+    }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalStatus { message, ttl_secs } => {
+      app.set_status_message(message, ttl_secs);
+    }
+    #[cfg(feature = "local-files")]
     DecodedSourceFact::LocalRepeat(mode) => app.decoded_repeat = mode,
     #[cfg(feature = "subsonic")]
     DecodedSourceFact::SubsonicPlaylists(items) => app.subsonic_playlists = items,
@@ -2499,20 +2531,41 @@ fn answer_decoded_query(
     }),
     #[cfg(feature = "local-files")]
     Q::LocalReplay => {
-      FoldAnswer::Decoded(A::LocalReplay(app.local_playback.as_ref().and_then(|s| {
+      FoldAnswer::Decoded(A::LocalReplay(app.local_playback.as_mut().and_then(|s| {
+        s.advancing = true;
         s.queue
           .get(s.index)
           .and_then(|uri| crate::infra::local::file_uri_to_path(uri).ok())
-          .map(|p| {
-            (
-              std::sync::Arc::clone(&s.player),
-              p.to_string_lossy().into_owned(),
-            )
-          })
+          .map(|p| (std::sync::Arc::clone(&s.player), p))
       })))
     }
     #[cfg(feature = "local-files")]
     Q::LocalShuffle => FoldAnswer::Decoded(A::LocalShuffle(app.decoded_shuffle)),
+    #[cfg(feature = "local-files")]
+    Q::LocalSkip { forward } => FoldAnswer::Decoded(A::LocalSkip(
+      app.local_playback.as_mut().and_then(|local| {
+        local.advancing = true;
+        crate::infra::queue::advance_index(
+          local.index,
+          local.queue.len(),
+          app.decoded_repeat,
+          forward,
+        )
+      }),
+    )),
+    #[cfg(feature = "local-files")]
+    Q::LocalPlayIndex(target) => FoldAnswer::Decoded(A::LocalPlayIndex(
+      app.local_playback.as_mut().and_then(|local| {
+        local.queue.get(target).map(|uri| {
+          local.advancing = true;
+          (std::sync::Arc::clone(&local.player), uri.clone())
+        })
+      }),
+    )),
+    #[cfg(feature = "local-files")]
+    Q::LocalRepeat(state) => {
+      FoldAnswer::Decoded(A::LocalRepeat(app.set_decoded_repeat_from_state(state)))
+    }
     #[cfg(feature = "local-files")]
     Q::BackendPlayers => FoldAnswer::Decoded(A::BackendPlayers {
       #[cfg(feature = "streaming")]
