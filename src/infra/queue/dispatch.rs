@@ -102,11 +102,13 @@ async fn route_queue_transport(app: &Arc<Mutex<App>>, event: &IoEvent) -> Option
     }
     IoEvent::ChangeVolume(volume) => {
       player.set_volume(*volume as f32 / 100.0);
-      let mut app = app.lock().await;
-      app.runtime_state.volume_percent = *volume;
-      app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-        *volume,
-      ));
+      if let Some(spine) = app.lock().await.spine.clone() {
+        spine
+          .emit(crate::runtime::engine::EngineEvent::Decoded(
+            crate::runtime::engine::DecodedSourceFact::Volume(*volume),
+          ))
+          .await;
+      }
       Some(true)
     }
     // Skip the queued track: advance to the next queued item (or resume).
@@ -984,7 +986,16 @@ async fn resume_youtube(
 }
 
 async fn set_status(app: &Arc<Mutex<App>>, message: String) {
-  app.lock().await.set_status_message(message, 4);
+  if let Some(spine) = app.lock().await.spine.clone() {
+    spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::TransientStatus {
+          message,
+          ttl_secs: 4,
+        },
+      ))
+      .await;
+  }
 }
 
 #[cfg(test)]
