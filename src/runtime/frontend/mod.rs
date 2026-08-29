@@ -245,6 +245,7 @@ impl Runtime {
           tick_rt.block_on(async move {
             driver_loop(
               app,
+              spine.clone(),
               shutdown_rx,
               shared_position,
               history_collector,
@@ -378,6 +379,7 @@ impl DriverWake {
 
 async fn driver_loop(
   app: Arc<Mutex<App>>,
+  spine: crate::runtime::engine::Spine,
   mut shutdown_rx: watch::Receiver<bool>,
   shared_position: Option<Arc<std::sync::atomic::AtomicU64>>,
   history_collector: crate::infra::history::HistoryCollectorHandle,
@@ -464,10 +466,8 @@ async fn driver_loop(
     let mut app = app.lock().await;
     driver.on_quit(&mut app);
   }
-  {
-    let mut app = app.lock().await;
-    app.flush_state_save(true);
-  }
+  // Persistence scheduling is fold-owned; producers only request the flush.
+  let _ = spine.query(crate::runtime::engine::FoldQuery::FlushStateSave).await;
   #[cfg(feature = "streaming")]
   super::startup::pause_native_playback_before_exit(&app).await;
   history_collector.shutdown().await;
