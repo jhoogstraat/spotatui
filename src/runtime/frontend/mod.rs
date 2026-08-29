@@ -862,6 +862,8 @@ pub(crate) fn apply_decoded_source_fact(
         }
       }
     }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalRepeat(mode) => app.decoded_repeat = mode,
     #[cfg(feature = "subsonic")]
     DecodedSourceFact::SubsonicPlaylists(items) => app.subsonic_playlists = items,
     #[cfg(feature = "subsonic")]
@@ -2511,6 +2513,26 @@ fn answer_decoded_query(
     }
     #[cfg(feature = "local-files")]
     Q::LocalShuffle => FoldAnswer::Decoded(A::LocalShuffle(app.decoded_shuffle)),
+    #[cfg(feature = "local-files")]
+    Q::BackendPlayers => FoldAnswer::Decoded(A::BackendPlayers {
+      #[cfg(feature = "streaming")]
+      streaming: app.streaming_player.clone(),
+      #[cfg(feature = "subsonic")]
+      subsonic: app
+        .subsonic_playback
+        .as_ref()
+        .map(|s| std::sync::Arc::clone(&s.player)),
+      #[cfg(feature = "internet-radio")]
+      radio: app
+        .radio_playback
+        .as_ref()
+        .map(|s| std::sync::Arc::clone(&s.player)),
+      #[cfg(feature = "youtube")]
+      youtube: app
+        .youtube_playback
+        .as_ref()
+        .map(|s| std::sync::Arc::clone(&s.player)),
+    }),
   }
 }
 

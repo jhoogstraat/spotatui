@@ -105,6 +105,8 @@ pub enum DecodedSourceFact {
     target: usize,
     info: Option<crate::core::plugin_api::TrackInfo>,
   },
+  #[cfg(feature = "local-files")]
+  LocalRepeat(crate::infra::queue::RepeatMode),
 }
 
 /// Typed decoded-source reads. Source handlers receive the live `Spine` and
@@ -121,6 +123,8 @@ pub enum DecodedSourceQuery {
   LocalReplay,
   #[cfg(feature = "local-files")]
   LocalShuffle,
+  #[cfg(feature = "local-files")]
+  BackendPlayers,
   Volume,
 }
 
@@ -140,6 +144,17 @@ pub enum DecodedSourceAnswer {
   LocalReplay(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
   #[cfg(feature = "local-files")]
   LocalShuffle(bool),
+  #[cfg(feature = "local-files")]
+  BackendPlayers {
+    #[cfg(feature = "streaming")]
+    streaming: Option<Arc<crate::infra::player::StreamingPlayer>>,
+    #[cfg(feature = "subsonic")]
+    subsonic: Option<Arc<crate::infra::audio::LocalPlayer>>,
+    #[cfg(feature = "internet-radio")]
+    radio: Option<Arc<crate::infra::audio::LocalPlayer>>,
+    #[cfg(feature = "youtube")]
+    youtube: Option<Arc<crate::infra::audio::LocalPlayer>>,
+  },
 }
 
 impl std::fmt::Debug for DecodedSourceFact {
@@ -179,6 +194,8 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::LocalAdvancing(_) => "LocalAdvancing",
       #[cfg(feature = "local-files")]
       Self::LocalIndex { .. } => "LocalIndex",
+      #[cfg(feature = "local-files")]
+      Self::LocalRepeat(_) => "LocalRepeat",
       Self::Volume(_) => "Volume",
     };
     f.write_str(name)
