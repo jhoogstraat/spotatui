@@ -38,6 +38,9 @@ use crate::core::source::{Searcher, Source};
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
 use crate::infra::queue::{advance_index, replay_file};
+use crate::runtime::engine::{
+  DecodedSourceAnswer as Answer, DecodedSourceQuery as Query, FoldAnswer, FoldQuery, Spine,
+};
 
 /// Skip direction within the YouTube queue.
 #[derive(Clone, Copy)]
@@ -458,39 +461,35 @@ fn snapshot_tracks(
 
 /// Release the other backends so only YouTube holds the output device.
 async fn release_other_backends(app: &Arc<Mutex<App>>) {
-  // In a youtube-only build every block below is compiled out.
-  let _ = app;
-  // Pause native Spotify so librespot releases the device.
-  #[cfg(feature = "streaming")]
+  let spine = app.lock().await.spine.clone();
+  let Some(spine) = spine else { return };
+  let answer = spine
+    .query(FoldQuery::Decoded(Query::ClaimBackendPlayers {
+      keep: Some(crate::core::source::Source::YouTube),
+    }))
+    .await
+    .ok();
+  if let Some(FoldAnswer::Decoded(Answer::BackendPlayers {
+    #[cfg(feature = "streaming")]
+    streaming,
+    #[cfg(feature = "local-files")]
+    local,
+    #[cfg(feature = "subsonic")]
+    subsonic,
+    #[cfg(feature = "internet-radio")]
+    radio,
+    #[cfg(feature = "youtube")]
+    youtube: _,
+  })) = answer
   {
-    let streaming = app.lock().await.streaming_player.clone();
-    if let Some(player) = streaming {
-      player.pause();
-    }
-  }
-  // Tear down any local-file session (dropping it releases its device handle).
-  #[cfg(feature = "local-files")]
-  {
-    let local = app.lock().await.local_playback.take();
-    if let Some(local) = local {
-      local.player.stop();
-    }
-  }
-  // Tear down any Subsonic session.
-  #[cfg(feature = "subsonic")]
-  {
-    let subsonic = app.lock().await.subsonic_playback.take();
-    if let Some(subsonic) = subsonic {
-      subsonic.player.stop();
-    }
-  }
-  // Tear down any radio session.
-  #[cfg(feature = "internet-radio")]
-  {
-    let radio = app.lock().await.radio_playback.take();
-    if let Some(radio) = radio {
-      radio.player.stop();
-    }
+    #[cfg(feature = "streaming")]
+    if let Some(player) = streaming { player.pause(); }
+    #[cfg(feature = "local-files")]
+    if let Some(state) = local { state.player.stop(); }
+    #[cfg(feature = "subsonic")]
+    if let Some(state) = subsonic { state.player.stop(); }
+    #[cfg(feature = "internet-radio")]
+    if let Some(state) = radio { state.player.stop(); }
   }
 }
 
