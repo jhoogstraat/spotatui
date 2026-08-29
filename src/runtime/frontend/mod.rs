@@ -842,6 +842,26 @@ pub(crate) fn apply_decoded_source_fact(
         local.player.stop();
       }
     }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalAdvancing(value) => {
+      if let Some(local) = app.local_playback.as_mut() {
+        local.advancing = value;
+      }
+    }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalIndex { target, info } => {
+      if let Some(local) = app.local_playback.as_mut() {
+        local.index = target;
+        local.advancing = false;
+        if let Some(info) = info {
+          local.name = info.name;
+          local.artists = info.artists.join(", ");
+          local.album = info.album;
+          local.duration_ms = info.duration_ms;
+          local.failed_since_played.clear();
+        }
+      }
+    }
     #[cfg(feature = "subsonic")]
     DecodedSourceFact::SubsonicPlaylists(items) => app.subsonic_playlists = items,
     #[cfg(feature = "subsonic")]
@@ -1691,6 +1711,7 @@ pub(crate) fn answer_query(
   use crate::core::catalog::LibrarySection;
   use crate::runtime::engine::{FoldAnswer, FoldQuery};
   match query {
+    FoldQuery::Decoded(query) => answer_decoded_query(app, query),
     FoldQuery::LibraryRequestLive { generation, .. } => {
       FoldAnswer::Bool(app.saved_tracks_prefetch_generation == generation)
     }
@@ -2444,6 +2465,52 @@ pub(crate) fn answer_query(
       app.playlist_tracks_prefetch_in_flight.remove(&offset);
       FoldAnswer::Bool(true)
     }
+  }
+}
+
+#[allow(unused_variables)]
+fn answer_decoded_query(
+  app: &mut App,
+  query: crate::runtime::engine::DecodedSourceQuery,
+) -> crate::runtime::engine::FoldAnswer {
+  use crate::runtime::engine::{DecodedSourceAnswer as A, DecodedSourceQuery as Q, FoldAnswer};
+  match query {
+    Q::Volume => FoldAnswer::Decoded(crate::runtime::engine::DecodedSourceAnswer::Volume(
+      app.runtime_state.volume_percent,
+    )),
+    #[cfg(feature = "local-files")]
+    Q::LocalConfig => FoldAnswer::Decoded(A::LocalConfig(
+      app.user_config.behavior.local_music_path.clone(),
+    )),
+    #[cfg(feature = "local-files")]
+    Q::LocalPlayer => FoldAnswer::Decoded(A::LocalPlayer(
+      app
+        .local_playback
+        .as_ref()
+        .map(|s| std::sync::Arc::clone(&s.player)),
+    )),
+    #[cfg(feature = "local-files")]
+    Q::LocalQueue => FoldAnswer::Decoded(A::LocalQueue {
+      index: app.local_playback.as_ref().map_or(0, |s| s.index),
+      len: app.local_playback.as_ref().map_or(0, |s| s.queue.len()),
+      repeat: app.decoded_repeat,
+    }),
+    #[cfg(feature = "local-files")]
+    Q::LocalReplay => {
+      FoldAnswer::Decoded(A::LocalReplay(app.local_playback.as_ref().and_then(|s| {
+        s.queue
+          .get(s.index)
+          .and_then(|uri| crate::infra::local::file_uri_to_path(uri).ok())
+          .map(|p| {
+            (
+              std::sync::Arc::clone(&s.player),
+              p.to_string_lossy().into_owned(),
+            )
+          })
+      })))
+    }
+    #[cfg(feature = "local-files")]
+    Q::LocalShuffle => FoldAnswer::Decoded(A::LocalShuffle(app.decoded_shuffle)),
   }
 }
 

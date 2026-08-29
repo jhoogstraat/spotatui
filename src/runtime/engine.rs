@@ -98,6 +98,48 @@ pub enum DecodedSourceFact {
   YouTubePlaybackCleared,
   /// Shared runtime volume mirror used by all decoded sources.
   Volume(u8),
+  #[cfg(feature = "local-files")]
+  LocalAdvancing(bool),
+  #[cfg(feature = "local-files")]
+  LocalIndex {
+    target: usize,
+    info: Option<crate::core::plugin_api::TrackInfo>,
+  },
+}
+
+/// Typed decoded-source reads. Source handlers receive the live `Spine` and
+/// ask the fold for exactly the snapshot needed for a decision.
+#[derive(Debug)]
+pub enum DecodedSourceQuery {
+  #[cfg(feature = "local-files")]
+  LocalConfig,
+  #[cfg(feature = "local-files")]
+  LocalPlayer,
+  #[cfg(feature = "local-files")]
+  LocalQueue,
+  #[cfg(feature = "local-files")]
+  LocalReplay,
+  #[cfg(feature = "local-files")]
+  LocalShuffle,
+  Volume,
+}
+
+pub enum DecodedSourceAnswer {
+  Volume(u8),
+  #[cfg(feature = "local-files")]
+  LocalConfig(Option<String>),
+  #[cfg(feature = "local-files")]
+  LocalPlayer(Option<Arc<crate::infra::audio::LocalPlayer>>),
+  #[cfg(feature = "local-files")]
+  LocalQueue {
+    index: usize,
+    len: usize,
+    repeat: crate::infra::queue::RepeatMode,
+  },
+  #[cfg(feature = "local-files")]
+  LocalReplay(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
+  #[cfg(feature = "local-files")]
+  LocalShuffle(bool),
 }
 
 impl std::fmt::Debug for DecodedSourceFact {
@@ -133,6 +175,10 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::YouTubePlayback(_) => "YouTubePlayback",
       #[cfg(feature = "youtube")]
       Self::YouTubePlaybackCleared => "YouTubePlaybackCleared",
+      #[cfg(feature = "local-files")]
+      Self::LocalAdvancing(_) => "LocalAdvancing",
+      #[cfg(feature = "local-files")]
+      Self::LocalIndex { .. } => "LocalIndex",
       Self::Volume(_) => "Volume",
     };
     f.write_str(name)
@@ -776,6 +822,9 @@ pub use crate::core::action::LibraryTarget;
 /// protocol stays auditable.
 #[derive(Debug)]
 pub enum FoldQuery {
+  /// Decoded-source read envelope; concrete variants are kept in the source
+  /// domain so this central vocabulary stays compact.
+  Decoded(DecodedSourceQuery),
   /// Was this library request superseded before it even fetched? The
   /// detached prefetch workers check their generation against the fold's
   /// (the old `app.saved_tracks_prefetch_generation == generation` read).
@@ -1151,6 +1200,7 @@ pub enum FoldQuery {
 /// match exhaustively and producers cannot mis-cast.
 /// Debug is manual: `StreamingPlayer` has no Debug.
 pub enum FoldAnswer {
+  Decoded(DecodedSourceAnswer),
   Bool(bool),
   U64(u64),
   Offset(Option<u32>),
@@ -1271,6 +1321,7 @@ pub enum FoldAnswer {
 impl std::fmt::Debug for FoldAnswer {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      FoldAnswer::Decoded(_) => f.write_str("Decoded"),
       FoldAnswer::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
       FoldAnswer::U64(v) => f.debug_tuple("U64").field(v).finish(),
       FoldAnswer::Offset(v) => f.debug_tuple("Offset").field(v).finish(),
