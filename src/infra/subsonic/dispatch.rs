@@ -566,10 +566,10 @@ pub(crate) async fn play_index(spine: &Spine, target: usize) {
         Fact::SubsonicIndex {
           target,
           tempfile: tmp,
+          display,
         },
       )
       .await;
-      status(spine, format!("\u{266a} {display}"), 4).await;
     }
     Ok(Err(e)) => {
       teardown_subsonic(spine).await;

@@ -134,6 +134,7 @@ pub enum DecodedSourceFact {
   SubsonicIndex {
     target: usize,
     tempfile: tempfile::NamedTempFile,
+    display: String,
   },
   #[cfg(feature = "subsonic")]
   SubsonicReplaySucceeded,

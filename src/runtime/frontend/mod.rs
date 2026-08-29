@@ -954,11 +954,18 @@ pub(crate) fn apply_decoded_source_fact(
       }
     }
     #[cfg(feature = "subsonic")]
-    DecodedSourceFact::SubsonicIndex { target, tempfile } => {
+    DecodedSourceFact::SubsonicIndex {
+      target,
+      tempfile,
+      display,
+    } => {
       if let Some(s) = app.subsonic_playback.as_mut() {
         s.index = target;
         s.advancing = false;
         s.tempfile = tempfile;
+      }
+      if app.subsonic_playback.is_some() {
+        app.set_status_message(format!("\u{266a} {display}"), 4);
       }
     }
     #[cfg(feature = "subsonic")]
@@ -2579,7 +2586,12 @@ fn answer_decoded_query(
   app: &mut App,
   query: crate::runtime::engine::DecodedSourceQuery,
 ) -> crate::runtime::engine::FoldAnswer {
-  #[cfg(feature = "local-files")]
+  #[cfg(any(
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "internet-radio",
+    feature = "youtube"
+  ))]
   use crate::runtime::engine::DecodedSourceAnswer as A;
   use crate::runtime::engine::{DecodedSourceQuery as Q, FoldAnswer};
   match query {
