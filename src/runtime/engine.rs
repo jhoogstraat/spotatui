@@ -128,7 +128,10 @@ pub enum SessionFact {
     found: bool,
   },
   /// The global play counter (telemetry read; `None` = fetch failed).
-  GlobalSongCount { count: Option<u64>, failed: bool },
+  GlobalSongCount {
+    count: Option<u64>,
+    failed: bool,
+  },
   /// A deduplicated announcement feed: the fold enqueues and opens the
   /// prompt route only when nothing was active (the old inline block).
   Announcements(Vec<crate::core::app::Announcement>),
@@ -252,7 +255,9 @@ pub enum SessionFact {
   /// (`me/player/play`): mirror the play state and re-poll. `Some` also
   /// records the native device id (the resume path that discovered it).
   #[cfg(feature = "streaming")]
-  NativeResumeApiStarted { native_device_id: Option<String> },
+  NativeResumeApiStarted {
+    native_device_id: Option<String>,
+  },
   /// A direct native load was accepted: park for the watchdog, arm it, and
   /// optimistically mirror the play/shuffle state (the watchdog corrects a
   /// zombie session). `record` additionally writes the recovery snapshot
@@ -279,19 +284,27 @@ pub enum SessionFact {
   NativePauseMirrored,
   /// A native seek landed: record the recovery position.
   #[cfg(feature = "streaming")]
-  NativeSeekMirrored { position_ms: u32 },
+  NativeSeekMirrored {
+    position_ms: u32,
+  },
   /// A native shuffle toggle landed: recovery state + context + runtime
   /// state + the persisted save.
   #[cfg(feature = "streaming")]
-  NativeShuffleMirrored { state: bool },
+  NativeShuffleMirrored {
+    state: bool,
+  },
   /// A native repeat toggle landed: recovery state + context.
   #[cfg(feature = "streaming")]
-  NativeRepeatMirrored { state: rspotify::model::RepeatState },
+  NativeRepeatMirrored {
+    state: rspotify::model::RepeatState,
+  },
   /// A native volume change landed: context, runtime state, persisted save,
   /// and the in-flight bookkeeping (`pending_volume` stays until the API
   /// confirms the value).
   #[cfg(feature = "streaming")]
-  NativeVolumeMirrored { volume: u8 },
+  NativeVolumeMirrored {
+    volume: u8,
+  },
   /// A Web API transport command landed: mirror whichever of play state,
   /// shuffle, repeat, volume the command wrote (each `Some` mirrors exactly
   /// the writes its success path did).
@@ -306,11 +319,75 @@ pub enum SessionFact {
   VolumeChangeDropped,
   /// A raw, unscaled status notice (the old direct `status_message` writes —
   /// no TTL scaling, no error-flag coupling).
-  TransientStatus { message: String, ttl_secs: u64 },
+  TransientStatus {
+    message: String,
+    ttl_secs: u64,
+  },
   /// A Web API queue load landed: install (or clear) the queue and bump its
   /// plugin-data generation (completion, not success, is what requests wait
   /// on).
   QueueLanded(Option<crate::core::app::QueueState>),
+  /// A playback poll landed; the fold applies all native/context mirrors.
+  #[cfg(feature = "streaming")]
+  PlaybackPolled {
+    context: Option<Box<rspotify::model::context::CurrentPlaybackContext>>,
+    state: Box<crate::infra::network::playback::PlaybackPollState>,
+  },
+  #[cfg(not(feature = "streaming"))]
+  PlaybackPolled {
+    context: Option<Box<rspotify::model::context::CurrentPlaybackContext>>,
+  },
+  /// Playback polling finished with no active context (or an idle 404).
+  PlaybackPollIdle {
+    clear_context: bool,
+  },
+  #[cfg(feature = "streaming")]
+  NativeIdleDeviceReconciled {
+    native_device_id: String,
+    device_name: String,
+    volume: u8,
+    activated_at: Option<std::time::Instant>,
+  },
+  #[cfg(feature = "streaming")]
+  NativeRestoreApplied {
+    generation: u64,
+    desired_playing: bool,
+    position_ms: u64,
+    shuffle: bool,
+    repeat: rspotify::model::RepeatState,
+  },
+  #[cfg(feature = "streaming")]
+  NativeRestoreFailed {
+    generation: u64,
+  },
+  #[cfg(feature = "streaming")]
+  NativeRestoreNoState {
+    generation: u64,
+  },
+  #[cfg(feature = "streaming")]
+  NativeTransferActivated {
+    native_device_id: String,
+    activation_time: std::time::Instant,
+  },
+  ExternalTransferCompleted {
+    device_id: String,
+  },
+  #[cfg(feature = "streaming")]
+  AutoSelectApplied {
+    native_device_id: String,
+    activation_time: std::time::Instant,
+    external_playback_active: bool,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlaybackIntentStopped,
+  #[cfg(feature = "streaming")]
+  ForceNativeRecovery,
+  #[cfg(feature = "art-decode")]
+  CoverArtFetched {
+    key: String,
+    image: Result<image::DynamicImage, String>,
+    palette: Option<crate::core::cover_theme::AlbumPalette>,
+  },
 }
 
 /// The parts of a DJ turn outcome the epilogue reports on.
@@ -434,6 +511,43 @@ impl std::fmt::Debug for SessionFact {
       SessionFact::NativeVolumeMirrored { volume } => f
         .debug_struct("NativeVolumeMirrored")
         .field("volume", volume)
+        .finish(),
+      SessionFact::PlaybackPolled { .. } => f.write_str("PlaybackPolled"),
+      SessionFact::PlaybackPollIdle { .. } => f.write_str("PlaybackPollIdle"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeIdleDeviceReconciled { .. } => f.write_str("NativeIdleDeviceReconciled"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeRestoreApplied { generation, .. } => f
+        .debug_struct("NativeRestoreApplied")
+        .field("generation", generation)
+        .finish_non_exhaustive(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeRestoreFailed { generation } => f
+        .debug_struct("NativeRestoreFailed")
+        .field("generation", generation)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeRestoreNoState { generation } => f
+        .debug_struct("NativeRestoreNoState")
+        .field("generation", generation)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeTransferActivated { .. } => f.write_str("NativeTransferActivated"),
+      SessionFact::ExternalTransferCompleted { device_id } => f
+        .debug_tuple("ExternalTransferCompleted")
+        .field(device_id)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::AutoSelectApplied { .. } => f.write_str("AutoSelectApplied"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativePlaybackIntentStopped => f.write_str("NativePlaybackIntentStopped"),
+      #[cfg(feature = "streaming")]
+      SessionFact::ForceNativeRecovery => f.write_str("ForceNativeRecovery"),
+      #[cfg(feature = "art-decode")]
+      SessionFact::CoverArtFetched { key, image, .. } => f
+        .debug_struct("CoverArtFetched")
+        .field("key", key)
+        .field("ok", &image.is_ok())
         .finish(),
       SessionFact::TransportStateMirrored {
         is_playing,
@@ -924,6 +1038,32 @@ pub enum FoldQuery {
     uris: Option<Vec<String>>,
     offset: Option<usize>,
   },
+  /// Snapshot the fields a playback poll needs before its HTTP round trip.
+  PlaybackPollState,
+  /// Claim a native restore generation and return its player/snapshot.
+  #[cfg(feature = "streaming")]
+  ClaimNativeRestore { generation: u64 },
+  /// Native idle reconciliation inputs (device cache + recovery state).
+  #[cfg(feature = "streaming")]
+  NativeIdleDeviceState {
+    saved_device_id: Option<String>,
+    native_device_id: String,
+    native_device_name: String,
+  },
+  /// Auto-select's check-and-decide step.
+  #[cfg(feature = "streaming")]
+  AutoSelectDecision {
+    native_device_id: String,
+    saved_device_id: Option<String>,
+    persist_device_id: bool,
+    yield_to_external_playback: bool,
+  },
+  /// Native continuation's check-and-read step.
+  #[cfg(feature = "streaming")]
+  NativeContinuationState { previous_track_id: String },
+  /// Cover-art key gate before starting an off-lock fetch.
+  #[cfg(feature = "art-decode")]
+  CoverArtState { key: String },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -1019,6 +1159,32 @@ pub enum FoldAnswer {
   /// The activation decision produced by the fold.
   #[cfg(feature = "streaming")]
   NativeActivation(NativeActivationDecision),
+  /// Playback poll snapshot.
+  PlaybackPoll(Box<crate::infra::network::playback::PlaybackPollState>),
+  #[cfg(feature = "streaming")]
+  NativeRestore(Option<Box<crate::infra::network::playback::NativeRestoreClaim>>),
+  #[cfg(feature = "streaming")]
+  NativeIdleDevice {
+    saved_device_matches_native: bool,
+  },
+  #[cfg(feature = "streaming")]
+  AutoSelect {
+    should_transfer: bool,
+    external_playback_active: bool,
+    preference: NativeDevicePreferenceUpdate,
+  },
+  #[cfg(feature = "streaming")]
+  NativeContinuation {
+    transition_advanced: bool,
+    raw_next: Option<crate::core::app::PendingStartPlayback>,
+    raw_list_exhausted: bool,
+    native_device_id: Option<String>,
+  },
+  #[cfg(feature = "art-decode")]
+  CoverArt {
+    current: bool,
+    loaded: bool,
+  },
 }
 
 impl std::fmt::Debug for FoldAnswer {
@@ -1099,6 +1265,45 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::DjLibrary(v) => f.debug_tuple("DjLibrary").field(&v.is_some()).finish(),
       #[cfg(feature = "ai-dj")]
       FoldAnswer::DjBrain(v) => f.debug_tuple("DjBrain").field(&v.is_ok()).finish(),
+      FoldAnswer::PlaybackPoll(_) => f.write_str("PlaybackPoll"),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeRestore(v) => f.debug_tuple("NativeRestore").field(&v.is_some()).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeIdleDevice {
+        saved_device_matches_native,
+      } => f
+        .debug_tuple("NativeIdleDevice")
+        .field(saved_device_matches_native)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::AutoSelect {
+        should_transfer,
+        external_playback_active,
+        ..
+      } => f
+        .debug_struct("AutoSelect")
+        .field("should_transfer", should_transfer)
+        .field("external", external_playback_active)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeContinuation {
+        transition_advanced,
+        raw_next,
+        raw_list_exhausted,
+        native_device_id,
+      } => f
+        .debug_struct("NativeContinuation")
+        .field("advanced", transition_advanced)
+        .field("next", &raw_next.is_some())
+        .field("exhausted", raw_list_exhausted)
+        .field("device", &native_device_id)
+        .finish(),
+      #[cfg(feature = "art-decode")]
+      FoldAnswer::CoverArt { current, loaded } => f
+        .debug_struct("CoverArt")
+        .field("current", current)
+        .field("loaded", loaded)
+        .finish(),
     }
   }
 }

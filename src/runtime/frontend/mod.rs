@@ -1187,6 +1187,144 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         .plugin_data_generations
         .bump(crate::core::app::PluginDataKind::Queue);
     }
+    #[cfg(feature = "streaming")]
+    SessionFact::PlaybackPolled {
+      context: Some(context),
+      state,
+    } => {
+      crate::infra::network::playback::apply_playback_poll(app, *context, *state);
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::PlaybackPolled { context: None, .. } => {
+      app.instant_since_last_current_playback_poll = Instant::now();
+      app.is_fetching_current_playback = false;
+    }
+    #[cfg(not(feature = "streaming"))]
+    SessionFact::PlaybackPolled { context } => {
+      crate::infra::network::playback::apply_playback_poll(app, context.map(|c| *c));
+    }
+    SessionFact::PlaybackPollIdle { clear_context } => {
+      if clear_context {
+        app.current_playback_context = None;
+      }
+      app.instant_since_last_current_playback_poll = Instant::now();
+      app.is_fetching_current_playback = false;
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeIdleDeviceReconciled {
+      native_device_id,
+      device_name,
+      volume,
+      activated_at,
+    } => {
+      if let Some(when) = activated_at {
+        app.last_device_activation = Some(when);
+      }
+      app.mark_native_streaming_device_available(native_device_id, device_name, volume);
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeRestoreApplied {
+      generation,
+      desired_playing,
+      position_ms,
+      shuffle,
+      repeat,
+    } => {
+      if app.native_playback_restore_generation() == Some(generation) {
+        app.is_streaming_active = true;
+        app.native_is_playing = Some(desired_playing);
+        app.song_progress_ms = position_ms as u128;
+        if let Some(ctx) = &mut app.current_playback_context {
+          ctx.is_playing = desired_playing;
+          ctx.shuffle_state = shuffle;
+          ctx.repeat_state = repeat;
+        }
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeRestoreFailed { generation } => {
+      if app.native_playback_restore_generation() == Some(generation) {
+        app.native_restore_pending = None;
+        app.native_load_watchdog = None;
+        app.set_status_message("Native playback restore failed; reconnecting again.", 8);
+        app.force_native_streaming_recovery(true);
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeRestoreNoState { generation } => {
+      if app.native_playback_restore_generation() == Some(generation) {
+        app.native_restore_pending = None;
+        app.native_load_watchdog = None;
+        app.set_status_message(
+          "Native connection recovered, but there was no playback state to restore.",
+          8,
+        );
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeTransferActivated {
+      native_device_id,
+      activation_time,
+    } => {
+      app.is_streaming_active = true;
+      app.native_activation_pending = true;
+      app.native_playback_origin = None;
+      app.native_device_id = Some(native_device_id);
+      app.current_playback_context = None;
+      app.last_device_activation = Some(activation_time);
+      app.instant_since_last_current_playback_poll = activation_time - Duration::from_secs(6);
+    }
+    SessionFact::ExternalTransferCompleted { .. } => {
+      app.current_playback_context = None;
+      #[cfg(feature = "streaming")]
+      {
+        app.is_streaming_active = false;
+        app.native_playback_origin = None;
+        app.clear_native_playback_recovery();
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::AutoSelectApplied {
+      native_device_id,
+      activation_time,
+      external_playback_active,
+    } => {
+      if external_playback_active {
+        crate::infra::network::playback::clear_native_recovery_intent_for_external_playback(app);
+        app.set_status_message("Playback remains on another Spotify device.", 8);
+      } else {
+        app.is_streaming_active = true;
+        app.native_activation_pending = false;
+        app.last_device_activation = Some(activation_time);
+        app.instant_since_last_current_playback_poll = activation_time - Duration::from_secs(6);
+      }
+      app.native_device_id = Some(native_device_id);
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativePlaybackIntentStopped => app.set_native_playback_intent(false),
+    #[cfg(feature = "streaming")]
+    SessionFact::ForceNativeRecovery => app.force_native_streaming_recovery(true),
+    #[cfg(feature = "art-decode")]
+    SessionFact::CoverArtFetched {
+      key,
+      image,
+      palette,
+    } => {
+      use crate::core::art::CoverArtStatus;
+      if app.desired_cover_art_key.as_deref() == Some(key.as_str()) {
+        match image {
+          Ok(image) => {
+            app.store_cover_art(key, image, palette);
+            app.cover_art.status = CoverArtStatus::Loaded;
+          }
+          Err(err) => {
+            log::warn!("cover art load failed: {err}");
+            app.clear_cover_art();
+            app.cover_art.status = CoverArtStatus::Failed;
+          }
+        }
+      }
+    }
     SessionFact::TransientStatus { message, ttl_secs } => {
       // Raw write for parity with the old direct `status_message` stores: no
       // TTL scaling, no error coupling.
@@ -1913,6 +2051,127 @@ pub(crate) fn answer_query(
         FoldAnswer::Bool(false)
       }
     }
+    FoldQuery::PlaybackPollState => {
+      #[cfg(feature = "streaming")]
+      {
+        let player = app.streaming_player.clone();
+        FoldAnswer::PlaybackPoll(Box::new(
+          crate::infra::network::playback::PlaybackPollState {
+            player,
+            native_device_id: app.native_device_id.clone(),
+            native_streaming_was_active: app.is_streaming_active,
+            native_activation_pending: app.native_activation_pending,
+            native_track_id: app.last_track_id.clone(),
+            native_info_name: app.native_track_info.as_ref().map(|i| i.name.clone()),
+            has_fresh_native_activity: app.has_fresh_native_activity(),
+            native_is_playing: app.native_is_playing,
+            persisted_shuffle: app.runtime_state.shuffle_enabled,
+            current_context: app.current_playback_context.clone(),
+            local_state: None,
+          },
+        ))
+      }
+      #[cfg(not(feature = "streaming"))]
+      {
+        FoldAnswer::PlaybackPoll(Box::new(crate::infra::network::playback::PlaybackPollState))
+      }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeRestore { generation } => {
+      let Some(player) = app
+        .streaming_player
+        .as_ref()
+        .filter(|player| player.is_connected())
+        .cloned()
+      else {
+        app.force_native_streaming_recovery(true);
+        return FoldAnswer::NativeRestore(None);
+      };
+      if app.pending_start_playback.is_some()
+        || app.native_playback_restore_generation() != Some(generation)
+      {
+        return FoldAnswer::NativeRestore(None);
+      }
+      let Some(snapshot) = app.begin_native_playback_restore(generation) else {
+        return FoldAnswer::NativeRestore(None);
+      };
+      app.native_load_watchdog = Some(std::time::Instant::now());
+      app.set_status_message("Native connection restored; restoring playback.", 6);
+      FoldAnswer::NativeRestore(Some(Box::new(
+        crate::infra::network::playback::NativeRestoreClaim { player, snapshot },
+      )))
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativeIdleDeviceState {
+      saved_device_id,
+      native_device_id,
+      native_device_name,
+    } => FoldAnswer::NativeIdleDevice {
+      saved_device_matches_native:
+        crate::infra::network::playback::saved_device_matches_native_player(
+          saved_device_id.as_deref(),
+          Some(&native_device_id),
+          app.devices.as_ref(),
+          &native_device_name,
+        ),
+    },
+    #[cfg(feature = "streaming")]
+    FoldQuery::AutoSelectDecision {
+      native_device_id,
+      saved_device_id,
+      persist_device_id,
+      yield_to_external_playback,
+    } => {
+      let player = app.streaming_player.as_ref();
+      let Some(player) = player else {
+        return FoldAnswer::AutoSelect {
+          should_transfer: false,
+          external_playback_active: false,
+          preference: crate::runtime::engine::NativeDevicePreferenceUpdate::KeepExistingPreference,
+        };
+      };
+      let saved_matches = crate::infra::network::playback::saved_device_matches_native_player(
+        saved_device_id.as_deref(),
+        Some(&native_device_id),
+        app.devices.as_ref(),
+        player.device_name(),
+      );
+      let recent_activation = app
+        .last_device_activation
+        .is_some_and(|instant| instant.elapsed() < Duration::from_secs(5));
+      let external = app.current_playback_context.as_ref().is_some_and(|ctx| {
+        crate::infra::network::playback::should_yield_native_recovery(
+          yield_to_external_playback,
+          ctx.is_playing,
+          ctx.device.id.as_deref(),
+          &native_device_id,
+        )
+      });
+      FoldAnswer::AutoSelect {
+        should_transfer: !app.native_activation_pending
+          && !app.is_streaming_active
+          && !recent_activation
+          && !external,
+        external_playback_active: external,
+        preference: crate::infra::network::playback::native_device_preference_update(
+          saved_device_id.as_deref(),
+          persist_device_id,
+          saved_matches,
+        ),
+      }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativeContinuationState { previous_track_id } => FoldAnswer::NativeContinuation {
+      transition_advanced: app.native_transition_has_advanced(&previous_track_id),
+      raw_next: app.native_raw_list_next_request(&previous_track_id),
+      raw_list_exhausted: app.native_raw_list_playback_exhausted(&previous_track_id),
+      native_device_id: app.native_device_id.clone(),
+    },
+    #[cfg(feature = "art-decode")]
+    FoldQuery::CoverArtState { key } => FoldAnswer::CoverArt {
+      current: app.desired_cover_art_key.as_deref() == Some(key.as_str()),
+      loaded: app.cover_art.key() == Some(key.as_str()),
+    },
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),
     ),
