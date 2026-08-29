@@ -1,7 +1,4 @@
-use crate::core::app::{ActiveBlock, App, RecapPromptState, RouteId};
-use crate::infra::media_metadata::{
-  current_playback_snapshot, PlaybackItemKind, PlaybackSnapshot, PlaybackSource,
-};
+use crate::infra::media_metadata::{PlaybackItemKind, PlaybackSnapshot, PlaybackSource};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -11,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
 const HISTORY_SUBDIR: &str = "history";
@@ -373,7 +370,7 @@ impl HistoryCollectorHandle {
   }
 }
 
-pub fn spawn_history_collector(app: Arc<Mutex<App>>) -> HistoryCollectorHandle {
+pub fn spawn_history_collector(spine: crate::runtime::engine::Spine) -> HistoryCollectorHandle {
   let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
   let task = tokio::spawn(async move {
     let mut collector = HistoryCollector::default();
@@ -383,7 +380,7 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) -> HistoryCollectorHandle {
     let mut network_tasks = JoinSet::new();
 
     // Check on startup
-    perform_auto_recap_check(&app).await;
+    perform_auto_recap_check(&spine, None).await;
 
     // Streak cache: load the full history once, then keep per-day totals
     // updated incrementally from the records this collector appends (avoids
@@ -401,18 +398,21 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) -> HistoryCollectorHandle {
         }
       };
     if let Some(totals) = &day_totals {
-      app.lock().await.listening_streaks = Some(streaks_from_day_totals(totals));
+      let _ = spine
+        .emit_acked(crate::runtime::engine::EngineEvent::History(
+          crate::runtime::engine::HistoryFact::Streaks(streaks_from_day_totals(totals)),
+        ))
+        .await;
     }
 
-    // Sync history to cloud on startup. This takes the lock properly rather
-    // than `try_lock`: the startup work above ends by acquiring (and releasing)
-    // the app mutex, and tokio's fair mutex hands the freed permit straight to
-    // any queued waiter, so a `try_lock` here intermittently loses to the
-    // render loop. Losing it silently pinned the token to `None` for the whole
-    // process, disabling per-song and now-playing sync and dumping the entire
-    // session onto the exit sync.
-    let mut sync_token_opt: Option<String> =
-      app.lock().await.user_config.behavior.sync_token.clone();
+    // Sync history to cloud on startup from the fold's authoritative token.
+    let mut sync_token_opt: Option<String> = match spine
+      .query(crate::runtime::engine::FoldQuery::HistoryState)
+      .await
+    {
+      Ok(crate::runtime::engine::FoldAnswer::HistoryState(state)) => state.sync_token,
+      _ => return,
+    };
     log::info!(
       "cloud sync {} at history collector startup",
       if sync_token_opt.is_some() {
@@ -446,21 +446,21 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) -> HistoryCollectorHandle {
         }
       }
 
+      // One fold query captures playback, token, config, and route state for
+      // this tick. A closed fold preserves the old try-lock skip semantics.
+      let state = match spine
+        .query(crate::runtime::engine::FoldQuery::HistoryState)
+        .await
+      {
+        Ok(crate::runtime::engine::FoldAnswer::HistoryState(state)) => state,
+        _ => continue,
+      };
       if last_auto_check.elapsed().as_secs() >= 3600 {
         last_auto_check = Instant::now();
-        perform_auto_recap_check(&app).await;
+        perform_auto_recap_check(&spine, Some(state.clone())).await;
       }
-
-      // Re-read the token from the guard we already hold: it can be pasted or
-      // cleared in Settings mid-session, and the collector is only spawned once.
-      let (snapshot, latest_token) = if let Ok(app_guard) = app.try_lock() {
-        (
-          current_playback_snapshot(&app_guard),
-          app_guard.user_config.behavior.sync_token.clone(),
-        )
-      } else {
-        continue;
-      };
+      let snapshot = state.playback;
+      let latest_token = state.sync_token;
 
       if latest_token != sync_token_opt {
         log::info!(
@@ -507,7 +507,11 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) -> HistoryCollectorHandle {
             if let Some(totals) = &mut day_totals {
               let date = record.ended_at.with_timezone(&Local).date_naive();
               *totals.entry(date).or_default() += record.listened_ms;
-              app.lock().await.listening_streaks = Some(streaks_from_day_totals(totals));
+              let _ = spine
+                .emit_acked(crate::runtime::engine::EngineEvent::History(
+                  crate::runtime::engine::HistoryFact::Streaks(streaks_from_day_totals(totals)),
+                ))
+                .await;
             }
           }
           // Push the finished listen to the cloud right away instead of only
@@ -563,14 +567,21 @@ fn auto_recap_is_due(last_recap_contents: Option<&str>, now_ts: i64) -> bool {
   }
 }
 
-async fn perform_auto_recap_check(app: &Arc<Mutex<App>>) {
-  if !app
-    .lock()
-    .await
-    .user_config
-    .behavior
-    .enable_monthly_recap_prompt
-  {
+async fn perform_auto_recap_check(
+  spine: &crate::runtime::engine::Spine,
+  state: Option<crate::runtime::engine::HistoryQueryState>,
+) {
+  let state = match state {
+    Some(state) => state,
+    None => match spine
+      .query(crate::runtime::engine::FoldQuery::HistoryState)
+      .await
+    {
+      Ok(crate::runtime::engine::FoldAnswer::HistoryState(state)) => state,
+      _ => return,
+    },
+  };
+  if !state.enable_monthly_recap_prompt {
     return;
   }
 
@@ -609,25 +620,14 @@ async fn perform_auto_recap_check(app: &Arc<Mutex<App>>) {
           log::warn!("failed to write last recap timestamp: {}", e);
         }
 
-        let mut app_guard = app.lock().await;
-        if app_guard.get_current_route().active_block == ActiveBlock::Input {
-          // Never steal keystrokes from an input field; fall back to a status
-          // message instead of the popup.
-          app_guard.set_status_message(
-            format!(
-              "Monthly listening recap ready at {} ({} listens)",
-              output_path.display(),
-              count
-            ),
-            10,
-          );
-        } else {
-          app_guard.recap_prompt = Some(RecapPromptState {
-            path: output_path,
-            listens: count,
-          });
-          app_guard.push_navigation_stack(RouteId::RecapPrompt, ActiveBlock::RecapPrompt);
-        }
+        let _ = spine
+          .emit_acked(crate::runtime::engine::EngineEvent::History(
+            crate::runtime::engine::HistoryFact::RecapReady {
+              path: output_path,
+              listens: count,
+            },
+          ))
+          .await;
       }
     }
     Err(e) => {

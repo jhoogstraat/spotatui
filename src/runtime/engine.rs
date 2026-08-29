@@ -61,6 +61,21 @@ pub enum EngineEvent {
   /// envelope keeps source-specific reducers out of this central enum while
   /// giving every source one fold-owned write path.
   Decoded(DecodedSourceFact),
+  /// Listening-history cache and recap facts, reduced by the fold.
+  History(HistoryFact),
+}
+
+/// Fold-owned writes produced by the listening-history collector.
+#[derive(Debug, Clone)]
+pub enum HistoryFact {
+  /// Replace the cached streak summary after initial load or a new listen.
+  Streaks(crate::infra::history::StreakSummary),
+  /// A monthly recap is ready. The fold decides whether to show a prompt or
+  /// a status notice from the current route, so producers never touch App.
+  RecapReady {
+    path: std::path::PathBuf,
+    listens: usize,
+  },
 }
 
 /// Fold-owned writes for the decoded sources.  Read-only decisions still use
@@ -1104,6 +1119,8 @@ pub enum FoldQuery {
   FlushStateSave,
   /// The source-agnostic playback snapshot (DJ now-playing, window title).
   MediaSnapshot,
+  /// Atomic history collector read: playback snapshot and sync token/config.
+  HistoryState,
   /// The native queue's depth (DJ now-playing payload).
   QueueDepth,
   /// The native queue's tracks, in order (DJ `get_queue`).
@@ -1342,6 +1359,7 @@ pub enum FoldAnswer {
   Search(Box<crate::core::app::SearchResult>),
   /// The source-agnostic playback snapshot (or `None` when nothing plays).
   Media(Option<crate::infra::media_metadata::PlaybackSnapshot>),
+  HistoryState(HistoryQueryState),
   /// The native queue's tracks, in order.
   QueueTracks(Vec<crate::core::plugin_api::TrackInfo>),
   /// The standing DJ vibe and whether the auto-queue DJ is on.
@@ -1440,6 +1458,14 @@ pub enum FoldAnswer {
   },
 }
 
+/// Published state needed by the listening-history producer for one tick.
+#[derive(Debug, Clone)]
+pub struct HistoryQueryState {
+  pub playback: Option<crate::infra::media_metadata::PlaybackSnapshot>,
+  pub sync_token: Option<String>,
+  pub enable_monthly_recap_prompt: bool,
+}
+
 impl std::fmt::Debug for FoldAnswer {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
@@ -1456,6 +1482,12 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::Tracks(v) => f.debug_tuple("Tracks").field(&v.len()).finish(),
       FoldAnswer::Search(v) => f.debug_tuple("Search").field(v).finish(),
       FoldAnswer::Media(v) => f.debug_tuple("Media").field(&v.is_some()).finish(),
+      FoldAnswer::HistoryState(v) => f
+        .debug_struct("HistoryState")
+        .field("playback", &v.playback.is_some())
+        .field("sync_token", &v.sync_token.is_some())
+        .field("recap", &v.enable_monthly_recap_prompt)
+        .finish(),
       FoldAnswer::QueueTracks(v) => f.debug_tuple("QueueTracks").field(&v.len()).finish(),
       #[cfg(feature = "dj-core")]
       FoldAnswer::DjVibe { vibe, auto_queue } => f

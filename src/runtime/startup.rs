@@ -702,8 +702,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     }
   }
 
-  let history_collector = crate::infra::history::spawn_history_collector(Arc::clone(&app));
-
   // Opt-in MCP control socket. Nothing listens unless the user asked for it;
   // a bind failure is reported and shrugged off rather than blocking startup,
   // since the player is perfectly usable without it.
@@ -778,6 +776,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     let mut app_mut = app.lock().await;
     app_mut.spine = Some(spine_for_events.clone());
   }
+  let history_collector = crate::infra::history::spawn_history_collector(spine_for_events.clone());
   #[cfg(feature = "streaming")]
   {
     let mut app_mut = app.lock().await;

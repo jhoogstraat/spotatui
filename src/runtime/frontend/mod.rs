@@ -655,6 +655,10 @@ pub(super) async fn fold_loop(
         let mut app = app.lock().await;
         apply_decoded_source_fact(&mut app, fact);
       }
+      EngineEvent::History(fact) => {
+        let mut app = app.lock().await;
+        apply_history_fact(&mut app, fact);
+      }
       EngineEvent::StateChanged(_) => {}
     }
     publish(&app, &tx).await;
@@ -813,7 +817,33 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
     }
     EngineEvent::Session(fact) => apply_session_fact(app, fact.clone()),
     EngineEvent::Decoded(_) => {}
+    EngineEvent::History(fact) => apply_history_fact(app, fact.clone()),
     EngineEvent::StateChanged(_) => {}
+  }
+}
+
+fn apply_history_fact(app: &mut App, fact: crate::runtime::engine::HistoryFact) {
+  use crate::runtime::engine::HistoryFact;
+  match fact {
+    HistoryFact::Streaks(streaks) => app.listening_streaks = Some(streaks),
+    HistoryFact::RecapReady { path, listens } => {
+      if app.get_current_route().active_block == crate::core::app::ActiveBlock::Input {
+        app.set_status_message(
+          format!(
+            "Monthly listening recap ready at {} ({} listens)",
+            path.display(),
+            listens
+          ),
+          10,
+        );
+      } else {
+        app.recap_prompt = Some(crate::core::app::RecapPromptState { path, listens });
+        app.push_navigation_stack(
+          crate::core::app::RouteId::RecapPrompt,
+          crate::core::app::ActiveBlock::RecapPrompt,
+        );
+      }
+    }
   }
 }
 
@@ -1904,6 +1934,13 @@ pub(crate) fn answer_query(
     FoldQuery::MediaSnapshot => {
       FoldAnswer::Media(crate::infra::media_metadata::current_playback_snapshot(app))
     }
+    FoldQuery::HistoryState => {
+      FoldAnswer::HistoryState(crate::runtime::engine::HistoryQueryState {
+        playback: crate::infra::media_metadata::current_playback_snapshot(app),
+        sync_token: app.user_config.behavior.sync_token.clone(),
+        enable_monthly_recap_prompt: app.user_config.behavior.enable_monthly_recap_prompt,
+      })
+    }
     FoldQuery::QueueDepth => FoldAnswer::U64(app.native_queue.len() as u64),
     FoldQuery::QueueTracks => FoldAnswer::QueueTracks(app.native_queue.clone()),
     #[cfg(feature = "dj-core")]
@@ -2533,7 +2570,9 @@ fn answer_decoded_query(
   app: &mut App,
   query: crate::runtime::engine::DecodedSourceQuery,
 ) -> crate::runtime::engine::FoldAnswer {
-  use crate::runtime::engine::{DecodedSourceAnswer as A, DecodedSourceQuery as Q, FoldAnswer};
+  #[cfg(feature = "local-files")]
+  use crate::runtime::engine::DecodedSourceAnswer as A;
+  use crate::runtime::engine::{DecodedSourceQuery as Q, FoldAnswer};
   match query {
     Q::Volume => FoldAnswer::Decoded(crate::runtime::engine::DecodedSourceAnswer::Volume(
       app.runtime_state.volume_percent,
@@ -2791,6 +2830,68 @@ mod tests {
       Some(crate::core::app::TrackTableContext::LocalPlaylist)
     );
     assert!(app.track_table.tracks.is_empty());
+  }
+
+  #[test]
+  fn history_streak_and_recap_facts_reduce_without_app_lock() {
+    use crate::runtime::engine::HistoryFact;
+    let mut app = App::default();
+    apply_history_fact(
+      &mut app,
+      HistoryFact::Streaks(crate::infra::history::StreakSummary {
+        current_days: 2,
+        longest_days: 3,
+        today_ms: 1_000,
+      }),
+    );
+    assert_eq!(
+      app.listening_streaks.as_ref().map(|s| s.current_days),
+      Some(2)
+    );
+
+    apply_history_fact(
+      &mut app,
+      HistoryFact::RecapReady {
+        path: std::path::PathBuf::from("recap.html"),
+        listens: 4,
+      },
+    );
+    assert_eq!(app.recap_prompt.as_ref().map(|p| p.listens), Some(4));
+
+    app.push_navigation_stack(
+      crate::core::app::RouteId::Search,
+      crate::core::app::ActiveBlock::Input,
+    );
+    apply_history_fact(
+      &mut app,
+      HistoryFact::RecapReady {
+        path: std::path::PathBuf::from("recap.html"),
+        listens: 5,
+      },
+    );
+    assert_eq!(app.recap_prompt.as_ref().map(|p| p.listens), Some(4));
+    assert!(app.status_message.is_some());
+  }
+
+  #[tokio::test]
+  async fn history_query_answers_snapshot_and_config_atomically() {
+    let app = Arc::new(Mutex::new(App::default()));
+    app
+      .lock()
+      .await
+      .user_config
+      .behavior
+      .enable_monthly_recap_prompt = true;
+    let (spine, _rx) = spawn_fold(&app).await;
+    let answer = spine
+      .query(crate::runtime::engine::FoldQuery::HistoryState)
+      .await
+      .expect("fold answers history state");
+    assert!(matches!(
+      answer,
+      crate::runtime::engine::FoldAnswer::HistoryState(state)
+        if state.enable_monthly_recap_prompt && state.sync_token.is_none()
+    ));
   }
 
   #[cfg(feature = "streaming")]
