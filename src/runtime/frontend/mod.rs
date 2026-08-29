@@ -235,6 +235,7 @@ impl Runtime {
       let shared_position = services.shared_position_for_ui;
       let history_collector = services.history_collector;
       let tick_wake = Arc::clone(&tick_wake);
+      let driver_spine = spine.clone();
       std::thread::Builder::new()
         .name("spotatui-frontend-tick".to_string())
         .spawn(move || {
@@ -245,7 +246,7 @@ impl Runtime {
           tick_rt.block_on(async move {
             driver_loop(
               app,
-              spine.clone(),
+              driver_spine,
               shutdown_rx,
               shared_position,
               history_collector,
