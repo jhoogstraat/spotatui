@@ -6,6 +6,8 @@ use crate::core::{
 };
 #[cfg(feature = "streaming")]
 use crate::infra::player::{select_native, PlaybackBackend};
+#[cfg(feature = "streaming")]
+use crate::runtime::engine::NativeDevicePreferenceUpdate;
 use crate::runtime::engine::{FoldAnswer, FoldQuery, SessionFact};
 use anyhow::anyhow;
 use chrono::TimeDelta;
@@ -192,13 +194,6 @@ struct NativeActivationContext {
 }
 
 #[cfg(feature = "streaming")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativeDevicePreferenceUpdate {
-  Persist,
-  KeepExistingPreference,
-}
-
-#[cfg(feature = "streaming")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum NativeIdleRecoveryPhase {
   #[default]
@@ -304,7 +299,7 @@ fn clear_native_recovery_intent_for_external_playback(app: &mut App) {
 }
 
 #[cfg(feature = "streaming")]
-fn native_device_preference_update(
+pub(crate) fn native_device_preference_update(
   saved_device_id: Option<&str>,
   explicit_persist: bool,
   saved_device_matches_native: bool,
@@ -326,7 +321,7 @@ fn native_idle_device_preference_update(
 }
 
 #[cfg(feature = "streaming")]
-fn saved_device_matches_native_player(
+pub(crate) fn saved_device_matches_native_player(
   saved_device_id: Option<&str>,
   native_device_id: Option<&str>,
   devices: Option<&DevicePayload>,
@@ -884,10 +879,11 @@ async fn resolve_native_playback_route(
     return NativePlaybackRoute::NativeLoad;
   }
 
-  let app = network.app.lock().await;
-  match app.native_device_id.clone() {
-    Some(device_id) => NativePlaybackRoute::ContextApi { device_id },
-    None => NativePlaybackRoute::NativeLoad,
+  match network.fold_query(FoldQuery::NativeDeviceId).await {
+    Some(FoldAnswer::NativeDeviceId(Some(device_id))) => {
+      NativePlaybackRoute::ContextApi { device_id }
+    }
+    _ => NativePlaybackRoute::NativeLoad,
   }
 }
 
@@ -940,41 +936,35 @@ async fn start_native_context_via_api(
         }
       };
 
-      let mut app = network.app.lock().await;
-      app.instant_since_last_current_playback_poll = Instant::now() - Duration::from_secs(6);
-      if let Some(ctx) = &mut app.current_playback_context {
-        ctx.is_playing = true;
-        if shuffle_applied {
-          ctx.shuffle_state = desired_shuffle_state;
-        }
-      }
-      if shuffle_applied {
-        app.runtime_state.shuffle_enabled = desired_shuffle_state;
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
-          desired_shuffle_state,
-        ));
-      }
       // Keep the recovery chain alive: if the API accepted the start but the
       // native device never emits a player event, the watchdog fires again and
       // the bounded attempt counter eventually drops the request with a
       // message instead of leaving it parked forever.
-      app.park_start_playback(
-        Some(context.uri()),
-        uris.map(|list| list.iter().map(|u| u.uri()).collect()),
-        offset,
-      );
-      app.native_load_watchdog = Some(Instant::now());
-      app.dispatch(IoEvent::GetCurrentPlayback);
+      network
+        .emit_session_acked(SessionFact::NativeApiContextStarted {
+          context_uri: context.uri(),
+          uris: uris.map(|list| list.iter().map(|u| u.uri()).collect()),
+          offset,
+          shuffle_applied,
+          desired_shuffle_state,
+        })
+        .await;
     }
     Err(e) => {
       if suppressed_restriction_violation_while_pending(network, &e).await {
         return;
       }
-      let mut app = network.app.lock().await;
+      network
+        .emit_session_acked(SessionFact::ClearStartPlaybackReplay)
+        .await;
       // Both routes failed for this request; drop the parked copy so an
       // unrelated later recovery can't replay it.
-      app.pending_start_playback = None;
-      app.handle_error(anyhow!("Failed to start native playback: {}", e));
+      network
+        .emit_session_acked(SessionFact::Error(format!(
+          "Failed to start native playback: {}",
+          e
+        )))
+        .await;
     }
   }
 }
@@ -1487,13 +1477,9 @@ impl PlaybackNetwork for Network {
       (uris, offset)
     };
 
-    let desired_shuffle_state = {
-      let app = self.app.lock().await;
-      app
-        .current_playback_context
-        .as_ref()
-        .map(|ctx| ctx.shuffle_state)
-        .unwrap_or(app.runtime_state.shuffle_enabled)
+    let desired_shuffle_state = match self.fold_query(FoldQuery::DesiredShuffleState).await {
+      Some(FoldAnswer::Bool(state)) => state,
+      _ => false,
     };
 
     // Any explicit new playback target invalidates the app-owned shuffle
@@ -1501,7 +1487,9 @@ impl PlaybackNetwork for Network {
     // resume (no context, no uris) keeps the session.
     #[cfg(feature = "streaming")]
     if context_id.is_some() || uris.is_some() {
-      self.app.lock().await.clear_native_shuffle_session();
+      self
+        .emit_session_acked(SessionFact::ClearNativeShuffleSession)
+        .await;
     }
 
     // Check if we should use native streaming for playback
@@ -1510,14 +1498,15 @@ impl PlaybackNetwork for Network {
       // Park the request instead of dropping it: the recovery handler replays
       // it once the new session and device selection are in place, so the
       // press that detected the disconnect still plays.
-      let mut app = self.app.lock().await;
-      app.park_start_playback(
-        context_id.as_ref().map(|c| c.uri()),
-        uris
-          .as_ref()
-          .map(|list| list.iter().map(|u| u.uri()).collect()),
-        offset,
-      );
+      self
+        .emit_session_acked(SessionFact::ParkStartPlayback {
+          context_uri: context_id.as_ref().map(|c| c.uri()),
+          uris: uris
+            .as_ref()
+            .map(|list| list.iter().map(|u| u.uri()).collect()),
+          offset,
+        })
+        .await;
       return;
     }
 
@@ -1526,32 +1515,41 @@ impl PlaybackNetwork for Network {
       let requested_origin = requested_native_playback_origin(self, &context_id, &uris).await;
       let activation_time = Instant::now();
       let native_device_id = player.device_id();
-      let (should_transfer, native_preference_update) = {
-        let app = self.app.lock().await;
-        let saved_device_matches_native = saved_device_matches_native_player(
-          self.client_config.device_id.as_deref(),
-          Some(&native_device_id),
-          app.devices.as_ref(),
-          player.device_name(),
-        );
-        let activation_pending = app.native_activation_pending;
-        let recent_activation = app
-          .last_device_activation
-          .is_some_and(|instant| instant.elapsed() < Duration::from_secs(5));
-        let should_transfer = if activation_pending {
-          !recent_activation
-        } else {
-          !app.is_streaming_active && !recent_activation
-        };
-
-        (
-          should_transfer,
-          native_device_preference_update(
-            self.client_config.device_id.as_deref(),
-            false,
-            saved_device_matches_native,
-          ),
-        )
+      let request = if context_id.is_none() && uris.is_none() {
+        None
+      } else {
+        Some(crate::runtime::engine::NativePlaybackRequestSpec {
+          context_uri: context_id.as_ref().map(|context| context.uri()),
+          uris: uris
+            .as_ref()
+            .map(|items| items.iter().map(|item| item.uri()).collect()),
+          offset,
+          desired_playing: true,
+          shuffle: desired_shuffle_state,
+        })
+      };
+      let activation = crate::runtime::engine::NativePlaybackActivation {
+        native_device_id: native_device_id.clone(),
+        native_device_name: player.device_name().to_string(),
+        saved_device_id: self.client_config.device_id.clone(),
+        explicit_persist: false,
+        origin: Some(requested_origin),
+        activation_time,
+        backdate_poll: false,
+        clear_context: false,
+        bare_resume: context_id.is_none() && uris.is_none(),
+        request,
+      };
+      let (should_transfer, native_preference_update) = match self
+        .fold_query(FoldQuery::NativePlaybackActivationDecision(
+          activation.clone(),
+        ))
+        .await
+      {
+        Some(FoldAnswer::NativeActivation(decision)) => {
+          (decision.should_transfer, decision.preference)
+        }
+        _ => (false, NativeDevicePreferenceUpdate::KeepExistingPreference),
       };
 
       if should_transfer {
@@ -1566,36 +1564,14 @@ impl PlaybackNetwork for Network {
       self
         .native_idle_recovery
         .settle_current_episode(activation_time);
+      self
+        .emit_session_acked(SessionFact::NativePlaybackActivated(activation))
+        .await;
+      if native_preference_update == NativeDevicePreferenceUpdate::Persist
+        && self.client_config.device_id.as_deref() != Some(native_device_id.as_str())
       {
-        let mut app = self.app.lock().await;
-        app.is_streaming_active = true;
-        app.last_device_activation = Some(activation_time);
-        app.native_activation_pending = false;
-        app.native_playback_origin = Some(requested_origin);
-        app.native_device_id = Some(native_device_id.clone());
-        persist_native_device_id_if_needed(
-          &mut self.client_config,
-          &mut app,
-          &native_device_id,
-          native_preference_update,
-        );
-        if context_id.is_none() && uris.is_none() {
-          app.set_native_playback_intent(true);
-        } else {
-          let repeat = app
-            .current_playback_context
-            .as_ref()
-            .map_or(RepeatState::Off, |ctx| ctx.repeat_state);
-          app.record_native_playback_request(
-            context_id.as_ref().map(|context| context.uri()),
-            uris
-              .as_ref()
-              .map(|items| items.iter().map(|item| item.uri()).collect()),
-            offset,
-            true,
-            desired_shuffle_state,
-            repeat,
-          );
+        if let Err(e) = self.client_config.set_device_id(native_device_id.clone()) {
+          self.emit_error(anyhow!(e)).await;
         }
       }
       // Client-side shuffle: when shuffle is on and the target is a playlist,
@@ -1614,18 +1590,22 @@ impl PlaybackNetwork for Network {
 
       // For resume playback (no context, no uris)
       if context_id.is_none() && uris.is_none() {
-        let can_resume_direct_native = {
-          let app = self.app.lock().await;
-          app.native_track_info.is_some() || app.last_track_id.is_some()
-        };
+        let can_resume_direct_native = matches!(
+          self.fold_query(FoldQuery::NativeResumeDirectPossible).await,
+          Some(FoldAnswer::Bool(true))
+        );
 
         if can_resume_direct_native {
           info!("starting native resume playback via direct player route");
           player.play();
-          let mut app = self.app.lock().await;
-          if let Some(ctx) = &mut app.current_playback_context {
-            ctx.is_playing = true;
-          }
+          self
+            .emit_session_acked(SessionFact::TransportStateMirrored {
+              is_playing: Some(true),
+              shuffle: None,
+              repeat: None,
+              volume: None,
+            })
+            .await;
         } else {
           info!(
             "starting native resume playback via Spotify API on device {}",
@@ -1641,19 +1621,19 @@ impl PlaybackNetwork for Network {
             .await
           {
             Ok(_) => {
-              let mut app = self.app.lock().await;
-              app.native_device_id = Some(native_device_id);
-              if let Some(ctx) = &mut app.current_playback_context {
-                ctx.is_playing = true;
-              }
-              app.dispatch(IoEvent::GetCurrentPlayback);
+              self
+                .emit_session_acked(SessionFact::NativeResumeApiStarted {
+                  native_device_id: Some(native_device_id),
+                })
+                .await;
             }
             Err(e) => {
-              let mut app = self.app.lock().await;
-              app.set_status_message(
-                format!("No playback to resume on {}.", player.device_name()),
-                4,
-              );
+              self
+                .emit_status(
+                  format!("No playback to resume on {}.", player.device_name()),
+                  4,
+                )
+                .await;
               info!("native resume via Spotify API failed: {}", e);
             }
           }
@@ -1688,15 +1668,16 @@ impl PlaybackNetwork for Network {
       // was already accepted once and failed silently (the context never
       // resolved); take the Web API context route this time instead of
       // looping through the same silent failure until the request is dropped.
-      let retry_via_api = {
-        let app = self.app.lock().await;
-        app.pending_start_playback.as_ref().is_some_and(|pending| {
-          pending.recovery_attempts > 0
-            && pending.context_uri == parked_context
-            && pending.uris == parked_uris
-            && pending.offset == offset
-        })
-      };
+      let retry_via_api = matches!(
+        self
+          .fold_query(FoldQuery::StartPlaybackReplayMatches {
+            context_uri: parked_context.clone(),
+            uris: parked_uris.clone(),
+            offset,
+          })
+          .await,
+        Some(FoldAnswer::Bool(true))
+      );
       if retry_via_api {
         if let Some((device_id, context)) = api_fallback.clone() {
           info!(
@@ -1725,22 +1706,21 @@ impl PlaybackNetwork for Network {
           let _ = player.set_shuffle(desired_shuffle_state);
           // Optimistic UI update; the watchdog corrects it if no player event
           // ever confirms the load (zombie session).
-          let mut app = self.app.lock().await;
-          app.park_start_playback(parked_context, parked_uris, offset);
-          app.native_load_watchdog = Some(Instant::now());
-          if let Some(ctx) = &mut app.current_playback_context {
-            ctx.is_playing = true;
-            ctx.shuffle_state = desired_shuffle_state;
-          }
-          app.runtime_state.shuffle_enabled = desired_shuffle_state;
-          app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
-            desired_shuffle_state,
-          ));
+          self
+            .emit_session_acked(SessionFact::NativeLoadAccepted {
+              context_uri: parked_context,
+              uris: parked_uris,
+              offset,
+              desired_shuffle_state,
+              record: None,
+            })
+            .await;
         }
         Err(load_err) => {
           let Some((device_id, context)) = api_fallback else {
-            let mut app = self.app.lock().await;
-            app.handle_error(anyhow!("Failed to start native playback: {}", load_err));
+            self
+              .emit_error(anyhow!("Failed to start native playback: {}", load_err))
+              .await;
             return;
           };
           info!(
@@ -1785,19 +1765,14 @@ impl PlaybackNetwork for Network {
           }
         };
 
-        let mut app = self.app.lock().await;
-        if let Some(ctx) = &mut app.current_playback_context {
-          ctx.is_playing = true;
-          if shuffle_applied {
-            ctx.shuffle_state = desired_shuffle_state;
-          }
-        }
-        if shuffle_applied {
-          app.runtime_state.shuffle_enabled = desired_shuffle_state;
-          app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
-            desired_shuffle_state,
-          ));
-        }
+        self
+          .emit_session_acked(SessionFact::TransportStateMirrored {
+            is_playing: Some(true),
+            shuffle: shuffle_applied.then_some(desired_shuffle_state),
+            repeat: None,
+            volume: None,
+          })
+          .await;
       }
       Err(e) => {
         #[cfg(feature = "streaming")]
@@ -1812,71 +1787,69 @@ impl PlaybackNetwork for Network {
               self
                 .native_idle_recovery
                 .settle_current_episode(activation_time);
+              let activation = crate::runtime::engine::NativePlaybackActivation {
+                native_device_id: native_device_id.clone(),
+                native_device_name: player.device_name().to_string(),
+                saved_device_id: self.client_config.device_id.clone(),
+                explicit_persist: false,
+                origin: Some(requested_origin),
+                activation_time,
+                backdate_poll: true,
+                clear_context: false,
+                bare_resume: context_id.is_none() && uris.is_none(),
+                // The recovery snapshot is recorded only after the fallback
+                // load is accepted, preserving the old failure behavior.
+                request: None,
+              };
+              let native_preference_update = match self
+                .fold_query(FoldQuery::NativePlaybackActivationDecision(
+                  activation.clone(),
+                ))
+                .await
               {
-                let mut app = self.app.lock().await;
-                let saved_device_matches_native = saved_device_matches_native_player(
-                  self.client_config.device_id.as_deref(),
-                  Some(&native_device_id),
-                  app.devices.as_ref(),
-                  player.device_name(),
-                );
-                let native_preference_update = native_device_preference_update(
-                  self.client_config.device_id.as_deref(),
-                  false,
-                  saved_device_matches_native,
-                );
-                app.is_streaming_active = true;
-                app.native_activation_pending = false;
-                app.native_playback_origin = Some(requested_origin);
-                app.native_device_id = Some(native_device_id.clone());
-                app.last_device_activation = Some(activation_time);
-                app.instant_since_last_current_playback_poll =
-                  activation_time - Duration::from_secs(6);
-                persist_native_device_id_if_needed(
-                  &mut self.client_config,
-                  &mut app,
-                  &native_device_id,
-                  native_preference_update,
-                );
+                Some(FoldAnswer::NativeActivation(decision)) => decision.preference,
+                _ => NativeDevicePreferenceUpdate::KeepExistingPreference,
+              };
+              self
+                .emit_session_acked(SessionFact::NativePlaybackActivated(activation))
+                .await;
+              if native_preference_update == NativeDevicePreferenceUpdate::Persist
+                && self.client_config.device_id.as_deref() != Some(native_device_id.as_str())
+              {
+                if let Err(e) = self.client_config.set_device_id(native_device_id.clone()) {
+                  self.emit_error(anyhow!(e)).await;
+                }
               }
 
               let parked_context = context_id.as_ref().map(|c| c.uri());
               let parked_uris = uris
                 .as_ref()
                 .map(|list| list.iter().map(|u| u.uri()).collect::<Vec<_>>());
-              if let Some(request) = native_load_request(context_id, uris, offset) {
+              if let Some(request) = native_load_request(context_id.clone(), uris.clone(), offset) {
                 info!("default Spotify playback had no active device; falling back to native load");
                 if let Err(load_err) = player.load(request) {
-                  let mut app = self.app.lock().await;
-                  app.handle_error(anyhow!("Failed to start native playback: {}", load_err));
+                  self
+                    .emit_error(anyhow!("Failed to start native playback: {}", load_err))
+                    .await;
                 } else {
                   let _ = player.set_shuffle(desired_shuffle_state);
-                  let mut app = self.app.lock().await;
-                  let repeat = app
-                    .current_playback_context
-                    .as_ref()
-                    .map_or(RepeatState::Off, |ctx| ctx.repeat_state);
-                  app.record_native_playback_request(
-                    parked_context.clone(),
-                    parked_uris.clone(),
-                    offset,
-                    true,
-                    desired_shuffle_state,
-                    repeat,
-                  );
-                  // Same zombie-session net as the direct load route.
-                  app.park_start_playback(parked_context, parked_uris, offset);
-                  app.native_load_watchdog = Some(Instant::now());
-                  if let Some(ctx) = &mut app.current_playback_context {
-                    ctx.is_playing = true;
-                    ctx.shuffle_state = desired_shuffle_state;
-                  }
-                  app.runtime_state.shuffle_enabled = desired_shuffle_state;
-                  app.schedule_state_save(
-                    crate::core::state::PersistedRuntimeState::shuffle_enabled(
+                  self
+                    .emit_session_acked(SessionFact::NativeLoadAccepted {
+                      context_uri: parked_context,
+                      uris: parked_uris,
+                      offset,
                       desired_shuffle_state,
-                    ),
-                  );
+                      record: Some(crate::runtime::engine::NativePlaybackRequestSpec {
+                        context_uri: context_id.as_ref().map(|context| context.uri()),
+                        uris: uris
+                          .as_ref()
+                          .map(|list| list.iter().map(|item| item.uri()).collect::<Vec<_>>()),
+                        offset,
+                        desired_playing: true,
+                        shuffle: desired_shuffle_state,
+                      }),
+                    })
+                    .await;
                 }
                 return;
               }
@@ -1895,18 +1868,19 @@ impl PlaybackNetwork for Network {
                 .await
               {
                 Ok(_) => {
-                  let mut app = self.app.lock().await;
-                  if let Some(ctx) = &mut app.current_playback_context {
-                    ctx.is_playing = true;
-                  }
-                  app.dispatch(IoEvent::GetCurrentPlayback);
+                  self
+                    .emit_session_acked(SessionFact::NativeResumeApiStarted {
+                      native_device_id: Some(native_device_id),
+                    })
+                    .await;
                 }
                 Err(resume_err) => {
-                  let mut app = self.app.lock().await;
-                  app.set_status_message(
-                    format!("No playback to resume on {}.", player.device_name()),
-                    4,
-                  );
+                  self
+                    .emit_status(
+                      format!("No playback to resume on {}.", player.device_name()),
+                      4,
+                    )
+                    .await;
                   info!("native resume fallback failed: {}", resume_err);
                 }
               }
@@ -1919,19 +1893,20 @@ impl PlaybackNetwork for Network {
           // park the request for replay instead of routing to the
           // full-screen error, which is what made every press during the
           // recovery window cost a paced round trip ending on Error.
-          let mut app = self.app.lock().await;
-          if app.native_backend_pending {
-            app.park_start_playback(
-              context_id.as_ref().map(|c| c.uri()),
-              uris
-                .as_ref()
-                .map(|list| list.iter().map(|u| u.uri()).collect()),
-              offset,
-            );
-            app.set_status_message("Reconnecting native streaming; playback will resume.", 6);
+          if matches!(
+            self
+              .fold_query(FoldQuery::ClaimNativeBackendPendingPark {
+                context_uri: context_id.as_ref().map(|c| c.uri()),
+                uris: uris
+                  .as_ref()
+                  .map(|list| list.iter().map(|u| u.uri()).collect()),
+                offset,
+              })
+              .await,
+            Some(FoldAnswer::Bool(true))
+          ) {
             return;
           }
-          drop(app);
         }
 
         // De-escalate a native-settling restriction violation; don't park it
@@ -1941,8 +1916,7 @@ impl PlaybackNetwork for Network {
           return;
         }
 
-        let mut app = self.app.lock().await;
-        app.handle_error(e);
+        self.emit_error(e).await;
       }
     }
   }

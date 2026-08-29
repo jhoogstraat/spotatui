@@ -1034,10 +1034,11 @@ impl Network {
   }
 
   /// Route a handler failure through the fold as a fact (the old inline
-  /// `self.handle_error(e)` lock site).
+  /// `self.handle_error(e)` lock site). Ack it because the CLI reads the
+  /// latched error immediately after the handler returns.
   async fn emit_error(&self, e: anyhow::Error) {
     self
-      .emit_session(SessionFact::Error(format!("{e:#}")))
+      .emit_session_acked(SessionFact::Error(format!("{e:#}")))
       .await;
   }
 

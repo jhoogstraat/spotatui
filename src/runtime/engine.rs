@@ -224,6 +224,47 @@ pub enum SessionFact {
     devices: Vec<rspotify::model::device::Device>,
     navigate: bool,
   },
+  // --- Ticket 17 (playback family): start_playback mirrors. Streaming-only.
+  /// Park a StartPlayback request for replay once a usable backend exists
+  /// (the recovery park and every "backend may materialize" park).
+  #[cfg(feature = "streaming")]
+  ParkStartPlayback {
+    context_uri: Option<String>,
+    uris: Option<Vec<String>>,
+    offset: Option<usize>,
+  },
+  /// The native player has been activated; install its App-owned mirrors and
+  /// recovery intent after the producer has called `player.activate()`.
+  #[cfg(feature = "streaming")]
+  NativePlaybackActivated(NativePlaybackActivation),
+  /// A context start via the Web API succeeded (`start_native_context_via_api`):
+  /// the whole Ok-arm write (poll backdate, play/shuffle mirror, park for the
+  /// watchdog, re-poll dispatch).
+  #[cfg(feature = "streaming")]
+  NativeApiContextStarted {
+    context_uri: String,
+    uris: Option<Vec<String>>,
+    offset: Option<usize>,
+    shuffle_applied: bool,
+    desired_shuffle_state: bool,
+  },
+  /// A bare-resume through the Web API on the native device succeeded
+  /// (`me/player/play`): mirror the play state and re-poll. `Some` also
+  /// records the native device id (the resume path that discovered it).
+  #[cfg(feature = "streaming")]
+  NativeResumeApiStarted { native_device_id: Option<String> },
+  /// A direct native load was accepted: park for the watchdog, arm it, and
+  /// optimistically mirror the play/shuffle state (the watchdog corrects a
+  /// zombie session). `record` additionally writes the recovery snapshot
+  /// (the fallback path, which had no prior activation-time record).
+  #[cfg(feature = "streaming")]
+  NativeLoadAccepted {
+    context_uri: Option<String>,
+    uris: Option<Vec<String>>,
+    offset: Option<usize>,
+    desired_shuffle_state: bool,
+    record: Option<NativePlaybackRequestSpec>,
+  },
   // --- Ticket 17 (playback family): transport-command mirrors. Each fact
   // names the outcome whose UI/recovery writes it folds. The native-backed
   // mirrors are streaming-only; `TransportStateMirrored` and the volume-drop
@@ -360,6 +401,16 @@ impl std::fmt::Debug for SessionFact {
         .debug_struct("DevicesLanded")
         .field("navigate", navigate)
         .finish_non_exhaustive(),
+      #[cfg(feature = "streaming")]
+      SessionFact::ParkStartPlayback { .. } => f.write_str("ParkStartPlayback"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativePlaybackActivated(_) => f.write_str("NativePlaybackActivated"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeApiContextStarted { .. } => f.write_str("NativeApiContextStarted"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeResumeApiStarted { .. } => f.write_str("NativeResumeApiStarted"),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeLoadAccepted { .. } => f.write_str("NativeLoadAccepted"),
       #[cfg(feature = "streaming")]
       SessionFact::ClearStartPlaybackReplay => f.write_str("ClearStartPlaybackReplay"),
       #[cfg(feature = "streaming")]
@@ -839,6 +890,40 @@ pub enum FoldQuery {
   /// the recorded origin, else derived from the current context.
   #[cfg(feature = "streaming")]
   NativePlaybackOriginFallback,
+  // --- Ticket 17 (playback family): start_playback claims and reads.
+  /// The shuffle state a new playback should carry (the context's, else the
+  /// persisted preference — the old pre-start read of `start_playback`).
+  DesiredShuffleState,
+  /// The recorded native device id, if any (`resolve_native_playback_route`).
+  #[cfg(feature = "streaming")]
+  NativeDeviceId,
+  /// Compute the transfer decision and device-preference verdict from live
+  /// state before the producer transfers and activates the player.
+  #[cfg(feature = "streaming")]
+  NativePlaybackActivationDecision(NativePlaybackActivation),
+  /// Is there local playback state a bare resume can ride (the old
+  /// `can_resume_direct_native` read: native metadata or a known last track)?
+  #[cfg(feature = "streaming")]
+  NativeResumeDirectPossible,
+  /// Does a parked StartPlayback replay with recovery attempts behind it
+  /// still describe this exact request? Decides the API-context retry route
+  /// (a direct load of the same request already failed silently once).
+  #[cfg(feature = "streaming")]
+  StartPlaybackReplayMatches {
+    context_uri: Option<String>,
+    uris: Option<Vec<String>>,
+    offset: Option<usize>,
+  },
+  /// Park a failed StartPlayback while a native backend is still materializing
+  /// (the `native_backend_pending` check-and-park): `true` when the fold
+  /// parked it and surfaced the reconnecting notice — the producer returns
+  /// instead of surfacing the error.
+  #[cfg(feature = "streaming")]
+  ClaimNativeBackendPendingPark {
+    context_uri: Option<String>,
+    uris: Option<Vec<String>>,
+    offset: Option<usize>,
+  },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -928,6 +1013,12 @@ pub enum FoldAnswer {
   /// The playback origin a bare resume should record.
   #[cfg(feature = "streaming")]
   NativeOrigin(crate::core::app::NativePlaybackOrigin),
+  /// The recorded native device id, if any.
+  #[cfg(feature = "streaming")]
+  NativeDeviceId(Option<String>),
+  /// The activation decision produced by the fold.
+  #[cfg(feature = "streaming")]
+  NativeActivation(NativeActivationDecision),
 }
 
 impl std::fmt::Debug for FoldAnswer {
@@ -981,6 +1072,14 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::IoTx(io_tx) => f.debug_tuple("IoTx").field(&io_tx.is_some()).finish(),
       #[cfg(feature = "streaming")]
       FoldAnswer::NativeOrigin(origin) => f.debug_tuple("NativeOrigin").field(origin).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeDeviceId(id) => f.debug_tuple("NativeDeviceId").field(id).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeActivation(decision) => f
+        .debug_struct("NativeActivation")
+        .field("should_transfer", &decision.should_transfer)
+        .field("preference", &decision.preference)
+        .finish(),
       #[cfg(feature = "streaming")]
       FoldAnswer::NativeShuffleInstall { generation, reload } => f
         .debug_struct("NativeShuffleInstall")
@@ -1084,6 +1183,69 @@ pub struct StartPlaybackPark {
   pub context_uri: Option<String>,
   pub uris: Option<Vec<String>>,
   pub offset: Option<usize>,
+}
+
+// --- Ticket 17 (playback family): start_playback activation + load facts.
+// Streaming-only — the slim build never routes playback natively.
+
+/// The request payload `record_native_playback_request` writes for the
+/// recovery snapshot (the repeat state is read fold-side from the context at
+/// apply time, exactly where the old inline block read it).
+#[cfg(feature = "streaming")]
+#[derive(Clone, Debug)]
+pub struct NativePlaybackRequestSpec {
+  pub context_uri: Option<String>,
+  pub uris: Option<Vec<String>>,
+  pub offset: Option<usize>,
+  pub desired_playing: bool,
+  pub shuffle: bool,
+}
+
+/// Whether a native playback activation should persist the native device id
+/// into the client config (`Persist`), or leave the user's saved device alone
+/// (`KeepExistingPreference`). Lives here because the producer (client
+/// config) and the fold (App) each need half of the decision.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeDevicePreferenceUpdate {
+  Persist,
+  KeepExistingPreference,
+}
+
+/// The native-playback activation payload. A query first computes the
+/// producer-owned transfer/config decision; after `player.activate()`, a fact
+/// applies the App-owned mirrors and recovery intent.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Debug)]
+pub struct NativePlaybackActivation {
+  pub native_device_id: String,
+  pub native_device_name: String,
+  /// The Web API client's saved device id (lives on the producer).
+  pub saved_device_id: Option<String>,
+  pub explicit_persist: bool,
+  pub origin: Option<crate::core::app::NativePlaybackOrigin>,
+  pub activation_time: std::time::Instant,
+  /// Backdate the poll clock (`activation_time - 6s`) so the next poll runs
+  /// immediately — the paths that hand playback to the player without a
+  /// context to confirm.
+  pub backdate_poll: bool,
+  /// Drop the previous device's playback context (the transfer path).
+  pub clear_context: bool,
+  /// A bare resume (no context, no uris): record play intent only.
+  pub bare_resume: bool,
+  /// A concrete playback request: record it for recovery (repeat read
+  /// fold-side from the context).
+  pub request: Option<NativePlaybackRequestSpec>,
+}
+
+/// What [`FoldQuery::NativePlaybackActivationDecision`] answers back.
+#[cfg(feature = "streaming")]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeActivationDecision {
+  /// Move the player to this device before it takes playback.
+  pub should_transfer: bool,
+  /// The device-preference verdict the producer applies to its client config.
+  pub preference: NativeDevicePreferenceUpdate,
 }
 
 /// Player state sampled at native-shuffle install time for the reload the

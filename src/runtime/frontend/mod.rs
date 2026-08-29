@@ -1306,6 +1306,111 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         .plugin_data_generations
         .bump(crate::core::app::PluginDataKind::Devices);
     }
+    #[cfg(feature = "streaming")]
+    SessionFact::ParkStartPlayback {
+      context_uri,
+      uris,
+      offset,
+    } => app.park_start_playback(context_uri, uris, offset),
+    #[cfg(feature = "streaming")]
+    SessionFact::NativePlaybackActivated(activation) => {
+      app.is_streaming_active = true;
+      app.last_device_activation = Some(activation.activation_time);
+      app.native_activation_pending = false;
+      app.native_playback_origin = activation.origin;
+      app.native_device_id = Some(activation.native_device_id);
+      if activation.backdate_poll {
+        app.instant_since_last_current_playback_poll =
+          activation.activation_time - Duration::from_secs(6);
+      }
+      if activation.clear_context {
+        app.current_playback_context = None;
+      }
+      if activation.bare_resume {
+        app.set_native_playback_intent(true);
+      } else if let Some(request) = activation.request {
+        let repeat = app
+          .current_playback_context
+          .as_ref()
+          .map_or(rspotify::model::RepeatState::Off, |ctx| ctx.repeat_state);
+        app.record_native_playback_request(
+          request.context_uri,
+          request.uris,
+          request.offset,
+          request.desired_playing,
+          request.shuffle,
+          repeat,
+        );
+      }
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeApiContextStarted {
+      context_uri,
+      uris,
+      offset,
+      shuffle_applied,
+      desired_shuffle_state,
+    } => {
+      app.instant_since_last_current_playback_poll = Instant::now() - Duration::from_secs(6);
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.is_playing = true;
+        if shuffle_applied {
+          ctx.shuffle_state = desired_shuffle_state;
+        }
+      }
+      if shuffle_applied {
+        app.runtime_state.shuffle_enabled = desired_shuffle_state;
+        app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
+          desired_shuffle_state,
+        ));
+      }
+      app.park_start_playback(Some(context_uri), uris, offset);
+      app.native_load_watchdog = Some(Instant::now());
+      app.dispatch(IoEvent::GetCurrentPlayback);
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeResumeApiStarted { native_device_id } => {
+      if let Some(id) = native_device_id {
+        app.native_device_id = Some(id);
+      }
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.is_playing = true;
+      }
+      app.dispatch(IoEvent::GetCurrentPlayback);
+    }
+    #[cfg(feature = "streaming")]
+    SessionFact::NativeLoadAccepted {
+      context_uri,
+      uris,
+      offset,
+      desired_shuffle_state,
+      record,
+    } => {
+      if let Some(request) = record {
+        let repeat = app
+          .current_playback_context
+          .as_ref()
+          .map_or(rspotify::model::RepeatState::Off, |ctx| ctx.repeat_state);
+        app.record_native_playback_request(
+          request.context_uri,
+          request.uris,
+          request.offset,
+          request.desired_playing,
+          request.shuffle,
+          repeat,
+        );
+      }
+      app.park_start_playback(context_uri, uris, offset);
+      app.native_load_watchdog = Some(Instant::now());
+      if let Some(ctx) = &mut app.current_playback_context {
+        ctx.is_playing = true;
+        ctx.shuffle_state = desired_shuffle_state;
+      }
+      app.runtime_state.shuffle_enabled = desired_shuffle_state;
+      app.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
+        desired_shuffle_state,
+      ));
+    }
   }
 }
 
@@ -1742,6 +1847,72 @@ pub(crate) fn answer_query(
       });
       FoldAnswer::NativeOrigin(origin)
     }
+    FoldQuery::DesiredShuffleState => FoldAnswer::Bool(
+      app
+        .current_playback_context
+        .as_ref()
+        .map(|ctx| ctx.shuffle_state)
+        .unwrap_or(app.runtime_state.shuffle_enabled),
+    ),
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativeDeviceId => FoldAnswer::NativeDeviceId(app.native_device_id.clone()),
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlaybackActivationDecision(activation) => {
+      use crate::infra::network::playback::{
+        native_device_preference_update, saved_device_matches_native_player,
+      };
+      let saved_matches = saved_device_matches_native_player(
+        activation.saved_device_id.as_deref(),
+        Some(&activation.native_device_id),
+        app.devices.as_ref(),
+        &activation.native_device_name,
+      );
+      let recent_activation = app
+        .last_device_activation
+        .is_some_and(|instant| instant.elapsed() < Duration::from_secs(5));
+      let should_transfer = if app.native_activation_pending {
+        !recent_activation
+      } else {
+        !app.is_streaming_active && !recent_activation
+      };
+      FoldAnswer::NativeActivation(crate::runtime::engine::NativeActivationDecision {
+        should_transfer,
+        preference: native_device_preference_update(
+          activation.saved_device_id.as_deref(),
+          activation.explicit_persist,
+          saved_matches,
+        ),
+      })
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativeResumeDirectPossible => {
+      FoldAnswer::Bool(app.native_track_info.is_some() || app.last_track_id.is_some())
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::StartPlaybackReplayMatches {
+      context_uri,
+      uris,
+      offset,
+    } => FoldAnswer::Bool(app.pending_start_playback.as_ref().is_some_and(|pending| {
+      pending.recovery_attempts > 0
+        && pending.context_uri == context_uri
+        && pending.uris == uris
+        && pending.offset == offset
+    })),
+    #[cfg(feature = "streaming")]
+    FoldQuery::ClaimNativeBackendPendingPark {
+      context_uri,
+      uris,
+      offset,
+    } => {
+      if app.native_backend_pending {
+        app.park_start_playback(context_uri, uris, offset);
+        app.set_status_message("Reconnecting native streaming; playback will resume.", 6);
+        FoldAnswer::Bool(true)
+      } else {
+        FoldAnswer::Bool(false)
+      }
+    }
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),
     ),
@@ -1993,5 +2164,85 @@ mod tests {
       answered,
       Ok(crate::runtime::engine::FoldAnswer::U64(0))
     ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn native_start_claim_and_load_are_fold_owned() {
+    use crate::core::app::NativePlaybackOrigin;
+    use crate::runtime::engine::{
+      FoldAnswer, FoldQuery, NativeDevicePreferenceUpdate, NativePlaybackActivation,
+      NativePlaybackRequestSpec, SessionFact,
+    };
+
+    let mut app = App::default();
+    let uris = vec!["spotify:track:one".to_string()];
+    let activation = NativePlaybackActivation {
+      native_device_id: "native-device".to_string(),
+      native_device_name: "Spotatui".to_string(),
+      saved_device_id: None,
+      explicit_persist: false,
+      origin: Some(NativePlaybackOrigin::RawList),
+      activation_time: Instant::now(),
+      backdate_poll: false,
+      clear_context: false,
+      bare_resume: false,
+      request: Some(NativePlaybackRequestSpec {
+        context_uri: None,
+        uris: Some(uris.clone()),
+        offset: Some(0),
+        desired_playing: true,
+        shuffle: true,
+      }),
+    };
+    let answer = answer_query(
+      &mut app,
+      FoldQuery::NativePlaybackActivationDecision(activation.clone()),
+    );
+
+    assert!(matches!(
+      answer,
+      FoldAnswer::NativeActivation(decision)
+        if decision.should_transfer
+          && decision.preference == NativeDevicePreferenceUpdate::Persist
+    ));
+    assert!(!app.is_streaming_active);
+    assert!(app.native_playback_recovery.is_none());
+
+    apply_session_fact(&mut app, SessionFact::NativePlaybackActivated(activation));
+    assert!(app.is_streaming_active);
+    assert_eq!(app.native_device_id.as_deref(), Some("native-device"));
+    assert_eq!(
+      app.native_playback_origin,
+      Some(NativePlaybackOrigin::RawList)
+    );
+    assert_eq!(
+      app
+        .native_playback_recovery
+        .as_ref()
+        .and_then(|snapshot| snapshot.uris.as_ref()),
+      Some(&uris)
+    );
+
+    apply_session_fact(
+      &mut app,
+      SessionFact::NativeLoadAccepted {
+        context_uri: None,
+        uris: Some(uris.clone()),
+        offset: Some(0),
+        desired_shuffle_state: true,
+        record: None,
+      },
+    );
+
+    assert!(app.native_load_watchdog.is_some());
+    assert_eq!(
+      app
+        .pending_start_playback
+        .as_ref()
+        .and_then(|pending| pending.uris.as_ref()),
+      Some(&uris)
+    );
+    assert!(app.runtime_state.shuffle_enabled);
   }
 }
