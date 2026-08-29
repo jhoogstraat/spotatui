@@ -35,7 +35,7 @@ use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 
 use super::{track_id_from_uri, SubsonicPlaybackState, SubsonicSource};
-use crate::core::app::{App, TrackTableContext};
+use crate::core::app::App;
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
@@ -121,11 +121,11 @@ pub async fn route_subsonic_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> boo
     IoEvent::ChangeVolume(volume) => match player(app).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        let mut app = app.lock().await;
-        app.runtime_state.volume_percent = *volume;
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-          *volume,
-        ));
+        crate::runtime::engine::emit_decoded_source(
+          app,
+          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
+        )
+        .await;
         true
       }
       None => false,
@@ -191,8 +191,11 @@ async fn load_subsonic_playlists(app: &Arc<Mutex<App>>) {
   };
   match source.playlists().await {
     Ok(playlists) => {
-      let mut app = app.lock().await;
-      app.subsonic_playlists = playlists;
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::SubsonicPlaylists(playlists),
+      )
+      .await;
     }
     Err(e) => set_error(app, format!("Cannot load Subsonic playlists: {e}")).await,
   }
@@ -206,10 +209,11 @@ async fn load_subsonic_tracks(app: &Arc<Mutex<App>>, playlist_uri: &str) {
   };
   match source.tracks(playlist_uri).await {
     Ok(tracks) => {
-      let mut app = app.lock().await;
-      app.track_table.tracks = tracks;
-      app.track_table.selected_index = 0;
-      app.track_table.context = Some(TrackTableContext::SubsonicPlaylist);
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::SubsonicTracks(tracks),
+      )
+      .await;
     }
     Err(e) => set_error(app, format!("Cannot load Subsonic playlist: {e}")).await,
   }
@@ -450,7 +454,6 @@ async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx:
       player.set_volume(volume as f32 / 100.0);
 
       let display = tracks[index].name.clone();
-      let mut guard = app.lock().await;
       // Publish the session exactly once, now that the source is decoding.
       let mut state = SubsonicPlaybackState {
         player,
@@ -462,11 +465,18 @@ async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx:
         shuffle_backup: None,
       };
       // Honor the player-global decoded shuffle for the freshly-built queue.
-      if guard.decoded_shuffle {
+      if app.lock().await.decoded_shuffle {
         state.set_shuffle(true);
       }
-      guard.subsonic_playback = Some(state);
-      guard.set_status_message(format!("\u{266a} {display}"), 4);
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::SubsonicPlayback(state),
+      )
+      .await;
+      app
+        .lock()
+        .await
+        .set_status_message(format!("\u{266a} {display}"), 4);
     }
     Ok(Err(e)) => set_error(app, format!("Cannot play Subsonic track: {e}")).await,
     Err(e) => set_error(app, format!("Subsonic playback task failed: {e}")).await,
@@ -617,11 +627,11 @@ async fn commit_index(app: &Arc<Mutex<App>>, target: usize, tmp: NamedTempFile) 
 /// End the subsonic session, releasing the output device and cleaning up the
 /// current tempfile.
 async fn teardown_subsonic(app: &Arc<Mutex<App>>) {
-  if let Some(s) = app.lock().await.subsonic_playback.take() {
-    s.player.stop();
-    // Dropping `s` drops the tempfile (cleanup) and, if it held the last
-    // reference, the keepalive thread exits and the device is released.
-  }
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::SubsonicPlaybackCleared,
+  )
+  .await;
 }
 
 async fn set_error(app: &Arc<Mutex<App>>, message: String) {

@@ -123,11 +123,11 @@ pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool
     IoEvent::ChangeVolume(volume) => match player(app).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        let mut app = app.lock().await;
-        app.runtime_state.volume_percent = *volume;
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-          *volume,
-        ));
+        crate::runtime::engine::emit_decoded_source(
+          app,
+          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
+        )
+        .await;
         true
       }
       None => false,
@@ -237,7 +237,11 @@ async fn publish_playlists(app: &Arc<Mutex<App>>, file: &super::playlists::Playl
     .iter()
     .map(super::playlists::playlist_to_info)
     .collect();
-  app.lock().await.youtube_playlists = infos;
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::YouTubePlaylists(infos),
+  )
+  .await;
 }
 
 /// Load `youtube_playlists.yml` into the sidebar.
@@ -266,11 +270,14 @@ async fn load_playlist_tracks(app: &Arc<Mutex<App>>, uri: &str) {
     .iter()
     .map(super::playlists::stored_to_track_info)
     .collect();
-  let mut guard = app.lock().await;
-  guard.track_table.tracks = rows;
-  guard.track_table.selected_index = 0;
-  guard.track_table.context = Some(crate::core::app::TrackTableContext::YouTubePlaylist);
-  guard.youtube_open_playlist = Some(uri.to_string());
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::YouTubeTracks(rows),
+  )
+  .await;
+  // The open-playlist marker is a small request token; retain its existing
+  // direct update until the source query envelope grows a marker operation.
+  app.lock().await.youtube_open_playlist = Some(uri.to_string());
 }
 
 /// Create a playlist and refresh the sidebar.
@@ -601,7 +608,6 @@ async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: 
       player.set_volume(volume as f32 / 100.0);
 
       let display = tracks[index].name.clone();
-      let mut guard = app.lock().await;
       // Publish the session exactly once, now that the source is decoding.
       let mut state = YouTubePlaybackState {
         player,
@@ -613,11 +619,18 @@ async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: 
         shuffle_backup: None,
       };
       // Honor the player-global decoded shuffle for the freshly-built queue.
-      if guard.decoded_shuffle {
+      if app.lock().await.decoded_shuffle {
         state.set_shuffle(true);
       }
-      guard.youtube_playback = Some(state);
-      guard.set_status_message(format!("\u{266a} {display}"), 4);
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::YouTubePlayback(state),
+      )
+      .await;
+      app
+        .lock()
+        .await
+        .set_status_message(format!("\u{266a} {display}"), 4);
     }
     Ok(Err(e)) => set_error(app, decode_hint(e)).await,
     Err(e) => set_error(app, format!("YouTube playback task failed: {e}")).await,
@@ -793,11 +806,11 @@ async fn commit_index(app: &Arc<Mutex<App>>, target: usize, tmp: NamedTempFile) 
 /// End the YouTube session, releasing the output device and cleaning up the
 /// current tempfile.
 pub async fn teardown_youtube(app: &Arc<Mutex<App>>) {
-  if let Some(s) = app.lock().await.youtube_playback.take() {
-    s.player.stop();
-    // Dropping `s` drops the tempfile (cleanup) and, if it held the last
-    // reference, the keepalive thread exits and the device is released.
-  }
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::YouTubePlaybackCleared,
+  )
+  .await;
 }
 
 async fn set_error(app: &Arc<Mutex<App>>, message: String) {

@@ -34,7 +34,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use super::{file_uri_to_path, track_info_from_path, LocalPlaybackState, LocalSource};
-use crate::core::app::{App, TrackTableContext};
+use crate::core::app::App;
 use crate::core::source::MediaSource;
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
@@ -109,11 +109,11 @@ pub async fn route_local_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
       Some(player) => {
         player.set_volume(*volume as f32 / 100.0);
         // Keep the playbar's volume readout in sync.
-        let mut app = app.lock().await;
-        app.runtime_state.volume_percent = *volume;
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-          *volume,
-        ));
+        crate::runtime::engine::emit_decoded_source(
+          app,
+          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
+        )
+        .await;
         true
       }
       None => false,
@@ -316,7 +316,6 @@ async fn start_local_queue(app: &Arc<Mutex<App>>, queue: Vec<String>, start_idx:
       // Publish-once covers the empty-sink race here: `local_playback` is `None`
       // throughout the decode above, so `advancing` starts `false`.
       let display_name = info.name.clone();
-      let mut app = app.lock().await;
       let mut state = LocalPlaybackState {
         player,
         queue,
@@ -332,11 +331,18 @@ async fn start_local_queue(app: &Arc<Mutex<App>>, queue: Vec<String>, start_idx:
       // Honor the player-global decoded shuffle for the freshly-built queue so it
       // persists across contexts like Spotify (the just-decoded start track stays
       // playing, moved to the front).
-      if app.decoded_shuffle {
+      if app.lock().await.decoded_shuffle {
         state.set_shuffle(true);
       }
-      app.local_playback = Some(state);
-      app.set_status_message(format!("\u{266a} {display_name}"), 4);
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::LocalPlayback(state),
+      )
+      .await;
+      app
+        .lock()
+        .await
+        .set_status_message(format!("\u{266a} {display_name}"), 4);
     }
     Ok(Err(e)) => set_error(app, format!("Cannot play local file: {e}")).await,
     Err(e) => set_error(app, format!("Local playback task failed: {e}")).await,
@@ -521,11 +527,11 @@ async fn acquire_player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
 
 /// End the local session, releasing the output device.
 async fn teardown_local(app: &Arc<Mutex<App>>) {
-  if let Some(local) = app.lock().await.local_playback.take() {
-    local.player.stop();
-    // `local` is dropped here; if it held the last reference the keepalive
-    // thread exits and the output device is released.
-  }
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::LocalPlaybackCleared,
+  )
+  .await;
 }
 
 async fn set_error(app: &Arc<Mutex<App>>, message: String) {
@@ -566,8 +572,11 @@ async fn load_local_playlists(app: &Arc<Mutex<App>>) {
   .await;
   match result {
     Ok(Ok(playlists)) => {
-      let mut app = app.lock().await;
-      app.local_playlists = playlists;
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::LocalPlaylists(playlists),
+      )
+      .await;
       // (view field deleted with the terminal UI; selection state lives
       // presentation-side now)
     }
@@ -589,10 +598,11 @@ async fn load_local_tracks(app: &Arc<Mutex<App>>, playlist_uri: &str) {
   .await;
   match result {
     Ok(Ok(tracks)) => {
-      let mut app = app.lock().await;
-      app.track_table.tracks = tracks;
-      app.track_table.selected_index = 0;
-      app.track_table.context = Some(TrackTableContext::LocalPlaylist);
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::LocalTracks(tracks),
+      )
+      .await;
     }
     Ok(Err(e)) => set_error(app, format!("Cannot read folder: {e}")).await,
     Err(e) => set_error(app, format!("Local track scan failed: {e}")).await,

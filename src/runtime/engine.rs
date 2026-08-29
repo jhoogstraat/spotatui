@@ -57,6 +57,86 @@ pub enum EngineEvent {
   /// spinner, emitted by the network layer instead of written under the App
   /// lock.
   Session(SessionFact),
+  /// Decoded-source domain facts (local, Subsonic, radio, YouTube).  The
+  /// envelope keeps source-specific reducers out of this central enum while
+  /// giving every source one fold-owned write path.
+  Decoded(DecodedSourceFact),
+}
+
+/// Fold-owned writes for the decoded sources.  Read-only decisions still use
+/// the existing `FoldQuery` protocol; these facts carry only completed work.
+pub enum DecodedSourceFact {
+  #[cfg(feature = "local-files")]
+  LocalPlaylists(Vec<crate::core::plugin_api::PlaylistInfo>),
+  #[cfg(feature = "local-files")]
+  LocalTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "local-files")]
+  LocalPlayback(crate::infra::local::LocalPlaybackState),
+  #[cfg(feature = "local-files")]
+  LocalPlaybackCleared,
+  #[cfg(feature = "subsonic")]
+  SubsonicPlaylists(Vec<crate::core::plugin_api::PlaylistInfo>),
+  #[cfg(feature = "subsonic")]
+  SubsonicTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "subsonic")]
+  SubsonicPlayback(crate::infra::subsonic::SubsonicPlaybackState),
+  #[cfg(feature = "subsonic")]
+  SubsonicPlaybackCleared,
+  #[cfg(feature = "internet-radio")]
+  RadioStations(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "internet-radio")]
+  RadioPlayback(crate::infra::radio::RadioPlaybackState),
+  #[cfg(feature = "internet-radio")]
+  RadioPlaybackCleared,
+  #[cfg(feature = "youtube")]
+  YouTubePlaylists(Vec<crate::core::plugin_api::PlaylistInfo>),
+  #[cfg(feature = "youtube")]
+  YouTubeTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "youtube")]
+  YouTubePlayback(crate::infra::youtube::YouTubePlaybackState),
+  #[cfg(feature = "youtube")]
+  YouTubePlaybackCleared,
+  /// Shared runtime volume mirror used by all decoded sources.
+  Volume(u8),
+}
+
+impl std::fmt::Debug for DecodedSourceFact {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let name = match self {
+      #[cfg(feature = "local-files")]
+      Self::LocalPlaylists(_) => "LocalPlaylists",
+      #[cfg(feature = "local-files")]
+      Self::LocalTracks(_) => "LocalTracks",
+      #[cfg(feature = "local-files")]
+      Self::LocalPlayback(_) => "LocalPlayback",
+      #[cfg(feature = "local-files")]
+      Self::LocalPlaybackCleared => "LocalPlaybackCleared",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicPlaylists(_) => "SubsonicPlaylists",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicTracks(_) => "SubsonicTracks",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicPlayback(_) => "SubsonicPlayback",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicPlaybackCleared => "SubsonicPlaybackCleared",
+      #[cfg(feature = "internet-radio")]
+      Self::RadioStations(_) => "RadioStations",
+      #[cfg(feature = "internet-radio")]
+      Self::RadioPlayback(_) => "RadioPlayback",
+      #[cfg(feature = "internet-radio")]
+      Self::RadioPlaybackCleared => "RadioPlaybackCleared",
+      #[cfg(feature = "youtube")]
+      Self::YouTubePlaylists(_) => "YouTubePlaylists",
+      #[cfg(feature = "youtube")]
+      Self::YouTubeTracks(_) => "YouTubeTracks",
+      #[cfg(feature = "youtube")]
+      Self::YouTubePlayback(_) => "YouTubePlayback",
+      #[cfg(feature = "youtube")]
+      Self::YouTubePlaybackCleared => "YouTubePlaybackCleared",
+      Self::Volume(_) => "Volume",
+    };
+    f.write_str(name)
+  }
 }
 
 /// One session-level fact (ticket 16). The fold applies these through the
@@ -1665,5 +1745,18 @@ pub(crate) async fn emit_catalog_event(
 ) {
   if let Some(spine) = app.lock().await.spine.as_ref() {
     spine.emit(EngineEvent::Catalog(event)).await;
+  }
+}
+
+/// Emit one decoded-source fact through the fold. Tests that do not install a
+/// fold use the same reducer synchronously as a compatibility fallback.
+#[allow(dead_code)]
+pub(crate) async fn emit_decoded_source(app: &Arc<Mutex<App>>, fact: DecodedSourceFact) {
+  let spine = app.lock().await.spine.clone();
+  if let Some(spine) = spine {
+    spine.emit(EngineEvent::Decoded(fact)).await;
+  } else {
+    let mut guard = app.lock().await;
+    crate::runtime::frontend::apply_decoded_source_fact(&mut guard, fact);
   }
 }

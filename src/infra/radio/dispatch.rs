@@ -91,11 +91,11 @@ pub async fn route_radio_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
     IoEvent::ChangeVolume(volume) => match player(app).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        let mut app = app.lock().await;
-        app.runtime_state.volume_percent = *volume;
-        app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
-          *volume,
-        ));
+        crate::runtime::engine::emit_decoded_source(
+          app,
+          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
+        )
+        .await;
         true
       }
       None => false,
@@ -120,21 +120,29 @@ pub async fn route_radio_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
 /// Load configured and saved stations into `app.radio_stations` (the sidebar's
 /// Stations panel). No network.
 async fn load_radio_stations(app: &Arc<Mutex<App>>) {
-  let mut guard = app.lock().await;
-  let stations: Vec<TrackInfo> = merged_radio_stations(
-    &guard.user_config.behavior.radio_stations,
-    &guard.runtime_state.radio_stations,
-  )
-  .into_iter()
-  .map(|station| config_station_to_track_info(&station.name, &station.url))
-  .collect();
+  let (configured, saved) = {
+    let guard = app.lock().await;
+    (
+      guard.user_config.behavior.radio_stations.clone(),
+      guard.runtime_state.radio_stations.clone(),
+    )
+  };
+  let stations: Vec<TrackInfo> = merged_radio_stations(&configured, &saved)
+    .into_iter()
+    .map(|station| config_station_to_track_info(&station.name, &station.url))
+    .collect();
   let empty = stations.is_empty();
-  guard.radio_stations = stations;
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::RadioStations(stations),
+  )
+  .await;
   if empty {
-    guard.set_status_message(
+    set_error(
+      app,
       "No radio stations configured or saved; search to add some".to_string(),
-      6,
-    );
+    )
+    .await;
   }
 }
 
@@ -330,14 +338,21 @@ async fn start_radio(app: &Arc<Mutex<App>>, uri: &str) {
       player.set_volume(volume as f32 / 100.0);
 
       let display = station.name.clone();
-      let mut guard = app.lock().await;
       // Publish the session exactly once, now that the stream is decoding.
-      guard.radio_playback = Some(RadioPlaybackState {
+      let state = RadioPlaybackState {
         player,
         station,
         now_playing,
-      });
-      guard.set_status_message(format!("\u{266a} {display} (live)"), 4);
+      };
+      crate::runtime::engine::emit_decoded_source(
+        app,
+        crate::runtime::engine::DecodedSourceFact::RadioPlayback(state),
+      )
+      .await;
+      app
+        .lock()
+        .await
+        .set_status_message(format!("\u{266a} {display} (live)"), 4);
     }
     Ok(Err(e)) => set_error(app, format!("Cannot play radio stream: {e}")).await,
     Err(e) => set_error(app, format!("Radio playback task failed: {e}")).await,
@@ -348,9 +363,11 @@ async fn start_radio(app: &Arc<Mutex<App>>, uri: &str) {
 /// the decoder, which drops the stream reader, which cancels the background
 /// download task (`cancel_on_drop`).
 pub async fn teardown_radio(app: &Arc<Mutex<App>>) {
-  if let Some(s) = app.lock().await.radio_playback.take() {
-    s.player.stop();
-  }
+  crate::runtime::engine::emit_decoded_source(
+    app,
+    crate::runtime::engine::DecodedSourceFact::RadioPlaybackCleared,
+  )
+  .await;
 }
 
 async fn set_error(app: &Arc<Mutex<App>>, message: String) {

@@ -631,12 +631,12 @@ pub(super) async fn fold_loop(
       }
       _ = tx.closed() => break,
     };
-    match &event {
+    match event {
       EngineEvent::Streaming(streaming) => {
         #[cfg(feature = "streaming")]
         {
           let mut app = app.lock().await;
-          app.apply_streaming_state(streaming.clone());
+          app.apply_streaming_state(streaming);
         }
         #[cfg(not(feature = "streaming"))]
         {
@@ -645,11 +645,15 @@ pub(super) async fn fold_loop(
       }
       EngineEvent::Catalog(catalog) => {
         let mut app = app.lock().await;
-        crate::core::apply_catalog_state(&mut app, catalog);
+        crate::core::apply_catalog_state(&mut app, &catalog);
       }
       EngineEvent::Session(fact) => {
         let mut app = app.lock().await;
-        apply_session_fact(&mut app, fact.clone());
+        apply_session_fact(&mut app, fact);
+      }
+      EngineEvent::Decoded(fact) => {
+        let mut app = app.lock().await;
+        apply_decoded_source_fact(&mut app, fact);
       }
       EngineEvent::StateChanged(_) => {}
     }
@@ -808,7 +812,84 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
       crate::core::apply_catalog_state(app, catalog);
     }
     EngineEvent::Session(fact) => apply_session_fact(app, fact.clone()),
+    EngineEvent::Decoded(_) => {}
     EngineEvent::StateChanged(_) => {}
+  }
+}
+
+/// Single fold-side writer for decoded-source state.  Keeping this reducer in
+/// the frontend fold means source handlers can publish completed work without
+/// racing the snapshot publisher.
+pub(crate) fn apply_decoded_source_fact(
+  app: &mut App,
+  fact: crate::runtime::engine::DecodedSourceFact,
+) {
+  use crate::runtime::engine::DecodedSourceFact;
+  match fact {
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalPlaylists(items) => app.local_playlists = items,
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalTracks(items) => {
+      app.track_table.tracks = items;
+      app.track_table.selected_index = 0;
+      app.track_table.context = Some(crate::core::app::TrackTableContext::LocalPlaylist);
+    }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalPlayback(state) => app.local_playback = Some(state),
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalPlaybackCleared => {
+      if let Some(local) = app.local_playback.take() {
+        local.player.stop();
+      }
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicPlaylists(items) => app.subsonic_playlists = items,
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicTracks(items) => {
+      app.track_table.tracks = items;
+      app.track_table.selected_index = 0;
+      app.track_table.context = Some(crate::core::app::TrackTableContext::SubsonicPlaylist);
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicPlayback(state) => app.subsonic_playback = Some(state),
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicPlaybackCleared => {
+      if let Some(s) = app.subsonic_playback.take() {
+        s.player.stop();
+      }
+    }
+    #[cfg(feature = "internet-radio")]
+    DecodedSourceFact::RadioStations(items) => app.radio_stations = items,
+    #[cfg(feature = "internet-radio")]
+    DecodedSourceFact::RadioPlayback(state) => app.radio_playback = Some(state),
+    #[cfg(feature = "internet-radio")]
+    DecodedSourceFact::RadioPlaybackCleared => {
+      if let Some(s) = app.radio_playback.take() {
+        s.player.stop();
+      }
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubePlaylists(items) => app.youtube_playlists = items,
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeTracks(items) => {
+      app.track_table.tracks = items;
+      app.track_table.selected_index = 0;
+      app.track_table.context = Some(crate::core::app::TrackTableContext::YouTubePlaylist);
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubePlayback(state) => app.youtube_playback = Some(state),
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubePlaybackCleared => {
+      if let Some(s) = app.youtube_playback.take() {
+        s.player.stop();
+      }
+    }
+    DecodedSourceFact::Volume(volume) => {
+      app.runtime_state.volume_percent = volume;
+      app.schedule_state_save(crate::core::state::PersistedRuntimeState::volume_percent(
+        volume,
+      ));
+    }
   }
 }
 
@@ -2431,6 +2512,21 @@ mod tests {
       answered,
       Ok(crate::runtime::engine::FoldAnswer::U64(0))
     ));
+  }
+
+  #[cfg(feature = "local-files")]
+  #[test]
+  fn decoded_source_tracks_are_reduced_by_the_fold() {
+    let mut app = App::default();
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::LocalTracks(Vec::new()),
+    );
+    assert_eq!(
+      app.track_table.context,
+      Some(crate::core::app::TrackTableContext::LocalPlaylist)
+    );
+    assert!(app.track_table.tracks.is_empty());
   }
 
   #[cfg(feature = "streaming")]
