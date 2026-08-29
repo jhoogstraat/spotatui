@@ -1329,7 +1329,7 @@ async fn restore_playback_session(
       // Seed the browse table so the start path's station snapshot resolves.
       app.lock().await.track_table.tracks = vec![station];
       crate::infra::radio::dispatch::route_radio_event(
-        app,
+        spine,
         &IoEvent::StartPlayback(Some(uri), None, None),
       )
       .await;

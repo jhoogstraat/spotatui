@@ -222,8 +222,7 @@ async fn teardown_backends(spine: &Spine, clear_local: bool) {
   let backends = decoded(
     spine,
     Query::ClaimBackendPlayers {
-      keep_local: !clear_local,
-      keep_subsonic: false,
+      keep: (!clear_local).then_some(crate::core::source::Source::Local),
     },
   )
   .await;

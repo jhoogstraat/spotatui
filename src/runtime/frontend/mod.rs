@@ -576,7 +576,7 @@ pub(super) async fn fold_loop(
       while let Ok((event, responder)) = acks.rx.try_recv() {
         let ack = {
           let mut guard = app.lock().await;
-          apply_acked(&mut guard, &event)
+          apply_acked(&mut guard, event)
         };
         let _ = responder.send(ack);
         publish(&app, &tx).await;
@@ -619,7 +619,7 @@ pub(super) async fn fold_loop(
           Some((event, responder)) => {
             let ack = {
               let mut guard = app.lock().await;
-              apply_acked(&mut guard, &event)
+              apply_acked(&mut guard, event)
             };
             let _ = responder.send(ack);
             publish(&app, &tx).await;
@@ -682,10 +682,10 @@ async fn publish(app: &Arc<Mutex<App>>, tx: &watch::Sender<Snapshot>) {
     }
   });
 }
-fn apply_acked(app: &mut App, event: &EngineEvent) -> Option<FoldAck> {
-  match event {
+fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
+  match &event {
     EngineEvent::Catalog(CatalogStateEvent::SavedTracksPageUpserted { .. }) => {
-      let outcome = crate::core::apply_catalog_state(app, event_catalog(event));
+      let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
       Some(FoldAck {
         next_saved_tracks_offset: if outcome.stale_event_dropped {
           None
@@ -696,7 +696,7 @@ fn apply_acked(app: &mut App, event: &EngineEvent) -> Option<FoldAck> {
       })
     }
     EngineEvent::Catalog(CatalogStateEvent::PlaylistTracksPageUpserted { .. }) => {
-      let outcome = crate::core::apply_catalog_state(app, event_catalog(event));
+      let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
       Some(FoldAck {
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: if outcome.stale_event_dropped {
@@ -709,7 +709,12 @@ fn apply_acked(app: &mut App, event: &EngineEvent) -> Option<FoldAck> {
     _ => {
       // Only catalog upserts carry post-fold facts today; other acked
       // events fold normally and answer the default ack.
-      fold_one(app, event);
+      match event {
+        EngineEvent::Decoded(fact) => {
+          apply_decoded_source_fact(app, fact);
+        }
+        _ => fold_one(app, &event),
+      }
       Some(FoldAck {
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
@@ -968,6 +973,10 @@ pub(crate) fn apply_decoded_source_fact(
     }
     #[cfg(feature = "subsonic")]
     DecodedSourceFact::SubsonicRepeat(mode) => app.decoded_repeat = mode,
+    #[cfg(feature = "internet-radio")]
+    DecodedSourceFact::RadioStatus { message, ttl_secs } => {
+      app.set_status_message(message, ttl_secs);
+    }
     #[cfg(feature = "internet-radio")]
     DecodedSourceFact::RadioStations(items) => app.radio_stations = items,
     #[cfg(feature = "internet-radio")]
@@ -2704,11 +2713,28 @@ fn answer_decoded_query(
     Q::SubsonicRepeat(state) => {
       FoldAnswer::Decoded(A::SubsonicRepeat(app.set_decoded_repeat_from_state(state)))
     }
-    #[cfg(any(feature = "local-files", feature = "subsonic"))]
-    Q::ClaimBackendPlayers {
-      keep_local,
-      keep_subsonic,
-    } => {
+    #[cfg(feature = "internet-radio")]
+    Q::RadioPlayer => FoldAnswer::Decoded(A::RadioPlayer(
+      app
+        .radio_playback
+        .as_ref()
+        .map(|s| std::sync::Arc::clone(&s.player)),
+    )),
+    #[cfg(feature = "internet-radio")]
+    Q::RadioStationsSnapshot(uri) => FoldAnswer::Decoded(A::RadioStationsSnapshot(
+      crate::infra::radio::dispatch::snapshot_station(app, &uri),
+    )),
+    #[cfg(feature = "internet-radio")]
+    Q::RadioConfig => FoldAnswer::Decoded(A::RadioConfig {
+      configured: app.user_config.behavior.radio_stations.clone(),
+      saved: app.runtime_state.radio_stations.clone(),
+    }),
+    #[cfg(any(
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "internet-radio"
+    ))]
+    Q::ClaimBackendPlayers { keep } => {
       let answer = A::BackendPlayers {
         #[cfg(feature = "streaming")]
         streaming: app.streaming_player.clone(),
@@ -2734,17 +2760,21 @@ fn answer_decoded_query(
           .map(|s| std::sync::Arc::clone(&s.player)),
       };
       #[cfg(feature = "local-files")]
-      if !keep_local {
+      if keep != Some(crate::core::source::Source::Local) {
         app.local_playback.take();
       }
       #[cfg(feature = "subsonic")]
-      if !keep_subsonic {
+      if keep != Some(crate::core::source::Source::Subsonic) {
         app.subsonic_playback.take();
       }
       #[cfg(feature = "internet-radio")]
-      app.radio_playback.take();
+      if keep != Some(crate::core::source::Source::Radio) {
+        app.radio_playback.take();
+      }
       #[cfg(feature = "youtube")]
-      app.youtube_playback.take();
+      if keep != Some(crate::core::source::Source::YouTube) {
+        app.youtube_playback.take();
+      }
       FoldAnswer::Decoded(answer)
     }
   }

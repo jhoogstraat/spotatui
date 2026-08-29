@@ -141,6 +141,8 @@ pub enum DecodedSourceFact {
   SubsonicStatus { message: String, ttl_secs: u64 },
   #[cfg(feature = "subsonic")]
   SubsonicRepeat(crate::infra::queue::RepeatMode),
+  #[cfg(feature = "internet-radio")]
+  RadioStatus { message: String, ttl_secs: u64 },
 }
 
 /// Typed decoded-source reads. Source handlers receive the live `Spine` and
@@ -183,11 +185,20 @@ pub enum DecodedSourceQuery {
   SubsonicPlayIndex(usize),
   #[cfg(feature = "subsonic")]
   SubsonicRepeat(rspotify::model::enums::RepeatState),
-  #[cfg(any(feature = "local-files", feature = "subsonic"))]
+  #[cfg(any(
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "internet-radio"
+  ))]
   ClaimBackendPlayers {
-    keep_local: bool,
-    keep_subsonic: bool,
+    keep: Option<crate::core::source::Source>,
   },
+  #[cfg(feature = "internet-radio")]
+  RadioPlayer,
+  #[cfg(feature = "internet-radio")]
+  RadioStationsSnapshot(String),
+  #[cfg(feature = "internet-radio")]
+  RadioConfig,
   Volume,
 }
 
@@ -213,7 +224,11 @@ pub enum DecodedSourceAnswer {
   LocalPlayIndex(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
   #[cfg(feature = "local-files")]
   LocalRepeat(bool),
-  #[cfg(any(feature = "local-files", feature = "subsonic"))]
+  #[cfg(any(
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "internet-radio"
+  ))]
   BackendPlayers {
     #[cfg(feature = "streaming")]
     streaming: Option<Arc<crate::infra::player::StreamingPlayer>>,
@@ -246,6 +261,15 @@ pub enum DecodedSourceAnswer {
   SubsonicPlayIndex(SubsonicPlayTarget),
   #[cfg(feature = "subsonic")]
   SubsonicRepeat(bool),
+  #[cfg(feature = "internet-radio")]
+  RadioPlayer(Option<Arc<crate::infra::audio::LocalPlayer>>),
+  #[cfg(feature = "internet-radio")]
+  RadioStationsSnapshot(crate::core::plugin_api::TrackInfo),
+  #[cfg(feature = "internet-radio")]
+  RadioConfig {
+    configured: Vec<crate::core::state::RadioStationConfig>,
+    saved: Vec<crate::core::state::RadioStationConfig>,
+  },
 }
 
 #[cfg(feature = "subsonic")]
@@ -316,6 +340,8 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::SubsonicStatus { .. } => "SubsonicStatus",
       #[cfg(feature = "subsonic")]
       Self::SubsonicRepeat(_) => "SubsonicRepeat",
+      #[cfg(feature = "internet-radio")]
+      Self::RadioStatus { .. } => "RadioStatus",
       Self::Volume(_) => "Volume",
     };
     f.write_str(name)

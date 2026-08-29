@@ -327,8 +327,7 @@ async fn release_other_backends(spine: &Spine, clear_subsonic: bool) {
   let backends = decoded(
     spine,
     Query::ClaimBackendPlayers {
-      keep_local: false,
-      keep_subsonic: !clear_subsonic,
+      keep: (!clear_subsonic).then_some(crate::core::source::Source::Subsonic),
     },
   )
   .await;

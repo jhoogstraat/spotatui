@@ -24,13 +24,10 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
 use super::{
   config_station_to_track_info, is_radio_uri, open_radio_stream, stream_url_from_uri,
   uri_for_stream_url, RadioPlaybackState, RadioSource,
 };
-use crate::core::app::App;
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
@@ -39,19 +36,23 @@ use crate::core::source::Source;
 use crate::core::state::merged_radio_stations;
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
+use crate::runtime::engine::{
+  DecodedSourceAnswer as Answer, DecodedSourceFact as Fact, DecodedSourceQuery as Query,
+  EngineEvent, FoldAnswer, FoldQuery, Spine,
+};
 
 /// Intercept events that target the radio source.
 ///
 /// Returns `true` if the event was handled (and must **not** be forwarded to
 /// the Spotify network), `false` to let the normal dispatch run.
-pub async fn route_radio_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
+pub async fn route_radio_event(spine: &Spine, event: &IoEvent) -> bool {
   match event {
     IoEvent::GetRadioStations => {
-      load_radio_stations(app).await;
+      load_radio_stations(spine).await;
       true
     }
     IoEvent::GetRadioSearchResults(query) => {
-      run_radio_search(app, query).await;
+      run_radio_search(spine, query).await;
       true
     }
     // A station play. Radio "queues" collapse to the one station at the offset:
@@ -60,15 +61,15 @@ pub async fn route_radio_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
       if uris.first().is_some_and(|u| is_radio_uri(u)) =>
     {
       let index = offset.unwrap_or(0).min(uris.len().saturating_sub(1));
-      start_radio(app, &uris[index]).await;
+      start_radio(spine, &uris[index]).await;
       true
     }
     IoEvent::StartPlayback(Some(uri), _, _) if is_radio_uri(uri) => {
-      start_radio(app, uri).await;
+      start_radio(spine, uri).await;
       true
     }
     // Bare "resume current" — ours only while radio owns the session.
-    IoEvent::StartPlayback(None, None, None) => match player(app).await {
+    IoEvent::StartPlayback(None, None, None) => match player(spine).await {
       Some(p) => {
         p.resume();
         true
@@ -78,39 +79,57 @@ pub async fn route_radio_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
     // Any other start is a local/Subsonic/Spotify play: relinquish the device,
     // then let the normal dispatch run.
     IoEvent::StartPlayback(..) => {
-      teardown_radio(app).await;
+      teardown_radio(spine).await;
       false
     }
-    IoEvent::PausePlayback => match player(app).await {
+    IoEvent::PausePlayback => match player(spine).await {
       Some(p) => {
         p.pause();
         true
       }
       None => false,
     },
-    IoEvent::ChangeVolume(volume) => match player(app).await {
+    IoEvent::ChangeVolume(volume) => match player(spine).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        crate::runtime::engine::emit_decoded_source(
-          app,
-          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
-        )
-        .await;
+        emit(spine, Fact::Volume(*volume)).await;
         true
       }
       None => false,
     },
     // Meaningless on a live stream — consume so they never reach Spotify.
-    IoEvent::Seek(_) => player(app).await.is_some(),
-    IoEvent::Repeat(_) => player(app).await.is_some(),
+    IoEvent::Seek(_) => player(spine).await.is_some(),
+    IoEvent::Repeat(_) => player(spine).await.is_some(),
     IoEvent::NextTrack | IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack
-      if player(app).await.is_some() =>
+      if player(spine).await.is_some() =>
     {
-      set_error(app, "Live radio: no track skipping".to_string()).await;
+      status(spine, "Live radio: no track skipping", 6).await;
       true
     }
     _ => false,
   }
+}
+
+async fn decoded(spine: &Spine, query: Query) -> Option<Answer> {
+  match spine.query(FoldQuery::Decoded(query)).await.ok()? {
+    FoldAnswer::Decoded(answer) => Some(answer),
+    _ => None,
+  }
+}
+
+async fn emit(spine: &Spine, fact: Fact) {
+  let _ = spine.emit_acked(EngineEvent::Decoded(fact)).await;
+}
+
+async fn status(spine: &Spine, message: impl Into<String>, ttl_secs: u64) {
+  emit(
+    spine,
+    Fact::RadioStatus {
+      message: message.into(),
+      ttl_secs,
+    },
+  )
+  .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,28 +138,22 @@ pub async fn route_radio_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
 
 /// Load configured and saved stations into `app.radio_stations` (the sidebar's
 /// Stations panel). No network.
-async fn load_radio_stations(app: &Arc<Mutex<App>>) {
-  let (configured, saved) = {
-    let guard = app.lock().await;
-    (
-      guard.user_config.behavior.radio_stations.clone(),
-      guard.runtime_state.radio_stations.clone(),
-    )
+async fn load_radio_stations(spine: &Spine) {
+  let (configured, saved) = match decoded(spine, Query::RadioConfig).await {
+    Some(Answer::RadioConfig { configured, saved }) => (configured, saved),
+    _ => return,
   };
   let stations: Vec<TrackInfo> = merged_radio_stations(&configured, &saved)
     .into_iter()
     .map(|station| config_station_to_track_info(&station.name, &station.url))
     .collect();
   let empty = stations.is_empty();
-  crate::runtime::engine::emit_decoded_source(
-    app,
-    crate::runtime::engine::DecodedSourceFact::RadioStations(stations),
-  )
-  .await;
+  emit(spine, Fact::RadioStations(stations)).await;
   if empty {
-    set_error(
-      app,
-      "No radio stations configured or saved; search to add some".to_string(),
+    status(
+      spine,
+      "No radio stations configured or saved; search to add some",
+      6,
     )
     .await;
   }
@@ -150,23 +163,20 @@ async fn load_radio_stations(app: &Arc<Mutex<App>>) {
 ///
 /// Like the Subsonic search, only the songs block is populated — each row is a
 /// station; Enter on one dispatches its `radio:` URI back through this module.
-async fn run_radio_search(app: &Arc<Mutex<App>>, query: &str) {
-  crate::runtime::engine::emit_catalog_event(
-    app,
-    CatalogStateEvent::SearchRequested {
+async fn run_radio_search(spine: &Spine, query: &str) {
+  spine
+    .emit(EngineEvent::Catalog(CatalogStateEvent::SearchRequested {
       source: Source::Radio,
       query: query.to_string(),
       scoped_loading: true,
-    },
-  )
-  .await;
+    }))
+    .await;
   let source = RadioSource::new();
   match source.search(query).await {
     Ok(results) => {
       let total = results.tracks.len() as u32;
-      crate::runtime::engine::emit_catalog_event(
-        app,
-        CatalogStateEvent::SearchCompleted {
+      spine
+        .emit(EngineEvent::Catalog(CatalogStateEvent::SearchCompleted {
           source: Source::Radio,
           query: query.to_string(),
           pages: Box::new(crate::core::catalog::SearchCompletionPages {
@@ -177,11 +187,10 @@ async fn run_radio_search(app: &Arc<Mutex<App>>, query: &str) {
             }),
             ..Default::default()
           }),
-        },
-      )
-      .await;
+        }))
+        .await;
     }
-    Err(e) => set_error(app, format!("Radio search failed: {e}")).await,
+    Err(e) => status(spine, format!("Radio search failed: {e}"), 6).await,
   }
 }
 
@@ -190,20 +199,18 @@ async fn run_radio_search(app: &Arc<Mutex<App>>, query: &str) {
 // ---------------------------------------------------------------------------
 
 /// The live radio player, if a radio session is active.
-async fn player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  app
-    .lock()
-    .await
-    .radio_playback
-    .as_ref()
-    .map(|s| Arc::clone(&s.player))
+async fn player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
+  match decoded(spine, Query::RadioPlayer).await? {
+    Answer::RadioPlayer(player) => player,
+    _ => None,
+  }
 }
 
 /// Find the station row for `uri` in the browse views a play request can
 /// originate from: the sidebar station list, the shared track table, and the
 /// search results. Falls back to a synthetic row built from the URL itself, so
 /// a `radio:` URI with no backing row still plays (it just has no nice name).
-fn snapshot_station(app: &App, uri: &str) -> TrackInfo {
+pub(crate) fn snapshot_station(app: &crate::core::app::App, uri: &str) -> TrackInfo {
   let matches = |t: &&TrackInfo| t.uri.as_deref() == Some(uri);
   app
     .radio_stations
@@ -225,38 +232,42 @@ fn snapshot_station(app: &App, uri: &str) -> TrackInfo {
 }
 
 /// Release the other backends so only radio holds the output device.
-async fn release_other_backends(_app: &Arc<Mutex<App>>) {
-  // Pause native Spotify so librespot releases the device.
-  #[cfg(feature = "streaming")]
+async fn release_other_backends(spine: &Spine, clear_radio: bool) {
+  let backends = decoded(
+    spine,
+    Query::ClaimBackendPlayers {
+      keep: (!clear_radio).then_some(crate::core::source::Source::Radio),
+    },
+  )
+  .await;
+  if let Some(Answer::BackendPlayers {
+    #[cfg(feature = "streaming")]
+    streaming,
+    #[cfg(feature = "local-files")]
+    local,
+    #[cfg(feature = "subsonic")]
+    subsonic,
+    #[cfg(feature = "internet-radio")]
+      radio: _,
+    #[cfg(feature = "youtube")]
+    youtube,
+  }) = backends
   {
-    let streaming = _app.lock().await.streaming_player.clone();
+    #[cfg(feature = "streaming")]
     if let Some(player) = streaming {
       player.pause();
     }
-  }
-  // Tear down any local-file session (dropping it releases its device handle).
-  #[cfg(feature = "local-files")]
-  {
-    let local = _app.lock().await.local_playback.take();
-    if let Some(local) = local {
-      local.player.stop();
+    #[cfg(feature = "local-files")]
+    if let Some(player) = local {
+      player.stop();
     }
-  }
-  // Tear down any Subsonic session.
-  #[cfg(feature = "subsonic")]
-  {
-    let subsonic = _app.lock().await.subsonic_playback.take();
-    if let Some(subsonic) = subsonic {
-      subsonic.player.stop();
+    #[cfg(feature = "subsonic")]
+    if let Some(player) = subsonic {
+      player.stop();
     }
-  }
-  // Tear down any YouTube session (the pump's short-circuit means the YouTube
-  // dispatch never sees this radio: start).
-  #[cfg(feature = "youtube")]
-  {
-    let youtube = _app.lock().await.youtube_playback.take();
-    if let Some(youtube) = youtube {
-      youtube.player.stop();
+    #[cfg(feature = "youtube")]
+    if let Some(player) = youtube {
+      player.stop();
     }
   }
 }
@@ -264,41 +275,42 @@ async fn release_other_backends(_app: &Arc<Mutex<App>>) {
 /// Reuse the live radio player, or open a fresh output device for one. A
 /// freshly opened player is **not** published to `App` here — the caller
 /// publishes the session only on a successful first play.
-async fn acquire_player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  if let Some(p) = player(app).await {
-    return Some(p);
-  }
+async fn acquire_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
   match tokio::task::spawn_blocking(LocalPlayer::new).await {
     Ok(Ok(p)) => Some(Arc::new(p)),
     Ok(Err(e)) => {
-      set_error(app, format!("No audio output for radio playback: {e}")).await;
+      status(spine, format!("No audio output for radio playback: {e}"), 6).await;
       None
     }
     Err(e) => {
-      set_error(app, format!("Audio output init failed: {e}")).await;
+      status(spine, format!("Audio output init failed: {e}"), 6).await;
       None
     }
   }
 }
 
 /// Begin playing the station at `uri`, taking over the session.
-async fn start_radio(app: &Arc<Mutex<App>>, uri: &str) {
+async fn start_radio(spine: &Spine, uri: &str) {
   let url = match stream_url_from_uri(uri) {
     Ok(u) => u.to_string(),
     Err(_) => {
-      set_error(app, "Invalid radio URI".to_string()).await;
+      status(spine, "Invalid radio URI", 6).await;
       return;
     }
   };
-  let mut station = {
-    let guard = app.lock().await;
-    snapshot_station(&guard, uri)
+  let mut station = match decoded(spine, Query::RadioStationsSnapshot(uri.to_string())).await {
+    Some(Answer::RadioStationsSnapshot(station)) => station,
+    _ => return,
   };
 
   // Only one backend owns the device at a time.
-  release_other_backends(app).await;
+  let existing_player = player(spine).await;
+  release_other_backends(spine, existing_player.is_none()).await;
 
-  let Some(player) = acquire_player(app).await else {
+  let Some(player) = (match existing_player {
+    Some(player) => Some(player),
+    None => acquire_player(spine).await,
+  }) else {
     return;
   };
 
@@ -306,7 +318,7 @@ async fn start_radio(app: &Arc<Mutex<App>>, uri: &str) {
   let opened = match open_radio_stream(&url).await {
     Ok(o) => o,
     Err(e) => {
-      set_error(app, format!("Cannot open radio stream: {e}")).await;
+      status(spine, format!("Cannot open radio stream: {e}"), 6).await;
       return;
     }
   };
@@ -334,8 +346,9 @@ async fn start_radio(app: &Arc<Mutex<App>>, uri: &str) {
 
   match result {
     Ok(Ok(())) => {
-      let volume = app.lock().await.runtime_state.volume_percent;
-      player.set_volume(volume as f32 / 100.0);
+      if let Some(Answer::Volume(volume)) = decoded(spine, Query::Volume).await {
+        player.set_volume(volume as f32 / 100.0);
+      }
 
       let display = station.name.clone();
       // Publish the session exactly once, now that the stream is decoding.
@@ -344,42 +357,29 @@ async fn start_radio(app: &Arc<Mutex<App>>, uri: &str) {
         station,
         now_playing,
       };
-      crate::runtime::engine::emit_decoded_source(
-        app,
-        crate::runtime::engine::DecodedSourceFact::RadioPlayback(state),
-      )
-      .await;
-      app
-        .lock()
-        .await
-        .set_status_message(format!("\u{266a} {display} (live)"), 4);
+      emit(spine, Fact::RadioPlayback(state)).await;
+      status(spine, format!("\u{266a} {display} (live)"), 4).await;
     }
-    Ok(Err(e)) => set_error(app, format!("Cannot play radio stream: {e}")).await,
-    Err(e) => set_error(app, format!("Radio playback task failed: {e}")).await,
+    Ok(Err(e)) => status(spine, format!("Cannot play radio stream: {e}"), 6).await,
+    Err(e) => status(spine, format!("Radio playback task failed: {e}"), 6).await,
   }
 }
 
 /// End the radio session, releasing the output device. Stopping the sink drops
 /// the decoder, which drops the stream reader, which cancels the background
 /// download task (`cancel_on_drop`).
-pub async fn teardown_radio(app: &Arc<Mutex<App>>) {
-  crate::runtime::engine::emit_decoded_source(
-    app,
-    crate::runtime::engine::DecodedSourceFact::RadioPlaybackCleared,
-  )
-  .await;
-}
-
-async fn set_error(app: &Arc<Mutex<App>>, message: String) {
-  app.lock().await.set_status_message(message, 6);
+pub async fn teardown_radio(spine: &Spine) {
+  emit(spine, Fact::RadioPlaybackCleared).await;
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::core::app::App;
   use crate::core::user_config::UserConfig;
   use std::sync::mpsc::channel;
   use std::time::SystemTime;
+  use tokio::sync::Mutex;
 
   fn test_app() -> App {
     let (tx, _rx) = channel();
@@ -441,22 +441,23 @@ mod tests {
   #[tokio::test]
   async fn foreign_events_fall_through_without_a_session() {
     let app = Arc::new(Mutex::new(test_app()));
+    let (spine, _rx) = crate::runtime::frontend::spawn_fold(&app).await;
     // No radio session: transport events are not ours.
-    assert!(!route_radio_event(&app, &IoEvent::PausePlayback).await);
-    assert!(!route_radio_event(&app, &IoEvent::NextTrack).await);
-    assert!(!route_radio_event(&app, &IoEvent::Seek(1000)).await);
+    assert!(!route_radio_event(&spine, &IoEvent::PausePlayback).await);
+    assert!(!route_radio_event(&spine, &IoEvent::NextTrack).await);
+    assert!(!route_radio_event(&spine, &IoEvent::Seek(1000)).await);
     assert!(
       !route_radio_event(
-        &app,
+        &spine,
         &IoEvent::Repeat(rspotify::model::enums::RepeatState::Off)
       )
       .await
     );
-    assert!(!route_radio_event(&app, &IoEvent::StartPlayback(None, None, None)).await);
+    assert!(!route_radio_event(&spine, &IoEvent::StartPlayback(None, None, None)).await);
     // A Spotify start falls through (and there is nothing to tear down).
     assert!(
       !route_radio_event(
-        &app,
+        &spine,
         &IoEvent::StartPlayback(Some("spotify:track:x".to_string()), None, None)
       )
       .await
@@ -466,28 +467,24 @@ mod tests {
   /// Loading the station list is consumed and merges config + saved stations.
   #[tokio::test]
   async fn get_radio_stations_merges_configured_and_saved_lists() {
-    let app = Arc::new(Mutex::new(test_app()));
-    assert!(route_radio_event(&app, &IoEvent::GetRadioStations).await);
-    assert!(app.lock().await.radio_stations.is_empty());
-
-    {
-      let mut guard = app.lock().await;
-      guard.user_config.behavior.radio_stations = vec![crate::core::state::RadioStationConfig {
-        name: "Configured Groove".to_string(),
+    let mut seeded = test_app();
+    seeded.user_config.behavior.radio_stations = vec![crate::core::state::RadioStationConfig {
+      name: "Configured Groove".to_string(),
+      url: "https://ice1.somafm.com/groovesalad-128-mp3".to_string(),
+    }];
+    seeded.runtime_state.radio_stations = vec![
+      crate::core::state::RadioStationConfig {
+        name: "Groove Salad".to_string(),
         url: "https://ice1.somafm.com/groovesalad-128-mp3".to_string(),
-      }];
-      guard.runtime_state.radio_stations = vec![
-        crate::core::state::RadioStationConfig {
-          name: "Groove Salad".to_string(),
-          url: "https://ice1.somafm.com/groovesalad-128-mp3".to_string(),
-        },
-        crate::core::state::RadioStationConfig {
-          name: "Secret Agent".to_string(),
-          url: "https://ice1.somafm.com/secretagent-128-mp3".to_string(),
-        },
-      ];
-    }
-    assert!(route_radio_event(&app, &IoEvent::GetRadioStations).await);
+      },
+      crate::core::state::RadioStationConfig {
+        name: "Secret Agent".to_string(),
+        url: "https://ice1.somafm.com/secretagent-128-mp3".to_string(),
+      },
+    ];
+    let app = Arc::new(Mutex::new(seeded));
+    let (spine, _rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    assert!(route_radio_event(&spine, &IoEvent::GetRadioStations).await);
     let guard = app.lock().await;
     assert_eq!(guard.radio_stations.len(), 2);
     assert_eq!(guard.radio_stations[0].name, "Configured Groove");
@@ -506,20 +503,19 @@ mod tests {
   #[tokio::test(flavor = "multi_thread")]
   #[ignore = "hits the live SomaFM stream AND requires an audio output device"]
   async fn live_dispatch_play_and_teardown() {
-    let app = Arc::new(Mutex::new(test_app()));
-    {
-      let mut guard = app.lock().await;
-      guard.runtime_state.radio_stations = vec![crate::core::state::RadioStationConfig {
-        name: "Groove Salad".to_string(),
-        url: "https://ice1.somafm.com/groovesalad-128-mp3".to_string(),
-      }];
-    }
-    assert!(route_radio_event(&app, &IoEvent::GetRadioStations).await);
+    let mut seeded = test_app();
+    seeded.runtime_state.radio_stations = vec![crate::core::state::RadioStationConfig {
+      name: "Groove Salad".to_string(),
+      url: "https://ice1.somafm.com/groovesalad-128-mp3".to_string(),
+    }];
+    let app = Arc::new(Mutex::new(seeded));
+    let (spine, _rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    assert!(route_radio_event(&spine, &IoEvent::GetRadioStations).await);
     let uri = app.lock().await.radio_stations[0].uri.clone().unwrap();
 
     // Start the station.
     assert!(
-      route_radio_event(&app, &IoEvent::StartPlayback(Some(uri), None, None)).await,
+      route_radio_event(&spine, &IoEvent::StartPlayback(Some(uri), None, None)).await,
       "radio StartPlayback must be consumed"
     );
     {
@@ -530,34 +526,34 @@ mod tests {
     }
 
     // Live-stream semantics: Seek and Next/Prev are consumed as no-ops.
-    assert!(route_radio_event(&app, &IoEvent::Seek(30_000)).await);
+    assert!(route_radio_event(&spine, &IoEvent::Seek(30_000)).await);
     assert!(
       route_radio_event(
-        &app,
+        &spine,
         &IoEvent::Repeat(rspotify::model::enums::RepeatState::Off)
       )
       .await
     );
-    assert!(route_radio_event(&app, &IoEvent::NextTrack).await);
+    assert!(route_radio_event(&spine, &IoEvent::NextTrack).await);
     assert!(
       app.lock().await.radio_playback.is_some(),
       "no-op transport must not tear the session down"
     );
 
     // Pause/resume are ours while the session lives.
-    assert!(route_radio_event(&app, &IoEvent::PausePlayback).await);
+    assert!(route_radio_event(&spine, &IoEvent::PausePlayback).await);
     assert!(app
       .lock()
       .await
       .radio_playback
       .as_ref()
       .is_some_and(|s| s.player.is_paused()));
-    assert!(route_radio_event(&app, &IoEvent::StartPlayback(None, None, None)).await);
+    assert!(route_radio_event(&spine, &IoEvent::StartPlayback(None, None, None)).await);
 
     // A foreign (Spotify) start tears the session down and falls through.
     assert!(
       !route_radio_event(
-        &app,
+        &spine,
         &IoEvent::StartPlayback(Some("spotify:track:x".to_string()), None, None)
       )
       .await,

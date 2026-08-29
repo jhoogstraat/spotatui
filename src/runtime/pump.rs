@@ -98,7 +98,11 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
       let handled_radio = !handled_queue
         && !handled_locally
         && !handled_subsonic
-        && crate::infra::radio::dispatch::route_radio_event(&network.app, &io_event).await;
+        && if let Some(spine) = network.spine.as_ref() {
+          crate::infra::radio::dispatch::route_radio_event(spine, &io_event).await
+        } else {
+          false
+        };
       #[cfg(not(feature = "internet-radio"))]
       let handled_radio = false;
       // YouTube is intercepted last before the Spotify network. A `youtube:`
