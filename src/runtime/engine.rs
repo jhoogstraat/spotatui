@@ -113,6 +113,19 @@ pub enum DecodedSourceFact {
   LocalStatus { message: String, ttl_secs: u64 },
   #[cfg(feature = "local-files")]
   LocalRepeat(crate::infra::queue::RepeatMode),
+  #[cfg(feature = "subsonic")]
+  SubsonicAdvancing(bool),
+  #[cfg(feature = "subsonic")]
+  SubsonicIndex {
+    target: usize,
+    tempfile: tempfile::NamedTempFile,
+  },
+  #[cfg(feature = "subsonic")]
+  SubsonicReplaySucceeded,
+  #[cfg(feature = "subsonic")]
+  SubsonicStatus { message: String, ttl_secs: u64 },
+  #[cfg(feature = "subsonic")]
+  SubsonicRepeat(crate::infra::queue::RepeatMode),
 }
 
 /// Typed decoded-source reads. Source handlers receive the live `Spine` and
@@ -137,8 +150,29 @@ pub enum DecodedSourceQuery {
   LocalPlayIndex(usize),
   #[cfg(feature = "local-files")]
   LocalRepeat(rspotify::model::enums::RepeatState),
-  #[cfg(feature = "local-files")]
-  BackendPlayers,
+  #[cfg(feature = "subsonic")]
+  SubsonicConfig,
+  #[cfg(feature = "subsonic")]
+  SubsonicPlayer,
+  #[cfg(feature = "subsonic")]
+  SubsonicShuffle,
+  #[cfg(feature = "subsonic")]
+  SubsonicTracks(Vec<String>),
+  #[cfg(feature = "subsonic")]
+  SubsonicReplay,
+  #[cfg(feature = "subsonic")]
+  SubsonicSkip {
+    forward: bool,
+  },
+  #[cfg(feature = "subsonic")]
+  SubsonicPlayIndex(usize),
+  #[cfg(feature = "subsonic")]
+  SubsonicRepeat(rspotify::model::enums::RepeatState),
+  #[cfg(any(feature = "local-files", feature = "subsonic"))]
+  ClaimBackendPlayers {
+    keep_local: bool,
+    keep_subsonic: bool,
+  },
   Volume,
 }
 
@@ -164,10 +198,12 @@ pub enum DecodedSourceAnswer {
   LocalPlayIndex(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
   #[cfg(feature = "local-files")]
   LocalRepeat(bool),
-  #[cfg(feature = "local-files")]
+  #[cfg(any(feature = "local-files", feature = "subsonic"))]
   BackendPlayers {
     #[cfg(feature = "streaming")]
     streaming: Option<Arc<crate::infra::player::StreamingPlayer>>,
+    #[cfg(feature = "local-files")]
+    local: Option<Arc<crate::infra::audio::LocalPlayer>>,
     #[cfg(feature = "subsonic")]
     subsonic: Option<Arc<crate::infra::audio::LocalPlayer>>,
     #[cfg(feature = "internet-radio")]
@@ -175,7 +211,40 @@ pub enum DecodedSourceAnswer {
     #[cfg(feature = "youtube")]
     youtube: Option<Arc<crate::infra::audio::LocalPlayer>>,
   },
+  #[cfg(feature = "subsonic")]
+  SubsonicConfig {
+    url: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+  },
+  #[cfg(feature = "subsonic")]
+  SubsonicPlayer(Option<Arc<crate::infra::audio::LocalPlayer>>),
+  #[cfg(feature = "subsonic")]
+  SubsonicShuffle(bool),
+  #[cfg(feature = "subsonic")]
+  SubsonicTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "subsonic")]
+  SubsonicReplay(Option<(Arc<crate::infra::audio::LocalPlayer>, std::path::PathBuf)>),
+  #[cfg(feature = "subsonic")]
+  SubsonicSkip(Option<usize>),
+  #[cfg(feature = "subsonic")]
+  SubsonicPlayIndex(SubsonicPlayTarget),
+  #[cfg(feature = "subsonic")]
+  SubsonicRepeat(bool),
 }
+
+#[cfg(feature = "subsonic")]
+pub type SubsonicPlayTarget = Option<
+  Result<
+    Option<(
+      Arc<crate::infra::audio::LocalPlayer>,
+      Arc<crate::infra::subsonic::SubsonicSource>,
+      String,
+      String,
+    )>,
+    (),
+  >,
+>;
 
 impl std::fmt::Debug for DecodedSourceFact {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -222,6 +291,16 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::LocalStatus { .. } => "LocalStatus",
       #[cfg(feature = "local-files")]
       Self::LocalRepeat(_) => "LocalRepeat",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicAdvancing(_) => "SubsonicAdvancing",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicIndex { .. } => "SubsonicIndex",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicReplaySucceeded => "SubsonicReplaySucceeded",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicStatus { .. } => "SubsonicStatus",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicRepeat(_) => "SubsonicRepeat",
       Self::Volume(_) => "Volume",
     };
     f.write_str(name)

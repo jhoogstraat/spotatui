@@ -79,9 +79,16 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
       // false) and is caught here (see infra::subsonic::dispatch). Skipped when
       // local already consumed the event.
       #[cfg(feature = "subsonic")]
-      let handled_subsonic = !handled_queue
-        && !handled_locally
-        && crate::infra::subsonic::dispatch::route_subsonic_event(&network.app, &io_event).await;
+      let handled_subsonic = if !handled_queue && !handled_locally {
+        match network.spine.as_ref() {
+          Some(spine) => {
+            crate::infra::subsonic::dispatch::route_subsonic_event(spine, &io_event).await
+          }
+          None => false,
+        }
+      } else {
+        false
+      };
       #[cfg(not(feature = "subsonic"))]
       let handled_subsonic = false;
       // Internet radio is intercepted last before the Spotify network. A

@@ -32,17 +32,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tempfile::NamedTempFile;
-use tokio::sync::Mutex;
 
 use super::{track_id_from_uri, SubsonicPlaybackState, SubsonicSource};
-use crate::core::app::App;
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
 use crate::core::source::{MediaSource, Searcher, Source};
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
-use crate::infra::queue::{advance_index, replay_file};
+use crate::infra::queue::replay_file;
+use crate::runtime::engine::{
+  DecodedSourceAnswer as Answer, DecodedSourceFact as Fact, DecodedSourceQuery as Query,
+  EngineEvent, FoldAnswer, FoldQuery, Spine,
+};
 
 /// Environment variable that overrides the configured Subsonic password. Prefer
 /// it over the plaintext config field so the secret is never written to disk.
@@ -53,45 +55,38 @@ fn is_subsonic_uri(uri: &str) -> bool {
   uri.starts_with("subsonic:")
 }
 
-/// Skip direction within the subsonic queue.
-#[derive(Clone, Copy)]
-enum Direction {
-  Next,
-  Prev,
-}
-
 /// Intercept events that target the Subsonic source.
 ///
 /// Returns `true` if the event was handled (and must **not** be forwarded to the
 /// Spotify network), `false` to let the normal dispatch run.
-pub async fn route_subsonic_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
+pub async fn route_subsonic_event(spine: &Spine, event: &IoEvent) -> bool {
   match event {
     IoEvent::GetSubsonicPlaylists => {
-      load_subsonic_playlists(app).await;
+      load_subsonic_playlists(spine).await;
       true
     }
     IoEvent::GetSubsonicTracks(uri) => {
-      load_subsonic_tracks(app, uri).await;
+      load_subsonic_tracks(spine, uri).await;
       true
     }
     IoEvent::GetSubsonicSearchResults(query) => {
-      run_subsonic_search(app, query).await;
+      run_subsonic_search(spine, query).await;
       true
     }
     // Start a playlist of subsonic tracks: queue all and start at the offset.
     IoEvent::StartPlayback(None, Some(uris), offset)
       if uris.first().is_some_and(|u| is_subsonic_uri(u)) =>
     {
-      start_subsonic_queue(app, uris, offset.unwrap_or(0)).await;
+      start_subsonic_queue(spine, uris, offset.unwrap_or(0)).await;
       true
     }
     // A single subsonic track with no surrounding playlist: a one-track queue.
     IoEvent::StartPlayback(Some(uri), _, _) if is_subsonic_uri(uri) => {
-      start_subsonic_queue(app, std::slice::from_ref(uri), 0).await;
+      start_subsonic_queue(spine, std::slice::from_ref(uri), 0).await;
       true
     }
     // Bare "resume current" — ours only while subsonic owns the session.
-    IoEvent::StartPlayback(None, None, None) => match player(app).await {
+    IoEvent::StartPlayback(None, None, None) => match player(spine).await {
       Some(p) => {
         p.resume();
         true
@@ -101,47 +96,68 @@ pub async fn route_subsonic_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> boo
     // Any other start is a local/Spotify play: relinquish the device, then let
     // the normal dispatch run.
     IoEvent::StartPlayback(..) => {
-      teardown_subsonic(app).await;
+      teardown_subsonic(spine).await;
       false
     }
-    IoEvent::PausePlayback => match player(app).await {
+    IoEvent::PausePlayback => match player(spine).await {
       Some(p) => {
         p.pause();
         true
       }
       None => false,
     },
-    IoEvent::Seek(position_ms) => match player(app).await {
+    IoEvent::Seek(position_ms) => match player(spine).await {
       Some(p) => {
         let _ = p.seek(Duration::from_millis(*position_ms as u64));
         true
       }
       None => false,
     },
-    IoEvent::ChangeVolume(volume) => match player(app).await {
+    IoEvent::ChangeVolume(volume) => match player(spine).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        crate::runtime::engine::emit_decoded_source(
-          app,
-          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
-        )
-        .await;
+        emit(spine, Fact::Volume(*volume)).await;
         true
       }
       None => false,
     },
-    IoEvent::NextTrack => skip(app, Direction::Next).await,
-    IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => skip(app, Direction::Prev).await,
+    IoEvent::NextTrack => skip(spine, true).await,
+    IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => skip(spine, false).await,
     // Repeat-one auto-advance: replay the current track (dispatched by the runner
     // tick only while Subsonic owns the session).
-    IoEvent::ReplayCurrentTrack => replay_current(app).await,
+    IoEvent::ReplayCurrentTrack => replay_current(spine).await,
     // Explicit repeat-mode set (e.g. a plugin's `set_repeat`): store it as the
     // decoded repeat mode while a queueable decoded source owns playback (the
     // method's ownership gate excludes a context suspended under the native
     // queue), so it never reaches the Spotify context.
-    IoEvent::Repeat(state) => app.lock().await.set_decoded_repeat_from_state(*state),
+    IoEvent::Repeat(state) => matches!(
+      decoded(spine, Query::SubsonicRepeat(*state)).await,
+      Some(Answer::SubsonicRepeat(true))
+    ),
     _ => false,
   }
+}
+
+async fn decoded(spine: &Spine, query: Query) -> Option<Answer> {
+  match spine.query(FoldQuery::Decoded(query)).await.ok()? {
+    FoldAnswer::Decoded(answer) => Some(answer),
+    _ => None,
+  }
+}
+
+async fn emit(spine: &Spine, fact: Fact) {
+  let _ = spine.emit_acked(EngineEvent::Decoded(fact)).await;
+}
+
+async fn status(spine: &Spine, message: impl Into<String>, ttl_secs: u64) {
+  emit(
+    spine,
+    Fact::SubsonicStatus {
+      message: message.into(),
+      ttl_secs,
+    },
+  )
+  .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,21 +167,21 @@ pub async fn route_subsonic_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> boo
 /// Build a [`SubsonicSource`] from the saved server config, with the password
 /// taken from the `SPOTATUI_SUBSONIC_PASSWORD` env var when set. Returns `None`
 /// (after surfacing a status message) when no server URL is configured.
-pub(crate) async fn build_source(app: &Arc<Mutex<App>>) -> Option<SubsonicSource> {
-  let (url, username, config_password) = {
-    let guard = app.lock().await;
-    let behavior = &guard.user_config.behavior;
-    (
-      behavior.subsonic_url.clone(),
-      behavior.subsonic_username.clone(),
-      behavior.subsonic_password.clone(),
-    )
+pub(crate) async fn build_source(spine: &Spine) -> Option<SubsonicSource> {
+  let (url, username, config_password) = match decoded(spine, Query::SubsonicConfig).await {
+    Some(Answer::SubsonicConfig {
+      url,
+      username,
+      password,
+    }) => (url, username, password),
+    _ => return None,
   };
 
   let Some(url) = url else {
-    set_error(
-      app,
-      "No Subsonic server configured (set behavior.subsonic_url)".to_string(),
+    status(
+      spine,
+      "No Subsonic server configured (set behavior.subsonic_url)",
+      6,
     )
     .await;
     return None;
@@ -185,37 +201,29 @@ pub(crate) async fn build_source(app: &Arc<Mutex<App>>) -> Option<SubsonicSource
 }
 
 /// Fetch the user's server playlists into `app.subsonic_playlists`.
-async fn load_subsonic_playlists(app: &Arc<Mutex<App>>) {
-  let Some(source) = build_source(app).await else {
+async fn load_subsonic_playlists(spine: &Spine) {
+  let Some(source) = build_source(spine).await else {
     return;
   };
   match source.playlists().await {
     Ok(playlists) => {
-      crate::runtime::engine::emit_decoded_source(
-        app,
-        crate::runtime::engine::DecodedSourceFact::SubsonicPlaylists(playlists),
-      )
-      .await;
+      emit(spine, Fact::SubsonicPlaylists(playlists)).await;
     }
-    Err(e) => set_error(app, format!("Cannot load Subsonic playlists: {e}")).await,
+    Err(e) => status(spine, format!("Cannot load Subsonic playlists: {e}"), 6).await,
   }
 }
 
 /// Fetch a playlist's tracks into the shared track table, tagged
 /// [`TrackTableContext::SubsonicPlaylist`] so selecting a row plays it.
-async fn load_subsonic_tracks(app: &Arc<Mutex<App>>, playlist_uri: &str) {
-  let Some(source) = build_source(app).await else {
+async fn load_subsonic_tracks(spine: &Spine, playlist_uri: &str) {
+  let Some(source) = build_source(spine).await else {
     return;
   };
   match source.tracks(playlist_uri).await {
     Ok(tracks) => {
-      crate::runtime::engine::emit_decoded_source(
-        app,
-        crate::runtime::engine::DecodedSourceFact::SubsonicTracks(tracks),
-      )
-      .await;
+      emit(spine, Fact::SubsonicTracks(tracks)).await;
     }
-    Err(e) => set_error(app, format!("Cannot load Subsonic playlist: {e}")).await,
+    Err(e) => status(spine, format!("Cannot load Subsonic playlist: {e}"), 6).await,
   }
 }
 
@@ -229,25 +237,22 @@ async fn load_subsonic_tracks(app: &Arc<Mutex<App>>, playlist_uri: &str) {
 /// (ticket 15): the handler emits typed events; `search_results` is written
 /// by `core::catalog_apply` on the fold task, which enforces the
 /// stale-request contract.
-async fn run_subsonic_search(app: &Arc<Mutex<App>>, query: &str) {
-  crate::runtime::engine::emit_catalog_event(
-    app,
-    CatalogStateEvent::SearchRequested {
+async fn run_subsonic_search(spine: &Spine, query: &str) {
+  spine
+    .emit(EngineEvent::Catalog(CatalogStateEvent::SearchRequested {
       source: Source::Subsonic,
       query: query.to_string(),
       scoped_loading: true,
-    },
-  )
-  .await;
-  let Some(source) = build_source(app).await else {
+    }))
+    .await;
+  let Some(source) = build_source(spine).await else {
     return;
   };
   match source.search(query).await {
     Ok(results) => {
       let total = results.tracks.len() as u32;
-      crate::runtime::engine::emit_catalog_event(
-        app,
-        CatalogStateEvent::SearchCompleted {
+      spine
+        .emit(EngineEvent::Catalog(CatalogStateEvent::SearchCompleted {
           source: Source::Subsonic,
           query: query.to_string(),
           pages: Box::new(crate::core::catalog::SearchCompletionPages {
@@ -258,11 +263,10 @@ async fn run_subsonic_search(app: &Arc<Mutex<App>>, query: &str) {
             }),
             ..Default::default()
           }),
-        },
-      )
-      .await;
+        }))
+        .await;
     }
-    Err(e) => set_error(app, format!("Subsonic search failed: {e}")).await,
+    Err(e) => status(spine, format!("Subsonic search failed: {e}"), 6).await,
   }
 }
 
@@ -271,13 +275,11 @@ async fn run_subsonic_search(app: &Arc<Mutex<App>>, query: &str) {
 // ---------------------------------------------------------------------------
 
 /// The live subsonic player, if a subsonic session is active.
-async fn player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  app
-    .lock()
-    .await
-    .subsonic_playback
-    .as_ref()
-    .map(|s| Arc::clone(&s.player))
+async fn player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
+  match decoded(spine, Query::SubsonicPlayer).await? {
+    Answer::SubsonicPlayer(player) => player,
+    _ => None,
+  }
 }
 
 /// Snapshot the `TrackInfo`s for `uris`, preserving order, looking each up in
@@ -286,7 +288,7 @@ async fn player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
 /// Enter sends `track_table.tracks` uris, the search-result Enter sends
 /// `search_results.tracks` uris — so the metadata may live in either. Any uri
 /// found in neither is dropped.
-fn snapshot_tracks(
+pub(crate) fn snapshot_tracks(
   table: &[TrackInfo],
   search: Option<&[TrackInfo]>,
   uris: &[String],
@@ -321,38 +323,43 @@ fn find_track<'a>(
   )),
   allow(unused_variables)
 )]
-async fn release_other_backends(app: &Arc<Mutex<App>>) {
-  // Pause native Spotify so librespot releases the device.
-  #[cfg(feature = "streaming")]
+async fn release_other_backends(spine: &Spine, clear_subsonic: bool) {
+  let backends = decoded(
+    spine,
+    Query::ClaimBackendPlayers {
+      keep_local: false,
+      keep_subsonic: !clear_subsonic,
+    },
+  )
+  .await;
+  if let Some(Answer::BackendPlayers {
+    #[cfg(feature = "streaming")]
+    streaming,
+    #[cfg(feature = "local-files")]
+    local,
+    #[cfg(feature = "internet-radio")]
+    radio,
+    #[cfg(feature = "youtube")]
+    youtube,
+    #[cfg(feature = "subsonic")]
+      subsonic: _,
+  }) = backends
   {
-    let streaming = app.lock().await.streaming_player.clone();
+    #[cfg(feature = "streaming")]
     if let Some(player) = streaming {
       player.pause();
     }
-  }
-  // Tear down any local-file session (dropping it releases its device handle).
-  #[cfg(feature = "local-files")]
-  {
-    let local = app.lock().await.local_playback.take();
-    if let Some(local) = local {
-      local.player.stop();
+    #[cfg(feature = "local-files")]
+    if let Some(player) = local {
+      player.stop();
     }
-  }
-  // Tear down any radio session (the `!handled_subsonic` short-circuit in the
-  // runtime means the radio dispatch never sees this subsonic: start).
-  #[cfg(feature = "internet-radio")]
-  {
-    let radio = app.lock().await.radio_playback.take();
-    if let Some(radio) = radio {
-      radio.player.stop();
+    #[cfg(feature = "internet-radio")]
+    if let Some(player) = radio {
+      player.stop();
     }
-  }
-  // Tear down any YouTube session, for the same short-circuit reason.
-  #[cfg(feature = "youtube")]
-  {
-    let youtube = app.lock().await.youtube_playback.take();
-    if let Some(youtube) = youtube {
-      youtube.player.stop();
+    #[cfg(feature = "youtube")]
+    if let Some(player) = youtube {
+      player.stop();
     }
   }
 }
@@ -360,18 +367,20 @@ async fn release_other_backends(app: &Arc<Mutex<App>>) {
 /// Reuse the live subsonic player, or open a fresh output device for one. A
 /// freshly opened player is **not** published to `App` here — the caller
 /// publishes the session only on a successful first play.
-async fn acquire_player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  if let Some(p) = player(app).await {
-    return Some(p);
-  }
+async fn acquire_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
   match tokio::task::spawn_blocking(LocalPlayer::new).await {
     Ok(Ok(p)) => Some(Arc::new(p)),
     Ok(Err(e)) => {
-      set_error(app, format!("No audio output for Subsonic playback: {e}")).await;
+      status(
+        spine,
+        format!("No audio output for Subsonic playback: {e}"),
+        6,
+      )
+      .await;
       None
     }
     Err(e) => {
-      set_error(app, format!("Audio output init failed: {e}")).await;
+      status(spine, format!("Audio output init failed: {e}"), 6).await;
       None
     }
   }
@@ -398,20 +407,13 @@ pub(crate) async fn download_for_queue(
 
 /// Begin playing a queue of subsonic tracks, taking over the session and
 /// starting at `start_idx` (clamped into range).
-async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: usize) {
-  // Snapshot the track metadata under one short lock, from whichever browse view
-  // the request came from (track table for browse, search results for search).
-  let tracks = {
-    let guard = app.lock().await;
-    let search = guard
-      .search_results
-      .tracks
-      .as_ref()
-      .map(|p| p.items.as_slice());
-    snapshot_tracks(&guard.track_table.tracks, search, uris)
+async fn start_subsonic_queue(spine: &Spine, uris: &[String], start_idx: usize) {
+  let tracks = match decoded(spine, Query::SubsonicTracks(uris.to_vec())).await {
+    Some(Answer::SubsonicTracks(tracks)) => tracks,
+    _ => Vec::new(),
   };
   if tracks.is_empty() {
-    set_error(app, "No Subsonic tracks to play".to_string()).await;
+    status(spine, "No Subsonic tracks to play", 6).await;
     return;
   }
   let index = start_idx.min(tracks.len() - 1);
@@ -419,20 +421,24 @@ async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx:
   let track_id = match tracks[index].uri.as_deref().map(track_id_from_uri) {
     Some(Ok(id)) => id.to_string(),
     _ => {
-      set_error(app, "Invalid Subsonic track URI".to_string()).await;
+      status(spine, "Invalid Subsonic track URI", 6).await;
       return;
     }
   };
 
-  let Some(source) = build_source(app).await else {
+  let Some(source) = build_source(spine).await else {
     return;
   };
   let source = Arc::new(source);
 
   // Only one backend owns the device at a time.
-  release_other_backends(app).await;
+  let existing_player = player(spine).await;
+  release_other_backends(spine, existing_player.is_none()).await;
 
-  let Some(player) = acquire_player(app).await else {
+  let Some(player) = (match existing_player {
+    Some(player) => Some(player),
+    None => acquire_player(spine).await,
+  }) else {
     return;
   };
 
@@ -440,7 +446,7 @@ async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx:
   let tmp = match download_track(&source, &track_id).await {
     Ok(t) => t,
     Err(e) => {
-      set_error(app, format!("Cannot download Subsonic track: {e}")).await;
+      status(spine, format!("Cannot download Subsonic track: {e}"), 6).await;
       return;
     }
   };
@@ -450,8 +456,9 @@ async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx:
 
   match result {
     Ok(Ok(())) => {
-      let volume = app.lock().await.runtime_state.volume_percent;
-      player.set_volume(volume as f32 / 100.0);
+      if let Some(Answer::Volume(volume)) = decoded(spine, Query::Volume).await {
+        player.set_volume(volume as f32 / 100.0);
+      }
 
       let display = tracks[index].name.clone();
       // Publish the session exactly once, now that the source is decoding.
@@ -465,49 +472,32 @@ async fn start_subsonic_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx:
         shuffle_backup: None,
       };
       // Honor the player-global decoded shuffle for the freshly-built queue.
-      if app.lock().await.decoded_shuffle {
+      let shuffle = matches!(
+        decoded(spine, Query::SubsonicShuffle).await,
+        Some(Answer::SubsonicShuffle(true))
+      );
+      if shuffle {
         state.set_shuffle(true);
       }
-      crate::runtime::engine::emit_decoded_source(
-        app,
-        crate::runtime::engine::DecodedSourceFact::SubsonicPlayback(state),
-      )
-      .await;
-      app
-        .lock()
-        .await
-        .set_status_message(format!("\u{266a} {display}"), 4);
+      emit(spine, Fact::SubsonicPlayback(state)).await;
+      status(spine, format!("\u{266a} {display}"), 4).await;
     }
-    Ok(Err(e)) => set_error(app, format!("Cannot play Subsonic track: {e}")).await,
-    Err(e) => set_error(app, format!("Subsonic playback task failed: {e}")).await,
+    Ok(Err(e)) => status(spine, format!("Cannot play Subsonic track: {e}"), 6).await,
+    Err(e) => status(spine, format!("Subsonic playback task failed: {e}"), 6).await,
   }
 }
 
 /// Move the subsonic queue index in `direction` and play the new track. Returns
 /// `true` if subsonic owns the session (so the event is consumed).
-async fn skip(app: &Arc<Mutex<App>>, direction: Direction) -> bool {
-  let target = {
-    let mut guard = app.lock().await;
-    // Repeat-all wraps at the ends; Off/Repeat-one clamp.
-    let mode = guard.decoded_repeat;
-    let Some(s) = guard.subsonic_playback.as_mut() else {
-      return false; // not ours
-    };
-    // Guard the empty-sink download window from spurious auto-advance.
-    s.advancing = true;
-    let forward = matches!(direction, Direction::Next);
-    advance_index(s.index, s.tracks.len(), mode, forward)
+async fn skip(spine: &Spine, forward: bool) -> bool {
+  let Some(Answer::SubsonicSkip(target)) = decoded(spine, Query::SubsonicSkip { forward }).await
+  else {
+    return false;
   };
 
   match target {
-    Some(idx) => play_index(app, idx).await,
-    None => {
-      // Queue boundary: clear the optimistic guard so it doesn't wedge
-      // auto-advance off for the rest of the track.
-      if let Some(s) = app.lock().await.subsonic_playback.as_mut() {
-        s.advancing = false;
-      }
-    }
+    Some(idx) => play_index(spine, idx).await,
+    None => emit(spine, Fact::SubsonicAdvancing(false)).await,
   }
   true
 }
@@ -517,31 +507,19 @@ async fn skip(app: &Arc<Mutex<App>>, direction: Direction) -> bool {
 /// network fetch — and on failure tears the session down (rather than leaving
 /// an empty sink that would re-fire replay every tick). Returns `true` if
 /// Subsonic owns the session.
-async fn replay_current(app: &Arc<Mutex<App>>) -> bool {
-  let (player, path) = {
-    let mut guard = app.lock().await;
-    let Some(s) = guard.subsonic_playback.as_mut() else {
-      return false; // not ours
-    };
-    s.advancing = true;
-    (Arc::clone(&s.player), s.tempfile.path().to_path_buf())
+async fn replay_current(spine: &Spine) -> bool {
+  let Some(Answer::SubsonicReplay(Some((player, path)))) =
+    decoded(spine, Query::SubsonicReplay).await
+  else {
+    return false;
   };
   if replay_file(player, path).await {
-    if let Some(s) = app.lock().await.subsonic_playback.as_mut() {
-      s.advancing = false;
-    }
+    emit(spine, Fact::SubsonicReplaySucceeded).await;
   } else {
-    teardown_subsonic(app).await;
-    set_error(app, "Cannot replay Subsonic track".to_string()).await;
+    teardown_subsonic(spine).await;
+    status(spine, "Cannot replay Subsonic track", 6).await;
   }
   true
-}
-
-/// What the locked snapshot in [`play_index`] decided to do.
-enum Plan {
-  Play(Arc<LocalPlayer>, Arc<SubsonicSource>, String),
-  OutOfRange,
-  BadUri,
 }
 
 /// Play the queued track at `target`, reusing the published session. Used by
@@ -550,41 +528,31 @@ enum Plan {
 /// A download failure tears the session down (deliberate divergence from the
 /// local source's skip-past): on a network outage, walking the whole queue at
 /// tick speed would spray error toasts, so one failure ends playback instead.
-pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
-  let plan = {
-    let guard = app.lock().await;
-    match guard.subsonic_playback.as_ref() {
-      None => return, // session torn down between dispatch and here
-      Some(s) => match s.tracks.get(target) {
-        None => Plan::OutOfRange,
-        Some(track) => match track.uri.as_deref().map(track_id_from_uri) {
-          Some(Ok(id)) => Plan::Play(Arc::clone(&s.player), Arc::clone(&s.source), id.to_string()),
-          _ => Plan::BadUri,
-        },
-      },
-    }
+pub(crate) async fn play_index(spine: &Spine, target: usize) {
+  let plan = match decoded(spine, Query::SubsonicPlayIndex(target)).await {
+    Some(Answer::SubsonicPlayIndex(plan)) => plan,
+    _ => return,
   };
 
-  let (player, source, track_id) = match plan {
-    Plan::Play(p, s, id) => (p, s, id),
-    Plan::OutOfRange => {
-      if let Some(s) = app.lock().await.subsonic_playback.as_mut() {
-        s.advancing = false;
-      }
+  let (player, source, track_id, display) = match plan {
+    Some(Ok(Some((p, s, id, display)))) => (p, s, id, display),
+    Some(Ok(None)) => {
+      emit(spine, Fact::SubsonicAdvancing(false)).await;
       return;
     }
-    Plan::BadUri => {
-      teardown_subsonic(app).await;
-      set_error(app, "Invalid Subsonic track URI".to_string()).await;
+    Some(Err(())) => {
+      teardown_subsonic(spine).await;
+      status(spine, "Invalid Subsonic track URI", 6).await;
       return;
     }
+    None => return,
   };
 
   let tmp = match download_track(&source, &track_id).await {
     Ok(t) => t,
     Err(e) => {
-      teardown_subsonic(app).await;
-      set_error(app, format!("Cannot download Subsonic track: {e}")).await;
+      teardown_subsonic(spine).await;
+      status(spine, format!("Cannot download Subsonic track: {e}"), 6).await;
       return;
     }
   };
@@ -593,14 +561,24 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
   let result = tokio::task::spawn_blocking(move || decode_player.play_file(&path)).await;
 
   match result {
-    Ok(Ok(())) => commit_index(app, target, tmp).await,
+    Ok(Ok(())) => {
+      emit(
+        spine,
+        Fact::SubsonicIndex {
+          target,
+          tempfile: tmp,
+        },
+      )
+      .await;
+      status(spine, format!("\u{266a} {display}"), 4).await;
+    }
     Ok(Err(e)) => {
-      teardown_subsonic(app).await;
-      set_error(app, format!("Cannot play Subsonic track: {e}")).await;
+      teardown_subsonic(spine).await;
+      status(spine, format!("Cannot play Subsonic track: {e}"), 6).await;
     }
     Err(e) => {
-      teardown_subsonic(app).await;
-      set_error(app, format!("Subsonic playback task failed: {e}")).await;
+      teardown_subsonic(spine).await;
+      status(spine, format!("Subsonic playback task failed: {e}"), 6).await;
     }
   }
 }
@@ -609,38 +587,17 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
 /// the new track's tempfile (dropping the previous one). Ordering is safe: the
 /// blocking `play_file` already cleared the old source from the sink, so rodio
 /// no longer holds the old file by the time it is dropped here.
-async fn commit_index(app: &Arc<Mutex<App>>, target: usize, tmp: NamedTempFile) {
-  let mut guard = app.lock().await;
-  let display = if let Some(s) = guard.subsonic_playback.as_mut() {
-    s.index = target;
-    s.advancing = false;
-    s.tempfile = tmp;
-    s.tracks.get(target).map(|t| t.name.clone())
-  } else {
-    None
-  };
-  if let Some(display) = display {
-    guard.set_status_message(format!("\u{266a} {display}"), 4);
-  }
-}
-
 /// End the subsonic session, releasing the output device and cleaning up the
 /// current tempfile.
-async fn teardown_subsonic(app: &Arc<Mutex<App>>) {
-  crate::runtime::engine::emit_decoded_source(
-    app,
-    crate::runtime::engine::DecodedSourceFact::SubsonicPlaybackCleared,
-  )
-  .await;
-}
-
-async fn set_error(app: &Arc<Mutex<App>>, message: String) {
-  app.lock().await.set_status_message(message, 6);
+async fn teardown_subsonic(spine: &Spine) {
+  emit(spine, Fact::SubsonicPlaybackCleared).await;
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::core::app::App;
+  use tokio::sync::Mutex;
 
   fn track(uri: &str, name: &str) -> TrackInfo {
     TrackInfo {
@@ -720,9 +677,10 @@ mod tests {
     app.user_config.behavior.subsonic_username = Some("demo".to_string());
     app.user_config.behavior.subsonic_password = Some("demo".to_string());
     let app = Arc::new(Mutex::new(app));
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
 
     // Browse playlists, then a playlist's tracks into the shared table.
-    assert!(route_subsonic_event(&app, &IoEvent::GetSubsonicPlaylists).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::GetSubsonicPlaylists).await);
     let playlist_uri = app
       .lock()
       .await
@@ -731,7 +689,7 @@ mod tests {
       .expect("demo has playlists")
       .uri
       .clone();
-    assert!(route_subsonic_event(&app, &IoEvent::GetSubsonicTracks(playlist_uri)).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::GetSubsonicTracks(playlist_uri)).await);
     let uris: Vec<String> = app
       .lock()
       .await
@@ -747,7 +705,7 @@ mod tests {
 
     // Start the queue at index 0 — downloads + plays the first track.
     assert!(
-      route_subsonic_event(&app, &IoEvent::StartPlayback(None, Some(uris), Some(0))).await,
+      route_subsonic_event(&spine, &IoEvent::StartPlayback(None, Some(uris), Some(0))).await,
       "subsonic StartPlayback must be consumed"
     );
     {
@@ -758,7 +716,7 @@ mod tests {
     }
 
     // Advance — downloads + plays the next track, moving the index.
-    assert!(route_subsonic_event(&app, &IoEvent::NextTrack).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::NextTrack).await);
     {
       let guard = app.lock().await;
       let s = guard
@@ -771,7 +729,7 @@ mod tests {
     // A foreign (Spotify) start tears the session down and falls through.
     assert!(
       !route_subsonic_event(
-        &app,
+        &spine,
         &IoEvent::StartPlayback(Some("spotify:track:x".to_string()), None, None)
       )
       .await,
@@ -800,9 +758,14 @@ mod tests {
     app.user_config.behavior.subsonic_username = Some("demo".to_string());
     app.user_config.behavior.subsonic_password = Some("demo".to_string());
     let app = Arc::new(Mutex::new(app));
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
 
     assert!(
-      route_subsonic_event(&app, &IoEvent::GetSubsonicSearchResults("love".to_string())).await
+      route_subsonic_event(
+        &spine,
+        &IoEvent::GetSubsonicSearchResults("love".to_string())
+      )
+      .await
     );
     let uris: Vec<String> = app
       .lock()
@@ -819,7 +782,7 @@ mod tests {
     // Track table is empty (never browsed) — metadata must resolve from search.
     assert!(app.lock().await.track_table.tracks.is_empty());
 
-    assert!(route_subsonic_event(&app, &IoEvent::StartPlayback(None, Some(uris), Some(0))).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::StartPlayback(None, Some(uris), Some(0))).await);
     let guard = app.lock().await;
     let s = guard
       .subsonic_playback

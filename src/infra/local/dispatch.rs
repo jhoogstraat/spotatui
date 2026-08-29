@@ -219,13 +219,19 @@ async fn start_local_queue(spine: &Spine, queue: Vec<String>, start_idx: usize) 
 }
 
 async fn teardown_backends(spine: &Spine, clear_local: bool) {
-  let backends = decoded(spine, Query::BackendPlayers).await;
-  if clear_local {
-    emit(spine, Fact::LocalPlaybackCleared).await;
-  }
+  let backends = decoded(
+    spine,
+    Query::ClaimBackendPlayers {
+      keep_local: !clear_local,
+      keep_subsonic: false,
+    },
+  )
+  .await;
   if let Some(Answer::BackendPlayers {
     #[cfg(feature = "streaming")]
     streaming,
+    #[cfg(feature = "local-files")]
+      local: _,
     #[cfg(feature = "subsonic")]
     subsonic,
     #[cfg(feature = "internet-radio")]
@@ -239,16 +245,16 @@ async fn teardown_backends(spine: &Spine, clear_local: bool) {
       player.pause();
     }
     #[cfg(feature = "subsonic")]
-    if subsonic.is_some() {
-      emit(spine, Fact::SubsonicPlaybackCleared).await;
+    if let Some(player) = subsonic {
+      player.stop();
     }
     #[cfg(feature = "internet-radio")]
-    if radio.is_some() {
-      emit(spine, Fact::RadioPlaybackCleared).await;
+    if let Some(player) = radio {
+      player.stop();
     }
     #[cfg(feature = "youtube")]
-    if youtube.is_some() {
-      emit(spine, Fact::YouTubePlaybackCleared).await;
+    if let Some(player) = youtube {
+      player.stop();
     }
   }
 }

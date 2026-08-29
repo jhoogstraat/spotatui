@@ -1268,7 +1268,7 @@ async fn restore_playback_session(
       // Seed the browse table so the start path's snapshot resolves metadata.
       app.lock().await.track_table.tracks = tracks;
       crate::infra::subsonic::dispatch::route_subsonic_event(
-        app,
+        spine,
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;

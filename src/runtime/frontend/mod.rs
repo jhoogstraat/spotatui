@@ -912,6 +912,32 @@ pub(crate) fn apply_decoded_source_fact(
         s.player.stop();
       }
     }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicAdvancing(value) => {
+      if let Some(s) = app.subsonic_playback.as_mut() {
+        s.advancing = value;
+      }
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicIndex { target, tempfile } => {
+      if let Some(s) = app.subsonic_playback.as_mut() {
+        s.index = target;
+        s.advancing = false;
+        s.tempfile = tempfile;
+      }
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicReplaySucceeded => {
+      if let Some(s) = app.subsonic_playback.as_mut() {
+        s.advancing = false;
+      }
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicStatus { message, ttl_secs } => {
+      app.set_status_message(message, ttl_secs);
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicRepeat(mode) => app.decoded_repeat = mode,
     #[cfg(feature = "internet-radio")]
     DecodedSourceFact::RadioStations(items) => app.radio_stations = items,
     #[cfg(feature = "internet-radio")]
@@ -2566,26 +2592,122 @@ fn answer_decoded_query(
     Q::LocalRepeat(state) => {
       FoldAnswer::Decoded(A::LocalRepeat(app.set_decoded_repeat_from_state(state)))
     }
-    #[cfg(feature = "local-files")]
-    Q::BackendPlayers => FoldAnswer::Decoded(A::BackendPlayers {
-      #[cfg(feature = "streaming")]
-      streaming: app.streaming_player.clone(),
-      #[cfg(feature = "subsonic")]
-      subsonic: app
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicConfig => FoldAnswer::Decoded(A::SubsonicConfig {
+      url: app.user_config.behavior.subsonic_url.clone(),
+      username: app.user_config.behavior.subsonic_username.clone(),
+      password: app.user_config.behavior.subsonic_password.clone(),
+    }),
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicPlayer => FoldAnswer::Decoded(A::SubsonicPlayer(
+      app
         .subsonic_playback
         .as_ref()
         .map(|s| std::sync::Arc::clone(&s.player)),
+    )),
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicShuffle => FoldAnswer::Decoded(A::SubsonicShuffle(app.decoded_shuffle)),
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicTracks(uris) => {
+      let search = app
+        .search_results
+        .tracks
+        .as_ref()
+        .map(|p| p.items.as_slice());
+      FoldAnswer::Decoded(A::SubsonicTracks(
+        crate::infra::subsonic::dispatch::snapshot_tracks(&app.track_table.tracks, search, &uris),
+      ))
+    }
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicReplay => {
+      FoldAnswer::Decoded(A::SubsonicReplay(app.subsonic_playback.as_mut().map(|s| {
+        s.advancing = true;
+        (
+          std::sync::Arc::clone(&s.player),
+          s.tempfile.path().to_path_buf(),
+        )
+      })))
+    }
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicSkip { forward } => FoldAnswer::Decoded(A::SubsonicSkip(
+      app.subsonic_playback.as_mut().and_then(|s| {
+        s.advancing = true;
+        crate::infra::queue::advance_index(s.index, s.tracks.len(), app.decoded_repeat, forward)
+      }),
+    )),
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicPlayIndex(target) => {
+      let plan = app
+        .subsonic_playback
+        .as_mut()
+        .map(|s| match s.tracks.get(target) {
+          None => Ok(None),
+          Some(track) => match track
+            .uri
+            .as_deref()
+            .map(crate::infra::subsonic::track_id_from_uri)
+          {
+            Some(Ok(id)) => {
+              s.advancing = true;
+              Ok(Some((
+                std::sync::Arc::clone(&s.player),
+                std::sync::Arc::clone(&s.source),
+                id.to_string(),
+                track.name.clone(),
+              )))
+            }
+            _ => Err(()),
+          },
+        });
+      FoldAnswer::Decoded(A::SubsonicPlayIndex(plan))
+    }
+    #[cfg(feature = "subsonic")]
+    Q::SubsonicRepeat(state) => {
+      FoldAnswer::Decoded(A::SubsonicRepeat(app.set_decoded_repeat_from_state(state)))
+    }
+    #[cfg(any(feature = "local-files", feature = "subsonic"))]
+    Q::ClaimBackendPlayers {
+      keep_local,
+      keep_subsonic,
+    } => {
+      let answer = A::BackendPlayers {
+        #[cfg(feature = "streaming")]
+        streaming: app.streaming_player.clone(),
+        #[cfg(feature = "local-files")]
+        local: app
+          .local_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+        #[cfg(feature = "subsonic")]
+        subsonic: app
+          .subsonic_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+        #[cfg(feature = "internet-radio")]
+        radio: app
+          .radio_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+        #[cfg(feature = "youtube")]
+        youtube: app
+          .youtube_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+      };
+      #[cfg(feature = "local-files")]
+      if !keep_local {
+        app.local_playback.take();
+      }
+      #[cfg(feature = "subsonic")]
+      if !keep_subsonic {
+        app.subsonic_playback.take();
+      }
       #[cfg(feature = "internet-radio")]
-      radio: app
-        .radio_playback
-        .as_ref()
-        .map(|s| std::sync::Arc::clone(&s.player)),
+      app.radio_playback.take();
       #[cfg(feature = "youtube")]
-      youtube: app
-        .youtube_playback
-        .as_ref()
-        .map(|s| std::sync::Arc::clone(&s.player)),
-    }),
+      app.youtube_playback.take();
+      FoldAnswer::Decoded(answer)
+    }
   }
 }
 

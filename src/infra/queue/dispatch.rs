@@ -307,7 +307,10 @@ async fn play_queued_local(app: &Arc<Mutex<App>>, track: &TrackInfo, uri: &str) 
 #[cfg(feature = "subsonic")]
 async fn play_queued_subsonic(app: &Arc<Mutex<App>>, track: &TrackInfo, uri: &str) -> bool {
   release_librespot(app).await;
-  let Some(source) = crate::infra::subsonic::dispatch::build_source(app).await else {
+  let Some(spine) = app.lock().await.spine.clone() else {
+    return false;
+  };
+  let Some(source) = crate::infra::subsonic::dispatch::build_source(&spine).await else {
     return false; // build_source surfaced its own status
   };
   let Some(player) = acquire_queue_player(app).await else {
@@ -920,7 +923,11 @@ async fn resume_subsonic(
         let _ = player.seek(Duration::from_millis(resume_position_ms));
       }
     }
-    None => crate::infra::subsonic::dispatch::play_index(app, index).await,
+    None => {
+      if let Some(spine) = app.lock().await.spine.clone() {
+        crate::infra::subsonic::dispatch::play_index(&spine, index).await;
+      }
+    }
   }
 }
 
@@ -1302,8 +1309,9 @@ mod tests {
       a.user_config.behavior.subsonic_password = Some("demo".to_string());
       Arc::new(Mutex::new(a))
     };
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
 
-    assert!(route_subsonic_event(&app, &IoEvent::GetSubsonicPlaylists).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::GetSubsonicPlaylists).await);
     let playlist_uri = app
       .lock()
       .await
@@ -1312,13 +1320,13 @@ mod tests {
       .unwrap()
       .uri
       .clone();
-    assert!(route_subsonic_event(&app, &IoEvent::GetSubsonicTracks(playlist_uri)).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::GetSubsonicTracks(playlist_uri)).await);
     let tracks: Vec<TrackInfo> = app.lock().await.track_table.tracks.clone();
     assert!(tracks.len() >= 3, "need a multi-track playlist");
     let uris: Vec<String> = tracks.iter().filter_map(|t| t.uri.clone()).collect();
 
     // Start the playlist at index 0.
-    assert!(route_subsonic_event(&app, &IoEvent::StartPlayback(None, Some(uris), Some(0))).await);
+    assert!(route_subsonic_event(&spine, &IoEvent::StartPlayback(None, Some(uris), Some(0))).await);
 
     // Queue a track from later in the playlist, then advance the native queue
     // (as an end-of-track suspension would).
