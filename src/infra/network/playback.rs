@@ -1203,6 +1203,11 @@ impl PlaybackNetwork for Network {
       Ok(None) => {
         self.consecutive_playback_auth_failures = 0;
         #[cfg(feature = "streaming")]
+        let poll_state = match self.fold_query(FoldQuery::PlaybackPollState).await {
+          Some(FoldAnswer::PlaybackPoll(state)) => *state,
+          _ => return,
+        };
+        #[cfg(feature = "streaming")]
         if let Some(player) = poll_state
           .player
           .as_ref()
@@ -1379,6 +1384,11 @@ impl PlaybackNetwork for Network {
           // The API answered, so the token is good.
           self.consecutive_playback_auth_failures = 0;
           #[cfg(feature = "streaming")]
+          let poll_state = match self.fold_query(FoldQuery::PlaybackPollState).await {
+            Some(FoldAnswer::PlaybackPoll(state)) => *state,
+            _ => return,
+          };
+          #[cfg(feature = "streaming")]
           if let Some(player) = poll_state
             .player
             .as_ref()
@@ -1397,12 +1407,10 @@ impl PlaybackNetwork for Network {
                 saved_device_matches_native: true
               })
             );
-            if native_idle_device_preference_update(
+            if let Some(update) = native_idle_device_preference_update(
               self.client_config.device_id.as_deref(),
               saved_matches,
-            )
-            .is_some()
-            {
+            ) {
               self
                 .emit_session(SessionFact::NativeIdleDeviceReconciled {
                   native_device_id: native_device_id.clone(),
@@ -1411,6 +1419,13 @@ impl PlaybackNetwork for Network {
                   activated_at: None,
                 })
                 .await;
+              if update == NativeDevicePreferenceUpdate::Persist
+                && self.client_config.device_id.as_deref() != Some(native_device_id.as_str())
+              {
+                if let Err(e) = self.client_config.set_device_id(native_device_id) {
+                  self.emit_error(anyhow!(e)).await;
+                }
+              }
             }
           }
           self

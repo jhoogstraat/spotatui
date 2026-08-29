@@ -1198,6 +1198,7 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     SessionFact::PlaybackPolled { context: None, .. } => {
       app.instant_since_last_current_playback_poll = Instant::now();
       app.is_fetching_current_playback = false;
+      app.seek_ms.take();
     }
     #[cfg(not(feature = "streaming"))]
     SessionFact::PlaybackPolled { context } => {
@@ -1209,6 +1210,7 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
       }
       app.instant_since_last_current_playback_poll = Instant::now();
       app.is_fetching_current_playback = false;
+      app.seek_ms.take();
     }
     #[cfg(feature = "streaming")]
     SessionFact::NativeIdleDeviceReconciled {
