@@ -984,7 +984,6 @@ pub use crate::core::action::LibraryTarget;
 /// (ticket 16). The fold answers under its existing App lock; the producer
 /// never locks. Every variant names the exact decision it feeds, so the
 /// protocol stays auditable.
-#[derive(Debug)]
 pub enum FoldQuery {
   /// Decoded-source read envelope; concrete variants are kept in the source
   /// domain so this central vocabulary stays compact.
@@ -1116,6 +1115,76 @@ pub enum FoldQuery {
   SavedTracksGeneration,
   /// Whether a Spotify session exists (the network layer's auth gate).
   SpotifyConnected,
+  #[cfg(feature = "streaming")]
+  NativePlayerState {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+  },
+  #[cfg(feature = "streaming")]
+  NativeRuntimeVolume,
+  #[cfg(feature = "streaming")]
+  NativePlayerUnavailable {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerLoading {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    position_ms: u32,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerPlaying {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    position_ms: u32,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerPaused {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    position_ms: u32,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerTrackChanged {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    info: crate::core::app::NativeTrackInfo,
+    previous_track_id: Option<String>,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerEndOfTrack {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    previous_track_id: String,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerDisconnect {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    shared_position: u32,
+    shared_is_playing: bool,
+    status_message: String,
+    restore_playback: bool,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerInstall {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerRecoveryFailed { error: String },
+  #[cfg(feature = "streaming")]
+  NativePlayerRecoveryRoute {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    request: crate::infra::player::StreamingRecoveryRequest,
+    device_name: String,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerReconnect {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    connected: bool,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerFact {
+    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
+    event: crate::core::streaming::StreamingStateEvent,
+  },
   /// Claim a playlist-tracks page offset for fetching (the old
   /// `playlist_tracks_prefetch_in_flight.insert(offset)` RMW, combined with
   /// the generation + still-open checks into one atomic fold decision).
@@ -1389,6 +1458,26 @@ pub enum FoldAnswer {
   HistoryState(HistoryQueryState),
   /// The native queue's tracks, in order.
   QueueTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "streaming")]
+  NativePlayerState(NativePlayerState),
+  #[cfg(feature = "streaming")]
+  NativeRuntimeVolume(u8),
+  #[cfg(feature = "streaming")]
+  NativePlayerPlaying {
+    current: bool,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerPaused {
+    current: bool,
+  },
+  #[cfg(feature = "streaming")]
+  NativePlayerTrackChanged(NativePlayerTrackChanged),
+  #[cfg(feature = "streaming")]
+  NativePlayerEndOfTrack(NativePlayerEndOfTrack),
+  #[cfg(feature = "streaming")]
+  NativePlayerRecovery(Option<crate::infra::player::StreamingRecoveryRequest>),
+  #[cfg(feature = "streaming")]
+  NativePlayerFactApplied(bool),
   /// The standing DJ vibe and whether the auto-queue DJ is on.
   #[cfg(feature = "dj-core")]
   DjVibe {
@@ -1516,6 +1605,37 @@ impl std::fmt::Debug for FoldAnswer {
         .field("recap", &v.enable_monthly_recap_prompt)
         .finish(),
       FoldAnswer::QueueTracks(v) => f.debug_tuple("QueueTracks").field(&v.len()).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerState(v) => f.debug_tuple("NativePlayerState").field(v).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativeRuntimeVolume(v) => f.debug_tuple("NativeRuntimeVolume").field(v).finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerPlaying { current } => {
+        f.debug_tuple("NativePlayerPlaying").field(current).finish()
+      }
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerPaused { current } => {
+        f.debug_tuple("NativePlayerPaused").field(current).finish()
+      }
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerTrackChanged(v) => f
+        .debug_tuple("NativePlayerTrackChanged")
+        .field(&v.current)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerEndOfTrack(v) => f
+        .debug_tuple("NativePlayerEndOfTrack")
+        .field(&v.current)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerRecovery(v) => f
+        .debug_tuple("NativePlayerRecovery")
+        .field(&v.is_some())
+        .finish(),
+      #[cfg(feature = "streaming")]
+      FoldAnswer::NativePlayerFactApplied(v) => {
+        f.debug_tuple("NativePlayerFactApplied").field(v).finish()
+      }
       #[cfg(feature = "dj-core")]
       FoldAnswer::DjVibe { vibe, auto_queue } => f
         .debug_struct("DjVibe")
@@ -1717,6 +1837,32 @@ pub struct NativePlaybackRequestSpec {
   pub offset: Option<usize>,
   pub desired_playing: bool,
   pub shuffle: bool,
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Debug, Clone, Copy)]
+pub struct NativePlayerState {
+  pub current: bool,
+  pub desired_playing: bool,
+  pub queue_suspended: bool,
+  pub decoded_queue_slot: bool,
+  pub queue_now_is_spotify: bool,
+  pub volume_percent: u8,
+}
+
+#[cfg(feature = "streaming")]
+pub struct NativePlayerTrackChanged {
+  pub current: bool,
+  pub reload_uri: Option<(String, bool)>,
+  pub transition_advanced: bool,
+}
+
+#[cfg(feature = "streaming")]
+pub struct NativePlayerEndOfTrack {
+  pub current: bool,
+  pub should_ensure_playback: bool,
+  pub stop_after_current: bool,
+  pub reissue_queue_slot: Option<(String, bool)>,
 }
 
 /// Whether a native playback activation should persist the native device id

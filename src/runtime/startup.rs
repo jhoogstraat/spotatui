@@ -548,7 +548,6 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
   // Spawn player event listener (updates app state from native player events)
   player::spawn_player_event_handler(player::PlayerEventContext {
     player: Arc::clone(&streaming_player),
-    app: Arc::clone(&ctx.app),
     shared_position: ctx.shared_position,
     shared_is_playing: ctx.shared_is_playing,
     spine: ctx.spine.clone(),
@@ -895,8 +894,15 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   if let Some(ref macos_media) = macos_media_manager {
     if let Some(event_rx) = macos_media.take_event_rx() {
       let app_for_macos = Arc::clone(&app);
+      let spine_for_macos = spine_for_events.clone();
       tokio::spawn(async move {
-        handle_macos_media_events(event_rx, app_for_macos, shared_is_playing_for_macos).await;
+        handle_macos_media_events(
+          event_rx,
+          app_for_macos,
+          shared_is_playing_for_macos,
+          spine_for_macos,
+        )
+        .await;
       });
     }
   }
@@ -924,8 +930,9 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   if let Some(ref windows_media) = windows_media_manager {
     if let Some(event_rx) = windows_media.take_event_rx() {
       let app_for_windows = Arc::clone(&app);
+      let spine_for_windows = spine_for_events.clone();
       tokio::spawn(async move {
-        handle_windows_media_events(event_rx, app_for_windows).await;
+        handle_windows_media_events(event_rx, app_for_windows, spine_for_windows).await;
       });
     }
   }
@@ -1032,7 +1039,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   #[cfg(feature = "streaming")]
   {
     player::spawn_streaming_recovery_handler(player::StreamingRecoveryContext {
-      app: Arc::clone(&app),
       shared_position: Arc::clone(&shared_position),
       shared_is_playing: Arc::clone(&shared_is_playing),
       spine: spine_for_events.clone(),
@@ -1740,6 +1746,7 @@ async fn handle_macos_media_events(
   mut event_rx: tokio::sync::mpsc::UnboundedReceiver<macos_media::MacMediaEvent>,
   app: Arc<Mutex<App>>,
   shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
+  spine: crate::runtime::engine::Spine,
 ) {
   use macos_media::MacMediaEvent;
   use std::sync::atomic::Ordering;
@@ -1765,7 +1772,7 @@ async fn handle_macos_media_events(
       continue;
     }
 
-    let Some(player) = player::active_streaming_player(&app).await else {
+    let Some(player) = player::active_streaming_player(&spine).await else {
       continue;
     };
 
@@ -1860,6 +1867,7 @@ async fn route_decoded_macos_event(
 async fn handle_windows_media_events(
   mut event_rx: tokio::sync::mpsc::UnboundedReceiver<smtc_tokio::WindowsMediaEvent>,
   app: Arc<Mutex<App>>,
+  spine: crate::runtime::engine::Spine,
 ) {
   use smtc_tokio::WindowsMediaEvent;
 
@@ -1884,7 +1892,7 @@ async fn handle_windows_media_events(
       continue;
     }
 
-    let player_opt = player::active_streaming_player(&app).await;
+    let player_opt = player::active_streaming_player(&spine).await;
 
     let is_native_loaded = app.lock().await.native_track_info.is_some();
 

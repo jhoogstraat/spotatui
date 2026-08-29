@@ -1810,6 +1810,22 @@ fn include_native_streaming_device(
 
 /// Takes `&mut App` because the claim and generation queries mutate the
 /// fold-owned bookkeeping — which is exactly the single-writer contract.
+#[cfg(feature = "streaming")]
+fn current_playback_matches_native(
+  app: &App,
+  player: &crate::infra::player::StreamingPlayer,
+) -> bool {
+  let Some(ctx) = app.current_playback_context.as_ref() else {
+    return app.is_streaming_active;
+  };
+  if let Some(native_id) = app.native_device_id.as_ref() {
+    if ctx.device.id.as_ref() == Some(native_id) {
+      return true;
+    }
+  }
+  ctx.device.name.eq_ignore_ascii_case(player.device_name()) && app.has_fresh_native_activity()
+}
+
 pub(crate) fn answer_query(
   app: &mut App,
   query: crate::runtime::engine::FoldQuery,
@@ -2400,6 +2416,360 @@ pub(crate) fn answer_query(
     ),
     FoldQuery::SavedTracksGeneration => FoldAnswer::U64(app.saved_tracks_prefetch_generation),
     FoldQuery::SpotifyConnected => FoldAnswer::Bool(app.spotify_connected),
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerState { player } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &player));
+      let decoded_queue_slot = {
+        #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+        {
+          app.queue_now_decoded_player().is_some()
+        }
+        #[cfg(not(any(feature = "local-files", feature = "subsonic", feature = "youtube")))]
+        {
+          false
+        }
+      };
+      FoldAnswer::NativePlayerState(crate::runtime::engine::NativePlayerState {
+        current,
+        desired_playing: app.native_playback_recovery.as_ref().map_or_else(
+          || app.native_is_playing.unwrap_or(false),
+          |snapshot| snapshot.desired_playing,
+        ),
+        queue_suspended: app.queue_suspended.is_some(),
+        decoded_queue_slot,
+        queue_now_is_spotify: app.queue_now_is_spotify(),
+        volume_percent: app.runtime_state.volume_percent,
+      })
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativeRuntimeVolume => {
+      FoldAnswer::NativeRuntimeVolume(app.runtime_state.volume_percent)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerPlaying {
+      player,
+      track_uri,
+      position_ms,
+    } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      if current {
+        let restored = app.observe_native_playback_state(track_uri.clone(), position_ms, true);
+        if app.native_restore_pending.is_none() {
+          app.native_load_watchdog = None;
+        }
+        app.pending_start_playback = None;
+        app.native_backend_pending = false;
+        if restored {
+          app.set_status_message("Native playback restored.", 5);
+        }
+        app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::Playing {
+          track_uri,
+          position_ms,
+        });
+      }
+      FoldAnswer::NativePlayerPlaying { current }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerPaused {
+      player,
+      track_uri,
+      position_ms,
+    } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      if current {
+        let restored = app.observe_native_playback_state(track_uri.clone(), position_ms, false);
+        if app.native_restore_pending.is_none() {
+          app.native_load_watchdog = None;
+        }
+        if restored {
+          app.set_status_message("Native playback restored in paused state.", 5);
+        }
+        app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::Paused {
+          track_uri,
+          position_ms,
+        });
+      }
+      FoldAnswer::NativePlayerPaused { current }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerTrackChanged {
+      player,
+      track_uri,
+      info,
+      previous_track_id,
+    } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      let mut reload_uri = None;
+      let mut transition_advanced = false;
+      if current {
+        if app.native_restore_pending.is_none() {
+          app.native_load_watchdog = None;
+        }
+        app.pending_start_playback = None;
+        app.native_backend_pending = false;
+        let kind = info.kind;
+        app.observe_native_track_changed(track_uri.clone(), kind, info.duration_ms);
+        let playing_id = crate::core::app::base62_id_of(&track_uri).to_string();
+        app.sync_native_shuffle_index(&playing_id);
+        reload_uri = app
+          .spotify_queue_guard_reload_uri(&playing_id)
+          .map(|uri| (uri, app.queue_slot_desired_playing));
+        transition_advanced = previous_track_id
+          .as_deref()
+          .is_some_and(|id| app.native_transition_has_advanced(id));
+        app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::TrackChanged {
+          info,
+          track_uri,
+        });
+      }
+      FoldAnswer::NativePlayerTrackChanged(crate::runtime::engine::NativePlayerTrackChanged {
+        current,
+        reload_uri,
+        transition_advanced,
+      })
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerEndOfTrack {
+      player,
+      previous_track_id,
+    } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      let mut should_ensure_playback = false;
+      let mut stop_after_current = false;
+      let mut reissue_queue_slot = None;
+      if current {
+        if app.user_config.behavior.stop_after_current_track {
+          stop_after_current = true;
+          app.pending_stop_after_track = true;
+          app.set_native_playback_intent(false);
+        } else if let Some(uri) = app.spotify_queue_guard_reload_uri(&previous_track_id) {
+          reissue_queue_slot = Some((uri, app.queue_slot_desired_playing));
+        } else if !app.handle_native_spotify_track_end() {
+          if app.native_raw_list_playback_exhausted(&previous_track_id) {
+            app.set_native_playback_intent(false);
+          } else {
+            should_ensure_playback = true;
+          }
+        }
+        app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::EndOfTrack {
+          reset_progress: true,
+          stop_after_current,
+        });
+      }
+      FoldAnswer::NativePlayerEndOfTrack(crate::runtime::engine::NativePlayerEndOfTrack {
+        current,
+        should_ensure_playback,
+        stop_after_current,
+        reissue_queue_slot,
+      })
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerDisconnect {
+      player,
+      shared_position,
+      shared_is_playing,
+      status_message,
+      restore_playback,
+    } => {
+      let Some(current) = app.streaming_player.as_ref() else {
+        return FoldAnswer::NativePlayerRecovery(None);
+      };
+      if !Arc::ptr_eq(current, &player) {
+        return FoldAnswer::NativePlayerRecovery(None);
+      }
+      let reselect_device =
+        restore_playback && crate::runtime::frontend::current_playback_matches_native(app, &player);
+      let continue_after_track = if reselect_device {
+        app.prepare_native_playback_recovery(shared_position, shared_is_playing);
+        app
+          .native_playback_recovery
+          .as_ref()
+          .and_then(|s| s.completed_track_uri())
+          .map(crate::core::app::base62_id_of)
+          .map(str::to_string)
+      } else {
+        app.clear_native_playback_recovery();
+        None
+      };
+      if !restore_playback {
+        app.pending_start_playback = None;
+        if app.queue_now_is_spotify() {
+          app.queue_now = None;
+          app.spotify_queue_guard_reloads = 0;
+        }
+      }
+      app.streaming_player = None;
+      app.is_streaming_active = false;
+      app.native_activation_pending = false;
+      app.native_device_id = None;
+      app.native_playback_origin = None;
+      app.convert_shuffled_suspension_to_context(None);
+      app.clear_native_shuffle_session();
+      app.last_device_activation = None;
+      app.seek_ms = None;
+      app.current_playback_context = None;
+      app.set_status_message(status_message, 8);
+      app.dispatch(IoEvent::GetCurrentPlayback);
+      app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::Teardown);
+      FoldAnswer::NativePlayerRecovery(Some(crate::infra::player::StreamingRecoveryRequest {
+        reselect_device,
+        restore_playback,
+        continue_after_track,
+      }))
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerInstall { player } => {
+      let old = app.streaming_player.replace(player.clone());
+      app.native_backend_pending = false;
+      FoldAnswer::StreamingPlayer(old)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerRecoveryFailed { error } => {
+      app.native_backend_pending = false;
+      app.native_restore_pending = None;
+      app.native_load_watchdog = None;
+      if app.pending_start_playback.take().is_some() {
+        app.set_status_message(
+          format!("Native recovery failed; playback request dropped: {error}"),
+          8,
+        );
+        FoldAnswer::Bool(true)
+      } else {
+        app.set_status_message(format!("Native recovery failed: {error}"), 8);
+        FoldAnswer::Bool(false)
+      }
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerRecoveryRoute {
+      player,
+      mut request,
+      device_name,
+    } => {
+      if !app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &player))
+      {
+        return FoldAnswer::Bool(false);
+      }
+      app.native_backend_pending = false;
+      let replay_queue_slot = app.pending_start_playback.is_none()
+        && request.restore_playback
+        && app.queue_now_is_spotify();
+      if request.reselect_device || replay_queue_slot {
+        app.dispatch(IoEvent::AutoSelectStreamingDevice(device_name, false, true));
+      }
+      if app.pending_start_playback.is_some() {
+        app.replay_pending_start_playback();
+      } else if replay_queue_slot {
+        app.dispatch(IoEvent::ReplayPublishedSpotifyQueueSlot);
+      } else if let Some(previous) = request.continue_after_track.take() {
+        if app.native_transition_has_advanced(&previous) {
+          if let Some(generation) = app.native_playback_restore_generation() {
+            app.dispatch(IoEvent::RestoreNativePlayback(generation));
+          }
+        } else {
+          app.dispatch(IoEvent::EnsurePlaybackContinues(previous));
+        }
+      } else if request.reselect_device {
+        if let Some(generation) = app.native_playback_restore_generation() {
+          app.dispatch(IoEvent::RestoreNativePlayback(generation));
+        }
+      } else if request.restore_playback {
+        app.set_status_message("Native streaming recovered.", 6);
+      }
+      FoldAnswer::Bool(true)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerUnavailable { player } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      if !current {
+        return FoldAnswer::NativePlayerFactApplied(false);
+      }
+      app.native_load_watchdog = None;
+      app.native_restore_pending = None;
+      app.pending_start_playback = None;
+      app.native_backend_pending = false;
+      if let Some(ctx) = app.current_playback_context.as_mut() {
+        ctx.is_playing = false;
+      }
+      app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::Stopped);
+      FoldAnswer::NativePlayerFactApplied(true)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerLoading {
+      player,
+      track_uri,
+      position_ms,
+    } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      if !current {
+        return FoldAnswer::NativePlayerFactApplied(false);
+      }
+      if app.native_load_watchdog.is_some() {
+        app.native_load_watchdog = Some(Instant::now());
+      }
+      app.apply_streaming_state(crate::core::streaming::StreamingStateEvent::Loading {
+        track_uri,
+        position_ms,
+      });
+      FoldAnswer::NativePlayerFactApplied(true)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerReconnect { player, connected } => {
+      if !app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &player))
+      {
+        return FoldAnswer::Bool(false);
+      }
+      app.native_backend_pending = !connected;
+      if connected && app.native_load_watchdog.is_some() {
+        app.native_load_watchdog = Some(Instant::now());
+      }
+      app.set_status_message(
+        if connected {
+          "Native streaming connection recovered."
+        } else {
+          "Native streaming connection lost; reconnecting."
+        },
+        if connected { 5 } else { 6 },
+      );
+      FoldAnswer::Bool(true)
+    }
+    #[cfg(feature = "streaming")]
+    FoldQuery::NativePlayerFact { player, event } => {
+      let current = app
+        .streaming_player
+        .as_ref()
+        .is_some_and(|p| Arc::ptr_eq(p, &player));
+      if current {
+        app.apply_streaming_state(event);
+      }
+      FoldAnswer::NativePlayerFactApplied(current)
+    }
     FoldQuery::ReleasePlaylistTracksPage {
       playlist_id,
       offset,
