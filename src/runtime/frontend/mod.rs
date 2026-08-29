@@ -2057,6 +2057,19 @@ pub(crate) fn answer_query(
       #[cfg(feature = "streaming")]
       {
         let player = app.streaming_player.clone();
+        let local_state = player
+          .as_ref()
+          .filter(|player| player.is_available())
+          .and_then(|player| {
+            app.current_playback_context.as_ref().map(|ctx| {
+              (
+                Some(player.get_volume()),
+                ctx.shuffle_state,
+                ctx.repeat_state,
+                app.native_is_playing,
+              )
+            })
+          });
         FoldAnswer::PlaybackPoll(Box::new(
           crate::infra::network::playback::PlaybackPollState {
             player,
@@ -2069,7 +2082,7 @@ pub(crate) fn answer_query(
             native_is_playing: app.native_is_playing,
             persisted_shuffle: app.runtime_state.shuffle_enabled,
             current_context: app.current_playback_context.clone(),
-            local_state: None,
+            local_state,
           },
         ))
       }
@@ -2080,6 +2093,11 @@ pub(crate) fn answer_query(
     }
     #[cfg(feature = "streaming")]
     FoldQuery::ClaimNativeRestore { generation } => {
+      if app.pending_start_playback.is_some()
+        || app.native_playback_restore_generation() != Some(generation)
+      {
+        return FoldAnswer::NativeRestore(None);
+      }
       let Some(player) = app
         .streaming_player
         .as_ref()
@@ -2089,11 +2107,6 @@ pub(crate) fn answer_query(
         app.force_native_streaming_recovery(true);
         return FoldAnswer::NativeRestore(None);
       };
-      if app.pending_start_playback.is_some()
-        || app.native_playback_restore_generation() != Some(generation)
-      {
-        return FoldAnswer::NativeRestore(None);
-      }
       let Some(snapshot) = app.begin_native_playback_restore(generation) else {
         return FoldAnswer::NativeRestore(None);
       };
@@ -2120,23 +2133,16 @@ pub(crate) fn answer_query(
     #[cfg(feature = "streaming")]
     FoldQuery::AutoSelectDecision {
       native_device_id,
+      native_device_name,
       saved_device_id,
       persist_device_id,
       yield_to_external_playback,
     } => {
-      let player = app.streaming_player.as_ref();
-      let Some(player) = player else {
-        return FoldAnswer::AutoSelect {
-          should_transfer: false,
-          external_playback_active: false,
-          preference: crate::runtime::engine::NativeDevicePreferenceUpdate::KeepExistingPreference,
-        };
-      };
       let saved_matches = crate::infra::network::playback::saved_device_matches_native_player(
         saved_device_id.as_deref(),
         Some(&native_device_id),
         app.devices.as_ref(),
-        player.device_name(),
+        &native_device_name,
       );
       let recent_activation = app
         .last_device_activation

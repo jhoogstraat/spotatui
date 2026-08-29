@@ -1132,7 +1132,7 @@ fn native_restore_load_request(snapshot: &NativePlaybackRecoverySnapshot) -> Opt
 impl PlaybackNetwork for Network {
   async fn get_current_playback(&mut self) {
     #[cfg(feature = "streaming")]
-    let mut poll_state = match self.fold_query(FoldQuery::PlaybackPollState).await {
+    let poll_state = match self.fold_query(FoldQuery::PlaybackPollState).await {
       Some(FoldAnswer::PlaybackPoll(state)) => *state,
       _ => return,
     };
@@ -1145,18 +1145,6 @@ impl PlaybackNetwork for Network {
           .filter(|player| player.is_available())
           .map(|player| Arc::as_ptr(player) as usize),
       );
-      poll_state.local_state = if poll_state.player.as_ref().is_some_and(|p| p.is_available()) {
-        poll_state.current_context.as_ref().map(|ctx| {
-          (
-            poll_state.player.as_ref().map(|p| p.get_volume()),
-            ctx.shuffle_state,
-            ctx.repeat_state,
-            poll_state.native_is_playing,
-          )
-        })
-      } else {
-        None
-      };
     }
 
     let context = self
@@ -1175,19 +1163,22 @@ impl PlaybackNetwork for Network {
         self.consecutive_playback_auth_failures = 0;
         #[cfg(feature = "streaming")]
         {
-          if let Some(player) = poll_state.player.as_ref() {
-            if poll_state.local_state.is_none() {
-              let _ = player.set_shuffle(
-                poll_state
-                  .current_context
-                  .as_ref()
-                  .map(|ctx| ctx.shuffle_state)
-                  .unwrap_or(poll_state.persisted_shuffle),
-              );
+          let poll_state = match self.fold_query(FoldQuery::PlaybackPollState).await {
+            Some(FoldAnswer::PlaybackPoll(state)) => *state,
+            _ => return,
+          };
+          if poll_state.local_state.is_none() {
+            if let Some(player) = poll_state.player.as_ref() {
+              let shuffle = poll_state
+                .current_context
+                .as_ref()
+                .map(|ctx| ctx.shuffle_state)
+                .unwrap_or(poll_state.persisted_shuffle);
+              let _ = player.set_shuffle(shuffle);
             }
           }
           self
-            .emit_session(SessionFact::PlaybackPolled {
+            .emit_session_acked(SessionFact::PlaybackPolled {
               context: Some(Box::new(c)),
               state: Box::new(poll_state),
             })
@@ -1195,7 +1186,7 @@ impl PlaybackNetwork for Network {
         }
         #[cfg(not(feature = "streaming"))]
         self
-          .emit_session(SessionFact::PlaybackPolled {
+          .emit_session_acked(SessionFact::PlaybackPolled {
             context: Some(Box::new(c)),
           })
           .await;
@@ -1242,7 +1233,7 @@ impl PlaybackNetwork for Network {
               None
             };
             self
-              .emit_session(SessionFact::NativeIdleDeviceReconciled {
+              .emit_session_acked(SessionFact::NativeIdleDeviceReconciled {
                 native_device_id: native_device_id.clone(),
                 device_name: player.device_name().to_string(),
                 volume: player.get_volume(),
@@ -1259,7 +1250,7 @@ impl PlaybackNetwork for Network {
           }
         }
         self
-          .emit_session(SessionFact::PlaybackPollIdle {
+          .emit_session_acked(SessionFact::PlaybackPollIdle {
             clear_context: false,
           })
           .await;
@@ -1279,7 +1270,7 @@ impl PlaybackNetwork for Network {
             })
             .await;
           self
-            .emit_session(SessionFact::PlaybackPollIdle {
+            .emit_session_acked(SessionFact::PlaybackPollIdle {
               clear_context: false,
             })
             .await;
@@ -1305,7 +1296,7 @@ impl PlaybackNetwork for Network {
             })
             .await;
           self
-            .emit_session(SessionFact::PlaybackPollIdle {
+            .emit_session_acked(SessionFact::PlaybackPollIdle {
               clear_context: false,
             })
             .await;
@@ -1327,7 +1318,7 @@ impl PlaybackNetwork for Network {
             })
             .await;
           self
-            .emit_session(SessionFact::PlaybackPollIdle {
+            .emit_session_acked(SessionFact::PlaybackPollIdle {
               clear_context: false,
             })
             .await;
@@ -1367,7 +1358,7 @@ impl PlaybackNetwork for Network {
                 .await;
             }
             self
-              .emit_session(SessionFact::PlaybackPollIdle {
+              .emit_session_acked(SessionFact::PlaybackPollIdle {
                 clear_context: false,
               })
               .await;
@@ -1412,7 +1403,7 @@ impl PlaybackNetwork for Network {
               saved_matches,
             ) {
               self
-                .emit_session(SessionFact::NativeIdleDeviceReconciled {
+                .emit_session_acked(SessionFact::NativeIdleDeviceReconciled {
                   native_device_id: native_device_id.clone(),
                   device_name: player.device_name().to_string(),
                   volume: player.get_volume(),
@@ -1429,7 +1420,7 @@ impl PlaybackNetwork for Network {
             }
           }
           self
-            .emit_session(SessionFact::PlaybackPollIdle {
+            .emit_session_acked(SessionFact::PlaybackPollIdle {
               clear_context: true,
             })
             .await;
@@ -1437,7 +1428,7 @@ impl PlaybackNetwork for Network {
         }
 
         self
-          .emit_session(SessionFact::PlaybackPollIdle {
+          .emit_session_acked(SessionFact::PlaybackPollIdle {
             clear_context: false,
           })
           .await;
@@ -1499,7 +1490,7 @@ impl PlaybackNetwork for Network {
       .and_then(crate::core::cover_theme::extract_palette);
 
     self
-      .emit_session(crate::runtime::engine::SessionFact::CoverArtFetched {
+      .emit_session_acked(crate::runtime::engine::SessionFact::CoverArtFetched {
         key,
         image: result.map_err(|e| e.to_string()),
         palette,
@@ -2330,7 +2321,7 @@ impl PlaybackNetwork for Network {
         .native_idle_recovery
         .settle_current_episode(activation_time);
       self
-        .emit_session(SessionFact::NativeTransferActivated {
+        .emit_session_acked(SessionFact::NativeTransferActivated {
           native_device_id: native_device_id.clone(),
           activation_time,
         })
@@ -2365,7 +2356,7 @@ impl PlaybackNetwork for Network {
         }
       }
       self
-        .emit_session(SessionFact::ExternalTransferCompleted { device_id })
+        .emit_session_acked(SessionFact::ExternalTransferCompleted { device_id })
         .await;
     }
   }
@@ -2383,6 +2374,7 @@ impl PlaybackNetwork for Network {
       let (should_transfer, external_playback_active, native_preference_update) = match self
         .fold_query(FoldQuery::AutoSelectDecision {
           native_device_id: native_device_id.clone(),
+          native_device_name: player.device_name().to_string(),
           saved_device_id: self.client_config.device_id.clone(),
           persist_device_id,
           yield_to_external_playback,
@@ -2412,7 +2404,7 @@ impl PlaybackNetwork for Network {
         .settle_current_episode(activation_time);
 
       self
-        .emit_session(SessionFact::AutoSelectApplied {
+        .emit_session_acked(SessionFact::AutoSelectApplied {
           native_device_id: native_device_id.clone(),
           activation_time,
           external_playback_active,
@@ -2501,7 +2493,7 @@ impl PlaybackNetwork for Network {
         // final track.
         info!("continuation for {previous_track_id}: raw uri list exhausted; staying stopped");
         self
-          .emit_session(SessionFact::NativePlaybackIntentStopped)
+          .emit_session_acked(SessionFact::NativePlaybackIntentStopped)
           .await;
         return;
       }
@@ -2533,19 +2525,14 @@ impl PlaybackNetwork for Network {
           );
           #[cfg(feature = "streaming")]
           if native_active {
-            let native_device_id = match self
-              .fold_query(FoldQuery::NativeContinuationState {
-                previous_track_id: previous_track_id.clone(),
-              })
-              .await
-            {
-              Some(FoldAnswer::NativeContinuation {
-                native_device_id, ..
-              }) => native_device_id,
+            let native_device_id = match self.fold_query(FoldQuery::NativeDeviceId).await {
+              Some(FoldAnswer::NativeDeviceId(native_device_id)) => native_device_id,
               _ => None,
             };
             let Some(native_device_id) = native_device_id else {
-              self.emit_session(SessionFact::ForceNativeRecovery).await;
+              self
+                .emit_session_acked(SessionFact::ForceNativeRecovery)
+                .await;
               return;
             };
             if let Err(e) = self
@@ -2558,7 +2545,9 @@ impl PlaybackNetwork for Network {
               .await
             {
               warn!("failed to advance stalled native playback via Web API: {e}");
-              self.emit_session(SessionFact::ForceNativeRecovery).await;
+              self
+                .emit_session_acked(SessionFact::ForceNativeRecovery)
+                .await;
             }
             return;
           }
@@ -3454,5 +3443,51 @@ mod tests {
 
     let guard = app.lock().await;
     assert_eq!(guard.status_message.as_deref(), Some("Queue finished"));
+  }
+
+  #[test]
+  fn playback_poll_idle_fact_resets_fetching_without_clearing_context_by_default() {
+    use crate::core::app::App;
+    use crate::core::user_config::UserConfig;
+    use std::sync::mpsc::channel;
+    use std::time::SystemTime;
+
+    let (io_tx, _rx) = channel();
+    let mut app = App::new(io_tx, UserConfig::new(), Some(SystemTime::now()));
+    app.is_fetching_current_playback = true;
+    app.seek_ms = Some(12_345);
+    crate::runtime::frontend::apply_session_fact(
+      &mut app,
+      SessionFact::PlaybackPollIdle {
+        clear_context: false,
+      },
+    );
+    assert!(!app.is_fetching_current_playback);
+    assert_eq!(app.seek_ms, None);
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn native_restore_claim_checks_parked_replay_before_recovery() {
+    use crate::core::app::{App, PendingStartPlayback};
+    use crate::core::user_config::UserConfig;
+    use std::sync::mpsc::channel;
+    use std::time::{Instant, SystemTime};
+
+    let (io_tx, _rx) = channel();
+    let mut app = App::new(io_tx, UserConfig::new(), Some(SystemTime::now()));
+    app.pending_start_playback = Some(PendingStartPlayback {
+      context_uri: None,
+      uris: None,
+      offset: None,
+      parked_at: Instant::now(),
+      recovery_attempts: 0,
+    });
+    let answer = crate::runtime::frontend::answer_query(
+      &mut app,
+      FoldQuery::ClaimNativeRestore { generation: 1 },
+    );
+    assert!(matches!(answer, FoldAnswer::NativeRestore(None)));
+    assert!(!app.native_backend_pending);
   }
 }

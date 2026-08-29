@@ -1054,6 +1054,7 @@ pub enum FoldQuery {
   #[cfg(feature = "streaming")]
   AutoSelectDecision {
     native_device_id: String,
+    native_device_name: String,
     saved_device_id: Option<String>,
     persist_device_id: bool,
     yield_to_external_playback: bool,
