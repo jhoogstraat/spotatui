@@ -17,7 +17,9 @@ use tokio::sync::{watch, Mutex};
 
 pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget};
 pub use crate::core::onboarding::Onboarding;
-pub use crate::core::plugin_api::{AlbumInfo, ArtistInfo, PlaybackState, PlaylistInfo, TrackInfo};
+pub use crate::core::plugin_api::{
+  AlbumInfo, ArtistInfo, ArtistRef, PlaybackState, PlaylistInfo, TrackInfo,
+};
 pub use crate::core::source::Source;
 
 /// Library data made visible to embedded frontends. `None` means the
