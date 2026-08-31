@@ -184,31 +184,20 @@ impl MetadataNetwork for Network {
         }
       };
 
-      let mut album_items = Vec::new();
-      let mut offset = 0u32;
-      let limit = 50u32;
-      loop {
-        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
-        if let Some(country) = country {
-          query.push(("market", country_code(country)));
-        }
-        let page = match self
-          .spotify_get_typed::<Page<SimplifiedAlbum>>(&format!("{}/albums", artist_path), &query)
-          .await
-        {
-          Ok(page) => page,
-          Err(e) => {
-            self.handle_error(anyhow!(e)).await;
-            return;
-          }
-        };
-        let next = page.next.is_some();
-        album_items.extend(page.items);
-        if !next {
-          break;
-        }
-        offset += limit;
+      let mut query = vec![("limit", "12".to_string()), ("offset", "0".to_string())];
+      if let Some(country) = country {
+        query.push(("market", country_code(country)));
       }
+      let album_items = match self
+        .spotify_get_typed::<Page<SimplifiedAlbum>>(&format!("{}/albums", artist_path), &query)
+        .await
+      {
+        Ok(page) => page.items,
+        Err(e) => {
+          self.handle_error(anyhow!(e)).await;
+          return;
+        }
+      };
 
       let data = CachedArtistData {
         top_tracks,
