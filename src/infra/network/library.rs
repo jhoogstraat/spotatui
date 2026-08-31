@@ -255,14 +255,8 @@ pub async fn prefetch_playlist_tracks_page_task(
         },
       ))
       .await;
-    let Some(FoldAck {
-      next_playlist_tracks_offset: Some(candidate_next_offset),
-      ..
-    }) = ack
-    else {
-      return;
-    };
-    offset = candidate_next_offset;
+    let _ = ack;
+    return;
   }
 }
 
