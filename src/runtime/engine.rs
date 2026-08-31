@@ -2018,11 +2018,9 @@ impl Spine {
     )
   }
 
-  /// Push an event. Never blocks: if the buffer is momentarily full the
-  /// coalescing publisher will catch up on its next wake anyway, and losing
-  /// a duplicate poke costs nothing while blocking every producer would.
+  /// Push an event, waiting for bounded capacity so unique facts are not lost.
   pub async fn emit(&self, event: EngineEvent) {
-    let _ = self.events_tx.try_send(event);
+    let _ = self.events_tx.send(event).await;
   }
   /// Synchronous fire-and-forget for contexts holding no async reactor
   /// (blocking threads, drop paths). Same lossy-on-overflow contract.
@@ -2136,5 +2134,40 @@ pub(crate) async fn emit_decoded_source(app: &Arc<Mutex<App>>, fact: DecodedSour
   } else {
     let mut guard = app.lock().await;
     crate::runtime::frontend::apply_decoded_source_fact(&mut guard, fact);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn emit_preserves_unique_facts_under_backpressure() {
+    let (spine, mut events, _) = Spine::open(SpineBounds { event_capacity: 1 });
+    spine.emit(EngineEvent::changed(Changed::Session)).await;
+
+    let pending = spine.emit(EngineEvent::Session(SessionFact::Auth {
+      transition: crate::core::auth::AuthTransition::Connected,
+      new_expiry: None,
+      post_connect_fetches: Vec::new(),
+    }));
+    tokio::pin!(pending);
+
+    assert!(
+      tokio::time::timeout(Duration::from_millis(10), &mut pending)
+        .await
+        .is_err()
+    );
+    assert!(matches!(
+      events.recv().await,
+      Some(EngineEvent::StateChanged(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(2), &mut pending)
+      .await
+      .expect("event should send after capacity is available");
+    assert!(matches!(
+      events.recv().await,
+      Some(EngineEvent::Session(SessionFact::Auth { .. }))
+    ));
   }
 }

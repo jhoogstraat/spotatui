@@ -558,6 +558,7 @@ pub(super) async fn fold_loop(
     Some(handles) => (Some(handles.queries), Some(handles.acks)),
     None => (None, None),
   };
+  publish(&app, &tx).await;
   loop {
     // Answer any producer query that arrived since the last event before
     // (possibly) blocking on the next one: the try_recv drain below clears a
@@ -3207,6 +3208,20 @@ mod tests {
   use crate::core::app::App;
   use std::sync::Arc;
   use tokio::sync::Mutex;
+
+  #[tokio::test]
+  async fn fold_publishes_state_that_existed_before_startup() {
+    let app = Arc::new(Mutex::new(App::default()));
+    app.lock().await.spotify_connected = true;
+
+    let (_spine, mut rx) = spawn_fold(&app).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), rx.changed())
+      .await
+      .expect("fold should publish its initial App state")
+      .expect("snapshot channel should remain open");
+
+    assert!(rx.borrow().spotify_connected);
+  }
 
   /// A query sent while the fold is parked on an empty event stream must
   /// still be answered (ticket 17 regression): CLI mode, the DJ turn loop,

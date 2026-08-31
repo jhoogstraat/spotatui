@@ -301,6 +301,7 @@ impl App {
       active_block: ActiveBlock::Empty,
       hovered_block: ActiveBlock::Library,
     };
+    let spotify_connected = spotify_token_expiry.is_some();
     App {
       io_tx: Some(io_tx),
       user_config,
@@ -308,8 +309,13 @@ impl App {
       state_path,
       // A token expiry means a Spotify session loaded at startup; a free-source
       // launch with no cached token passes `None`. In-TUI login flips both fields.
-      spotify_connected: spotify_token_expiry.is_some(),
+      spotify_connected,
       spotify_token_expiry,
+      auth_state: crate::core::auth::AuthState {
+        connected: spotify_connected,
+        token_expiry: spotify_token_expiry,
+        ..Default::default()
+      },
       active_source,
       navigation_stack: vec![startup_route],
       playlist_sort,
@@ -323,5 +329,21 @@ impl App {
       },
       ..App::default()
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn cached_session_initializes_auth_domain_and_mirror() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let expiry = SystemTime::now();
+    let app = App::new(tx, UserConfig::new(), Some(expiry));
+
+    assert!(app.spotify_connected);
+    assert!(app.auth_state.connected);
+    assert_eq!(app.auth_state.token_expiry, Some(expiry));
   }
 }
