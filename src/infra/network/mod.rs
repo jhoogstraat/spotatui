@@ -387,7 +387,7 @@ impl Network {
     Network {
       spotify,
       large_search_limit: 50,
-      small_search_limit: 4,
+      small_search_limit: 12,
       client_config,
       app: Arc::clone(app),
       spine: None,
@@ -413,7 +413,7 @@ impl Network {
     Network {
       spotify,
       large_search_limit: 50,
-      small_search_limit: 4,
+      small_search_limit: 12,
       client_config,
       app: Arc::clone(app),
       spine: None,

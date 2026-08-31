@@ -45,7 +45,7 @@ impl Default for App {
       saved_album_ids_set: HashSet::new(),
       saved_show_ids_set: HashSet::new(),
       navigation_stack: vec![DEFAULT_ROUTE],
-      small_search_limit: 4,
+      small_search_limit: 12,
       api_error: String::new(),
       api_error_expires_at: None,
       current_playback_context: None,

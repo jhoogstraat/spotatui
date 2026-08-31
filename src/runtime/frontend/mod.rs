@@ -17,7 +17,7 @@ use tokio::sync::{watch, Mutex};
 
 pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget};
 pub use crate::core::onboarding::Onboarding;
-pub use crate::core::plugin_api::{PlaybackState, PlaylistInfo, TrackInfo};
+pub use crate::core::plugin_api::{AlbumInfo, ArtistInfo, PlaybackState, PlaylistInfo, TrackInfo};
 pub use crate::core::source::Source;
 
 /// Library data made visible to embedded frontends. `None` means the
@@ -45,8 +45,11 @@ pub struct Snapshot {
   pub as_of: std::time::Instant,
   /// The native queue's upcoming items, in order.
   pub queue_upcoming: Vec<TrackInfo>,
-  /// Track rows of the latest catalog search.
+  /// Rows of the latest catalog search, grouped by Spotify content type.
   pub search_tracks: Vec<TrackInfo>,
+  pub search_artists: Vec<ArtistInfo>,
+  pub search_albums: Vec<AlbumInfo>,
+  pub search_playlists: Vec<PlaylistInfo>,
   /// A catalog fetch is in flight.
   pub search_loading: bool,
   /// A Spotify session exists.
@@ -486,6 +489,9 @@ impl Default for Snapshot {
       as_of: Instant::now(),
       queue_upcoming: Vec::new(),
       search_tracks: Vec::new(),
+      search_artists: Vec::new(),
+      search_albums: Vec::new(),
+      search_playlists: Vec::new(),
       search_loading: false,
       spotify_connected: false,
       notice: None,
@@ -528,6 +534,9 @@ pub(crate) async fn spawn_fold(
     as_of: std::time::Instant::now(),
     queue_upcoming: Vec::new(),
     search_tracks: Vec::new(),
+    search_artists: Vec::new(),
+    search_albums: Vec::new(),
+    search_playlists: Vec::new(),
     search_loading: false,
     spotify_connected: false,
     notice: None,
@@ -3187,6 +3196,9 @@ fn build_snapshot(app: &App) -> Snapshot {
     position_ms: app.playback_position_ms().map(|p| p as u64),
     queue_upcoming: app.native_queue.clone(),
     search_tracks: search.tracks,
+    search_artists: search.artists,
+    search_albums: search.albums,
+    search_playlists: search.playlists,
     search_loading: app.search_loading,
     spotify_connected: app.spotify_connected,
     notice: app.status_message.clone(),
