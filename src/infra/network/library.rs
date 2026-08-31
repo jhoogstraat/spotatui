@@ -193,7 +193,7 @@ pub async fn prefetch_playlist_tracks_page_task(
   token_cache_path: std::path::PathBuf,
   limit: u32,
   playlist_id: PlaylistId<'static>,
-  mut offset: u32,
+  offset: u32,
 ) {
   let playlist_id_string = playlist_id.id().to_string();
   loop {
