@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 
-pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget};
+pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget, OpenTarget};
 pub use crate::core::onboarding::Onboarding;
 pub use crate::core::plugin_api::{
   AlbumInfo, ArtistInfo, ArtistRef, PlaybackState, PlaylistInfo, TrackInfo,
@@ -30,6 +30,13 @@ pub struct LibrarySnapshot {
   pub liked_songs: Option<Vec<TrackInfo>>,
   pub recently_played: Option<Vec<TrackInfo>>,
   pub playlists: Option<Vec<PlaylistInfo>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchDetail {
+  Artist { tracks: Vec<TrackInfo>, albums: Vec<AlbumInfo> },
+  Album { tracks: Vec<TrackInfo> },
+  Playlist { tracks: Vec<TrackInfo> },
 }
 
 /// One published runtime state. Composed from the existing snapshot builders;
@@ -52,6 +59,7 @@ pub struct Snapshot {
   pub search_artists: Vec<ArtistInfo>,
   pub search_albums: Vec<AlbumInfo>,
   pub search_playlists: Vec<PlaylistInfo>,
+  pub search_detail: Option<SearchDetail>,
   /// A catalog fetch is in flight.
   pub search_loading: bool,
   /// A Spotify session exists.
@@ -494,6 +502,7 @@ impl Default for Snapshot {
       search_artists: Vec::new(),
       search_albums: Vec::new(),
       search_playlists: Vec::new(),
+      search_detail: None,
       search_loading: false,
       spotify_connected: false,
       notice: None,
@@ -539,6 +548,7 @@ pub(crate) async fn spawn_fold(
     search_artists: Vec::new(),
     search_albums: Vec::new(),
     search_playlists: Vec::new(),
+    search_detail: None,
     search_loading: false,
     spotify_connected: false,
     notice: None,
@@ -3179,6 +3189,32 @@ fn answer_decoded_query(
 
 fn build_snapshot(app: &App) -> Snapshot {
   let search = crate::core::plugin_api::search_results_snapshot(app);
+  let search_detail = match app.get_current_route().id {
+    crate::core::app::RouteId::Artist => app.artist.as_ref().map(|artist| SearchDetail::Artist {
+      tracks: artist.top_tracks.clone(),
+      albums: artist.albums.items.clone(),
+    }),
+    crate::core::app::RouteId::AlbumTracks => app
+      .selected_album_simplified
+      .as_ref()
+      .map(|album| SearchDetail::Album { tracks: album.tracks.items.clone() })
+      .or_else(|| app.selected_album_full.as_ref().map(|album| SearchDetail::Album {
+        tracks: album.album.tracks.clone(),
+      })),
+    crate::core::app::RouteId::TrackTable => app.playlist_tracks.as_ref().map(|page| {
+      SearchDetail::Playlist {
+        tracks: page
+          .items
+          .iter()
+          .filter_map(|(_, item)| match item {
+            crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
+            crate::core::plugin_api::PlayableInfo::Episode(_) => None,
+          })
+          .collect(),
+      }
+    }),
+    _ => None,
+  };
   Snapshot {
     as_of: Instant::now(),
     playback: crate::core::plugin_api::playback_state(app),
@@ -3201,6 +3237,7 @@ fn build_snapshot(app: &App) -> Snapshot {
     search_artists: search.artists,
     search_albums: search.albums,
     search_playlists: search.playlists,
+    search_detail,
     search_loading: app.search_loading,
     spotify_connected: app.spotify_connected,
     notice: app.status_message.clone(),
