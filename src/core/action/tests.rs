@@ -1,6 +1,6 @@
 //! Differential tests for `App::apply`: one test per arm (or small arm
 //! family), pinning the exact observable behavior — dispatched `IoEvent`s
-//! and `App` state — that the scripting effect drain had before the port.
+//! and `App` state.
 //!
 //! House pattern: `app_with_channel` keeps the `IoEvent` receiver alive;
 //! `IoEvent` derives nothing, so assertions pattern-match. Catch-all match
@@ -800,14 +800,11 @@ fn navigate_devices_opens_the_device_picker() {
 }
 
 #[test]
-fn navigate_help_lyrics_and_party_push_their_routes() {
+fn navigate_help_pushes_the_help_route() {
   let (mut app, _rx) = app_with_channel();
 
   app.apply(EngineAction::Navigate(NavTarget::Help));
   assert_eq!(app.get_current_route().id, RouteId::HelpMenu);
-
-  app.apply(EngineAction::Navigate(NavTarget::Lyrics));
-  assert_eq!(app.get_current_route().id, RouteId::LyricsView);
 }
 
 #[test]
@@ -932,7 +929,6 @@ fn theme_color(theme: &Theme, field: ThemeField) -> Color {
     ThemeField::Text => theme.text,
     ThemeField::Background => theme.background,
     ThemeField::Header => theme.header,
-    ThemeField::HighlightedLyrics => theme.highlighted_lyrics,
     ThemeField::AnalysisBar => theme.analysis_bar,
     ThemeField::AnalysisBarText => theme.analysis_bar_text,
   }

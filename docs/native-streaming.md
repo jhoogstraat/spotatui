@@ -89,7 +89,6 @@ This feature uses Apple's `MPRemoteCommandCenter` API and is enabled by default 
 When using native streaming on Windows, spotatui registers with the [System Media Transport Controls](https://learn.microsoft.com/en-us/uwp/api/windows.media.systemmediatransportcontrols) (SMTC), enabling:
 
 - **Media key support** - Play/pause, next, previous via keyboard media keys
-- **Media overlay integration** - Track title, artist, album, and cover art appear in the Windows volume flyout / media overlay
 - **Transport controls** - Play, pause, next, previous, stop, and seek requests from the OS are routed back into spotatui
 
 This feature uses the `smtc-tokio` crate and is enabled by default on Windows builds with native streaming.

@@ -267,7 +267,7 @@ impl Runtime {
     }
 
     // The tick thread owns `Driver`, which is deliberately `!Send` (the Lua
-    // scripting engine is thread-local). Run it on a dedicated OS thread with
+    // Runtime state is thread-local. Run it on a dedicated OS thread with
     // a current-thread reactor; everything it shares (`Arc<Mutex<App>>`, the
     // shutdown watch, the tick-wake notify) is `Send`.
     let (tick_done_tx, tick_done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -587,8 +587,6 @@ async fn driver_loop(
         elapsed,
         crate::core::driver::TickEnv {
           now: Instant::now(),
-          #[cfg(feature = "art-decode")]
-          cover_art_full_image_support: false,
         },
       );
       // Tick-produced changes (notice expiry) republish via the
@@ -1544,25 +1542,6 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         app.set_status_message(message, 6);
       }
     },
-    SessionFact::Lyrics {
-      identity,
-      lyrics,
-      synced,
-      found,
-    } => {
-      // Re-gate on the track-change detector's identity (the old inline
-      // stale-check before every write): a fetch for a song that is no
-      // longer wanted must not land.
-      if app.desired_lyrics_identity.as_ref() == Some(&identity) {
-        if found {
-          app.lyrics = lyrics;
-          app.lyrics_synced = synced;
-          app.lyrics_status = crate::core::app::LyricsStatus::Found;
-        } else {
-          app.lyrics_status = crate::core::app::LyricsStatus::NotFound;
-        }
-      }
-    }
     SessionFact::GlobalSongCount { count, failed } => {
       if let Some(count) = count {
         app.global_song_count = Some(count);

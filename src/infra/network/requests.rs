@@ -130,12 +130,11 @@ fn truncate_for_log(body: &str) -> String {
 /// reused; building one per request (the previous behavior) discarded keep-alive
 /// connections and forced a fresh TLS handshake on every call. The client is
 /// internally reference-counted, so the returned `&'static` reference is shared
-/// cheaply across all request paths (Spotify API, friends relay, telemetry,
-/// lyrics).
+/// cheaply across all request paths (Spotify API and telemetry).
 pub fn shared_http_client() -> &'static reqwest::Client {
   SHARED_HTTP_CLIENT.get_or_init(|| {
-    // Spotify API (and the friends relay / lyrics / telemetry paths that share
-    // this client) all return bounded, non-streaming responses, so a blanket
+    // Spotify API and telemetry paths return bounded, non-streaming responses,
+    // so a blanket
     // request timeout is safe here. Without one, a post-connect read stall
     // (captive portal, half-open TCP, an edge that accepts then sends nothing)
     // makes `send()`/`text()` await forever on the serial IoEvent pump and

@@ -61,7 +61,6 @@ pub struct Theme {
   pub text: Color,
   pub background: Color,
   pub header: Color,
-  pub highlighted_lyrics: Color,
 }
 
 impl Default for Theme {
@@ -87,7 +86,6 @@ impl Default for Theme {
       text: Color::Reset,
       background: Color::Reset,
       header: Color::Reset,
-      highlighted_lyrics: Color::Rgb(0, 200, 200), // LightCyan equivalent
     }
   }
 }
@@ -118,7 +116,6 @@ pub enum ThemeField {
   Text,
   Background,
   Header,
-  HighlightedLyrics,
   AnalysisBar,
   AnalysisBarText,
 }
@@ -126,7 +123,7 @@ pub enum ThemeField {
 #[allow(dead_code)]
 impl ThemeField {
   /// Every field, in the order the Lua API has always advertised them.
-  pub const ALL: [ThemeField; 18] = [
+  pub const ALL: [ThemeField; 17] = [
     ThemeField::Active,
     ThemeField::Banner,
     ThemeField::ErrorBorder,
@@ -142,7 +139,6 @@ impl ThemeField {
     ThemeField::Text,
     ThemeField::Background,
     ThemeField::Header,
-    ThemeField::HighlightedLyrics,
     ThemeField::AnalysisBar,
     ThemeField::AnalysisBarText,
   ];
@@ -165,7 +161,6 @@ impl ThemeField {
       ThemeField::Text => "text",
       ThemeField::Background => "background",
       ThemeField::Header => "header",
-      ThemeField::HighlightedLyrics => "highlighted_lyrics",
       ThemeField::AnalysisBar => "analysis_bar",
       ThemeField::AnalysisBarText => "analysis_bar_text",
     }
@@ -201,7 +196,6 @@ impl Theme {
       text: _,
       background: _,
       header: _,
-      highlighted_lyrics: _,
     } = *self;
     match field {
       ThemeField::Active => self.active = color,
@@ -219,7 +213,6 @@ impl Theme {
       ThemeField::Text => self.text = color,
       ThemeField::Background => self.background = color,
       ThemeField::Header => self.header = color,
-      ThemeField::HighlightedLyrics => self.highlighted_lyrics = color,
       ThemeField::AnalysisBar => self.analysis_bar = color,
       ThemeField::AnalysisBarText => self.analysis_bar_text = color,
     }
@@ -354,7 +347,6 @@ impl ThemePreset {
         text: Color::Reset,
         background: Color::Reset,
         header: Color::Reset,
-        highlighted_lyrics: Color::Cyan,
       },
       ThemePreset::PookiePink => Theme {
         analysis_bar: Color::Rgb(255, 255, 255),         // White
@@ -374,7 +366,6 @@ impl ThemePreset {
         text: Color::Rgb(255, 255, 255),                 // White
         background: Color::Rgb(245, 115, 180),           // Pink background
         header: Color::Rgb(255, 255, 255),               // White
-        highlighted_lyrics: Color::Rgb(255, 230, 245),   // Light pink-white
       },
       ThemePreset::Vesper => Theme {
         analysis_bar: Color::Rgb(153, 255, 228),     // Mint (#99FFE4)
@@ -394,7 +385,6 @@ impl ThemePreset {
         text: Color::Rgb(255, 255, 255),             // White
         background: Color::Rgb(16, 16, 16),          // Base bg (#101010)
         header: Color::Rgb(255, 255, 255),           // White
-        highlighted_lyrics: Color::Rgb(153, 255, 228), // Mint
       },
       ThemePreset::Dracula => Theme {
         analysis_bar: Color::Rgb(189, 147, 249),      // Purple
@@ -413,8 +403,7 @@ impl ThemePreset {
         selected: Color::Rgb(139, 233, 253), // Cyan
         text: Color::Rgb(248, 248, 242),
         background: Color::Reset,
-        header: Color::Rgb(255, 121, 198),             // Pink
-        highlighted_lyrics: Color::Rgb(255, 121, 198), // Pink
+        header: Color::Rgb(255, 121, 198), // Pink
       },
       ThemePreset::Nord => Theme {
         analysis_bar: Color::Rgb(136, 192, 208),      // Nord8 (frost)
@@ -434,7 +423,6 @@ impl ThemePreset {
         text: Color::Rgb(236, 239, 244),     // Nord6
         background: Color::Reset,
         header: Color::Rgb(136, 192, 208),
-        highlighted_lyrics: Color::Rgb(136, 192, 208), // Nord8 (frost)
       },
       ThemePreset::SolarizedDark => Theme {
         analysis_bar: Color::Rgb(38, 139, 210),       // Blue
@@ -454,7 +442,6 @@ impl ThemePreset {
         text: Color::Rgb(147, 161, 161),         // Base1
         background: Color::Reset,
         header: Color::Rgb(38, 139, 210),
-        highlighted_lyrics: Color::Rgb(38, 139, 210), // Blue
       },
       ThemePreset::Monokai => Theme {
         analysis_bar: Color::Rgb(102, 217, 239),      // Cyan
@@ -474,7 +461,6 @@ impl ThemePreset {
         text: Color::Rgb(248, 248, 242),
         background: Color::Reset,
         header: Color::Rgb(249, 38, 114),
-        highlighted_lyrics: Color::Rgb(249, 38, 114), // Pink
       },
       ThemePreset::Gruvbox => Theme {
         analysis_bar: Color::Rgb(131, 165, 152),      // Aqua
@@ -493,8 +479,7 @@ impl ThemePreset {
         selected: Color::Rgb(131, 165, 152), // Aqua
         text: Color::Rgb(235, 219, 178),     // fg
         background: Color::Reset,
-        header: Color::Rgb(254, 128, 25),             // Orange
-        highlighted_lyrics: Color::Rgb(254, 128, 25), // Orange
+        header: Color::Rgb(254, 128, 25), // Orange
       },
       ThemePreset::GruvboxLight => Theme {
         analysis_bar: Color::Rgb(66, 123, 88),     // Aqua
@@ -513,8 +498,7 @@ impl ThemePreset {
         selected: Color::Rgb(66, 123, 88), // Aqua
         text: Color::Rgb(60, 56, 54),      // fg
         background: Color::Rgb(251, 241, 199),
-        header: Color::Rgb(175, 58, 3),             // Orange
-        highlighted_lyrics: Color::Rgb(175, 58, 3), // Orange
+        header: Color::Rgb(175, 58, 3), // Orange
       },
       ThemePreset::CatppuccinMocha => Theme {
         analysis_bar: Color::Rgb(166, 227, 161),      // Green
@@ -533,8 +517,7 @@ impl ThemePreset {
         selected: Color::Rgb(180, 190, 254),         // Lavender
         text: Color::Rgb(205, 214, 244),             // Text
         background: Color::Reset,
-        header: Color::Rgb(180, 190, 254),             // Lavender
-        highlighted_lyrics: Color::Rgb(180, 190, 254), // Lavender
+        header: Color::Rgb(180, 190, 254), // Lavender
       },
       ThemePreset::Spotify => Theme {
         analysis_bar: Color::Rgb(29, 185, 84), // Spotify Green #1DB954
@@ -553,8 +536,7 @@ impl ThemePreset {
         selected: Color::Rgb(29, 185, 84),       // Spotify Green
         text: Color::Rgb(255, 255, 255),         // White
         background: Color::Reset,
-        header: Color::Rgb(29, 185, 84),             // Spotify Green
-        highlighted_lyrics: Color::Rgb(29, 185, 84), // Spotify Green
+        header: Color::Rgb(29, 185, 84), // Spotify Green
       },
       ThemePreset::TokyoNight => Theme {
         analysis_bar: Color::Rgb(122, 162, 247), //Darker blue #7aa2f7
@@ -574,7 +556,6 @@ impl ThemePreset {
         text: Color::Rgb(169, 177, 214),         // Light purple #a9b1d6
         background: Color::Rgb(36, 40, 59),      // Gray #24283b
         header: Color::Rgb(122, 162, 247),       // Blue #7aa2f7,
-        highlighted_lyrics: Color::Rgb(42, 195, 222), // Light blue #2ac3de
       },
       ThemePreset::Custom => Theme::default(), // Won't be used directly
     }
@@ -785,7 +766,6 @@ mod tests {
       theme.text,
       theme.background,
       theme.header,
-      theme.highlighted_lyrics,
     ] {
       assert_eq!(parse_theme_item(&color_to_string(color)).unwrap(), color);
     }

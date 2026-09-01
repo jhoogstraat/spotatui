@@ -436,15 +436,6 @@ pub enum SessionFact {
   /// The signed-in profile response (the old `get_user`'s `app.user` write).
   /// `Err` surfaces the rate-limit notice through the same fold sink.
   User(Result<crate::core::app::UserInfo, String>),
-  /// A finished lyrics fetch. The fold re-gates on `desired_lyrics_identity`
-  /// (the old inline stale-check) before applying; the loading-half claim is
-  /// [`FoldQuery::ClaimLyricsFetch`].
-  Lyrics {
-    identity: (String, String),
-    lyrics: Option<Vec<(u128, String)>>,
-    synced: bool,
-    found: bool,
-  },
   /// The global play counter (telemetry read; `None` = fetch failed).
   GlobalSongCount {
     count: Option<u64>,
@@ -878,7 +869,6 @@ impl std::fmt::Debug for SessionFact {
       #[cfg(feature = "dj-core")]
       SessionFact::DjStep(step) => f.debug_tuple("DjStep").field(step).finish(),
       SessionFact::User(result) => f.debug_tuple("User").field(&result.is_ok()).finish(),
-      SessionFact::Lyrics { identity, .. } => f.debug_tuple("Lyrics").field(identity).finish(),
       SessionFact::GlobalSongCount { count, failed } => f
         .debug_struct("GlobalSongCount")
         .field("count", &count.is_some())
@@ -943,8 +933,7 @@ impl EngineEvent {
 
 /// What the embedder asks the engine to do. The single input vocabulary:
 /// `player-core::Command` maps one-to-one here (the fork's `Action` enum was
-/// the terminal UI's input shape and stays internal where other in-process
-/// producers — DJ tools, scripting effects — still speak it).
+/// the terminal UI's input shape and stays internal to in-process producers).
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineCommand {
   /// Start playing this resolved playable (`spotify:track:…` URIs etc.).

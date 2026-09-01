@@ -363,7 +363,7 @@ pub struct DecodedQueuePlayback {
   /// The output-device sink. Shared (`Arc::ptr_eq`) with the suspended context's
   /// player when there is one, so no second device is opened.
   pub player: std::sync::Arc<crate::infra::audio::LocalPlayer>,
-  /// The queued track's metadata (drives the playbar / MPRIS / cover art).
+  /// The queued track's metadata (drives the playbar and MPRIS).
   pub track: crate::core::plugin_api::TrackInfo,
   /// Guards the empty-sink window during a queue advance from being read as
   /// end-of-track by the runner tick (mirrors the per-source `advancing` guard).

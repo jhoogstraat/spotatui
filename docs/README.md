@@ -12,7 +12,6 @@ Detailed documentation for [spotatui](https://github.com/LargeModGames/spotatui)
 
 - **[Themes](themes.md)** - Built-in presets and custom color schemes
 - **[Native Streaming](native-streaming.md)** - Play music directly without the Spotify app
-- **[Scripting](scripting.md)** - Lua plugin API for extending spotatui
 
 ## Development
 

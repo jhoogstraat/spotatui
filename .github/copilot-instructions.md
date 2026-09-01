@@ -6,10 +6,9 @@ This file is maintained as three near-identical copies: `CLAUDE.md`, `AGENTS.md`
 ## Build & Run
 
 ```bash
-# Full build (native streaming + audio viz + Lua scripting + OS integrations)
 cargo run
 
-# Slim build - no librespot/audio/scripting; fastest iteration, one of CI's legs
+# Slim build - no librespot; fastest iteration, one of CI's legs
 cargo run --no-default-features --features telemetry
 
 # With the free alternative sources (Local/Subsonic/Radio/YouTube). These are NOT
@@ -83,7 +82,6 @@ units under `src/`:
 | Unit | Role |
 |------|------|
 | `core/` | Centralized state (`App`), the frontend-neutral tick scheduler (`driver/`), the shared action vocabulary (`action/`), config/state persistence, and the rspotify-free domain types (`plugin_api`, `pagination`, `source`) |
-| `infra/` | Spotify Web API (`network/`), native librespot streaming (`player/`), alternative sources (`local/`, `subsonic/`, `radio/`, `youtube/`, `queue/`), audio viz (`audio/`), Lua scripting (`scripting/`), AI DJ + MCP (`dj/`, `mcp/`), OS integrations (Discord RPC, MPRIS, macOS/Windows media) |
 | `cli/` | clap subcommands: playback control, listening history, self-update, MCP relay, plugin management |
 | `runtime/` | `mod.rs::run_cli` (entry point + CLI dispatch), `bootstrap.rs::boot` (frontend-neutral config/auth/`App` construction, `run_cli` its sole caller), `cli.rs` (clap assembly + self-update), `pump.rs::start_tokio` (the IoEvent pump), `startup.rs` (shared service startup), `frontend/` (the embedded runtime seam) |
 
@@ -248,7 +246,6 @@ cooldown) - don't "fix" that by escalating on first failure.
 `src/core/action/` holds `Action` (one enum of frontend-neutral state
 changes), `App::apply` (the single write path, in `core/action/apply.rs`),
 and `ActionOutcome`. Producers that are not the network layer's own result
-handling mutate `App` via `app.apply(Action::…)`: the Lua scripting engine
 drains its queued actions into it, the mutating DJ/MCP tools call it
 directly, and TUI handlers adopt it as the conversion sub-PRs land
 (`action_refs_in_tui_handlers` may only rise). Rules:
@@ -372,22 +369,16 @@ never config:
 
 - `default` = `telemetry, streaming, macos-media, windows-media, mpris,
   discord-rpc, self-update`. Notably **not**
-  in default: `cover-art` (so a plain `cargo run` has no album art, though
   every shipped binary enables it), the four sources, and the DJ features.
 - The terminal frontend's `tui` feature and its crates (ratatui, crossterm,
   tui-bar-graph) were deleted in ADR 0016 ticket 01. `gui` remains a reserved
   placeholder that only gates the `spotatui-gui` bin shim.
-- Cover art is two features: `art-decode` is the frontend-agnostic decode half
-  (`dep:image`, fills `core::art::CoverArtStore`, feeds the adaptive theme;
-  never enabled by hand); `cover-art` now adds only the ratatui-image-free
   rendering plumbing and keeps its historical name for users and CI.
 - `audio-decode` (rodio) is the shared engine pulled in by the sources;
   `all-sources` = `local-files, subsonic, internet-radio, youtube`.
 - `dj-core` is a shared implementation feature pulled in by `mcp-server` and
   `ai-dj`; none of the three are in `default`, and neither front door may assume
   the other (or `streaming`) is present.
-- `scripting` (mlua Lua plugins) is default-on and gates `src/infra/scripting/` +
-  `src/cli/plugin.rs`; the slim gate never compiles it, so verify scripting
   changes with a default `cargo test`.
 
 ### Adding a feature-gated sidebar row
@@ -397,7 +388,6 @@ See `.claude/skills/add-tui-screen/SKILL.md`.
 ### Domain-specific conventions
 
 `src/infra/dj/CLAUDE.md` (DJ lanes/guards/avoid-library filter),
-`src/infra/mcp/CLAUDE.md` (MCP server), `src/infra/scripting/CLAUDE.md` (Lua
 plugins), and `src/cli/CLAUDE.md` (CLI subcommands) load automatically when
 working in those directories.
 

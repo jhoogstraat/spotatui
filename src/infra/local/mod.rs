@@ -388,8 +388,6 @@ fn track_info_from_path(path: &Path) -> TrackInfo {
         is_local: true,
         track_number: 0,
         explicit: false,
-        // Cover art for local files is read from the file's embedded picture on
-        // demand (see `extract_embedded_cover`), not carried as a URL here.
         image_url: None,
       };
     }
@@ -496,27 +494,6 @@ pub(crate) fn file_uri_to_path(uri: &str) -> Result<PathBuf> {
   url
     .to_file_path()
     .map_err(|_| anyhow::anyhow!("URI is not a valid file:// path: {uri}"))
-}
-
-/// Decode the first embedded cover-art picture from a local audio file into an
-/// image, for the cover-art pane. Reads tags via `lofty` (synchronous file I/O
-/// and image decode), so callers must run this on a blocking thread rather than
-/// the async runtime. Returns an error when the file has no embedded artwork.
-///
-/// Gated on both `local-files` (for `lofty`) and `art-decode` (for `image`), so
-/// builds enabling only one of them do not pull in the other's dependency.
-#[cfg(feature = "art-decode")]
-pub(crate) fn extract_embedded_cover(path: &Path) -> Result<image::DynamicImage> {
-  let tagged = read_from_path(path).with_context(|| format!("reading tags from {:?}", path))?;
-  let tag = tagged
-    .primary_tag()
-    .or_else(|| tagged.first_tag())
-    .context("file has no tags")?;
-  let picture = tag
-    .pictures()
-    .first()
-    .context("file has no embedded cover art")?;
-  image::load_from_memory(picture.data()).context("decoding embedded cover art")
 }
 
 /// Count audio files (non-recursively) in `dir`.

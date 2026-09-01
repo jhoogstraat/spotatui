@@ -257,21 +257,6 @@ pub enum PluginLength {
   Percent(u16),
 }
 
-/// How a [`PluginWidgetKind::CoverArt`] image is scaled into its area.
-///
-/// `Crop` (CSS `cover`) is deliberately not offered: the terminal image
-/// renderer documents that cropping overdraws characters over graphics and
-/// that some terminals misbehave when it does (Alacritty's sixel branch is
-/// named explicitly).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum PluginCoverArtFit {
-  /// Fit inside the area, keeping the aspect ratio, never upscaling.
-  #[default]
-  Contain,
-  /// Like `Contain` but upscales an image smaller than the area.
-  Scale,
-}
-
 /// A widget in a [`PluginScreenContent`].
 ///
 /// `width`/`height` are per-axis size hints; only the one matching the parent
@@ -316,11 +301,6 @@ pub enum PluginWidgetKind {
     /// 0.0..=1.0 (clamped at the API layer).
     ratio: f64,
     label: Option<String>,
-  },
-  /// The current track's cover art, rendered from the app's already-decoded
-  /// in-memory image. At most one may appear per screen.
-  CoverArt {
-    fit: PluginCoverArtFit,
   },
   Row {
     children: Vec<PluginWidget>,
@@ -367,22 +347,6 @@ pub struct QueueSnapshot {
   pub currently_playing: Option<QueueItemSnapshot>,
   #[serde(default)]
   pub items: Vec<QueueItemSnapshot>,
-}
-
-/// A single timestamped lyrics line.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LyricsLineSnapshot {
-  pub time_ms: u64,
-  pub text: String,
-}
-
-/// Lyrics for the current track as exposed to plugins.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct LyricsSnapshot {
-  /// One of `"not_started"`, `"loading"`, `"found"`, `"not_found"`.
-  pub status: String,
-  #[serde(default)]
-  pub lines: Vec<LyricsLineSnapshot>,
 }
 
 /// Safe, plugin-visible behavior settings. Secrets and service credentials
@@ -439,7 +403,6 @@ pub fn config_snapshot(
     ("error_border", t.error_border),
     ("error_text", t.error_text),
     ("header", t.header),
-    ("highlighted_lyrics", t.highlighted_lyrics),
     ("hint", t.hint),
     ("hovered", t.hovered),
     ("inactive", t.inactive),
@@ -622,8 +585,6 @@ pub fn route_name(route: &crate::core::app::Route) -> String {
     RouteId::AlbumTracks => "album_tracks",
     RouteId::AlbumList => "album_list",
     RouteId::Artist => "artist",
-    RouteId::LyricsView => "lyrics",
-    RouteId::CoverArtView => "cover_art",
     RouteId::MiniPlayer => "miniplayer",
     RouteId::Error => "error",
     RouteId::Home => "home",
@@ -758,62 +719,6 @@ pub fn search_results_snapshot(app: &App) -> SearchResults {
       .shows
       .as_ref()
       .map(|p| p.items.clone())
-      .unwrap_or_default(),
-  }
-}
-
-/// Whether `app.lyrics`/`app.lyrics_status` describe the item playing *right now*.
-///
-/// The driver's shared track-change detector runs **after** the script engine's
-/// tick, so on the tick a track changes the lyrics state still belongs to the
-/// previous track. Without this check, `spotatui.get_lyrics` called from a
-/// `track_change` handler - the obvious place to call it - sees a terminal
-/// status, resolves synchronously, and hands the plugin the *previous* track's
-/// lyrics; the one-shot callback is then spent by the time the real ones land.
-///
-/// `desired_lyrics_identity` is the detector's record of which item it last
-/// published lyrics state for, so comparing it against the live snapshot
-/// detects exactly that window.
-pub fn lyrics_state_is_current(app: &App) -> bool {
-  use crate::infra::media_metadata::PlaybackItemKind;
-  match current_playback_snapshot(app) {
-    // Nothing playing: the detector clears the identity.
-    None => app.desired_lyrics_identity.is_none(),
-    Some(snapshot) => match snapshot.item_kind {
-      PlaybackItemKind::Track => {
-        app.desired_lyrics_identity
-          == Some((snapshot.metadata.title.clone(), snapshot.primary_artist()))
-      }
-      // Episodes get no lookup at all; the detector clears the identity and
-      // publishes `NotFound` for them.
-      PlaybackItemKind::Episode => app.desired_lyrics_identity.is_none(),
-    },
-  }
-}
-
-/// Lyrics for the current track, with the fetch status spelled out.
-pub fn lyrics_snapshot(app: &App) -> LyricsSnapshot {
-  use crate::core::app::LyricsStatus;
-  let status = match app.lyrics_status {
-    LyricsStatus::NotStarted => "not_started",
-    LyricsStatus::Loading => "loading",
-    LyricsStatus::Found => "found",
-    LyricsStatus::NotFound => "not_found",
-  };
-  LyricsSnapshot {
-    status: status.to_string(),
-    lines: app
-      .lyrics
-      .as_ref()
-      .map(|lines| {
-        lines
-          .iter()
-          .map(|(time_ms, text)| LyricsLineSnapshot {
-            time_ms: *time_ms as u64,
-            text: text.clone(),
-          })
-          .collect()
-      })
       .unwrap_or_default(),
   }
 }

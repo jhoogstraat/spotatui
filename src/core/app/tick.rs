@@ -77,22 +77,6 @@ impl App {
   pub fn update_on_tick(&mut self, elapsed: Duration) {
     self.last_tick_at = Instant::now();
 
-    // Advance an adaptive-theme fade. Real elapsed time, not tick count, so
-    // the fade speed is independent of the configured tick rates.
-    #[cfg(feature = "art-decode")]
-    if let Some(transition) = self.theme_transition.as_mut() {
-      transition.advance(elapsed);
-      self.user_config.theme = transition.current();
-      if transition.is_complete() {
-        self.theme_transition = None;
-        // A finished fade-out means the user's own theme is back in place.
-        if let crate::core::cover_theme::CoverThemeState::Restoring { .. } = self.cover_theme_state
-        {
-          self.cover_theme_state = crate::core::cover_theme::CoverThemeState::Inactive;
-        }
-      }
-    }
-
     if let Some(expires_at) = self.status_message_expires_at {
       if Instant::now() >= expires_at {
         self.status_message = None;

@@ -118,10 +118,6 @@ impl Default for App {
 
       active_announcement: None,
       pending_announcements: Vec::new(),
-      lyrics: None,
-      lyrics_status: LyricsStatus::default(),
-      desired_lyrics_identity: None,
-      lyrics_synced: false,
       global_song_count: None,
       global_song_count_failed: false,
       // Settings defaults

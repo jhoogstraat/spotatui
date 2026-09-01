@@ -42,7 +42,6 @@ theme:
   text: "205, 214, 244"
   header: "255, 255, 255"
   background: "30, 30, 46"
-  highlighted_lyrics: "166, 227, 161"
 ```
 
 ### Color Values

@@ -182,7 +182,6 @@ pub fn current_playback_snapshot(app: &App) -> Option<PlaybackSnapshot> {
 fn source_playback_snapshot(app: &App) -> Option<PlaybackSnapshot> {
   // The native queue slot playing a decoded track wins over every per-source
   // context: it is what is actually audible, and it drives the playbar / MPRIS /
-  // cover art / lyrics via the shared track-change detector.
   #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
   if let Some(crate::infra::queue::QueueNowPlaying::Decoded(d)) = app.queue_now.as_ref() {
     let mut snapshot = source_snapshot(
@@ -280,7 +279,6 @@ fn source_playback_snapshot(app: &App) -> Option<PlaybackSnapshot> {
       radio.station.album.clone(),
       0,
       radio.station.uri.clone(),
-      // Live radio streams carry no per-track cover art.
       None,
       radio.player.position().as_millis(),
       !radio.player.is_paused(),

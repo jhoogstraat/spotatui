@@ -96,7 +96,6 @@ impl From<&FullTrack> for TrackInfo {
       is_local: t.is_local,
       track_number: t.track_number,
       explicit: t.explicit,
-      // Spotify cover art is resolved separately from album images, not here.
       image_url: None,
     }
   }
@@ -125,7 +124,6 @@ impl From<&SimplifiedTrack> for TrackInfo {
       is_local: t.is_local,
       track_number: t.track_number,
       explicit: t.explicit,
-      // Spotify cover art is resolved separately from album images, not here.
       image_url: None,
     }
   }
@@ -399,7 +397,7 @@ mod tests {
     let ft = full_track("4uLU6hMCjMI75M1A2tKUQC", "Never Gonna Give You Up");
     let info = TrackInfo::from(&ft);
 
-    // Scripting-contract fields (must keep working for api_version = 4).
+    // Extended API fields.
     assert_eq!(info.name, "Never Gonna Give You Up");
     assert_eq!(info.artists, vec!["Test Artist".to_string()]);
     assert_eq!(info.album, "Test Album");

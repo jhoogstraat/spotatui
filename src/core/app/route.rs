@@ -59,8 +59,6 @@ pub enum ActiveBlock {
   TrackTable,
   Discover,
   Artists,
-  LyricsView,
-  CoverArtView,
   MiniPlayer,
   Dialog(DialogContext),
 
@@ -96,8 +94,6 @@ pub enum RouteId {
   AlbumTracks,
   AlbumList,
   Artist,
-  LyricsView,
-  CoverArtView,
   MiniPlayer,
   Error,
   Home,

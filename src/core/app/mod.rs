@@ -73,11 +73,7 @@ mod construction;
 // wholesale, but three of its methods are production state, not presentation
 // (DJ queue bookkeeping + the AI-DJ screen opener reachable from OpenLibrary).
 mod dj;
-// Cover-art store + adaptive-theme syncing (stage 2a dropped the file with the
-// TUI; the all-sources leg still calls store/clear_cover_art from the network
-// layer and driver).
 mod library;
-mod lyrics;
 mod models;
 mod native_backend;
 mod native_recovery;
@@ -104,7 +100,6 @@ mod volume;
 mod test_support;
 
 pub use library::*;
-pub use lyrics::*;
 pub use models::*;
 pub use native_backend::*;
 #[cfg(feature = "streaming")]
@@ -309,14 +304,6 @@ pub struct App {
 
   pub active_announcement: Option<Announcement>,
   pub pending_announcements: Vec<Announcement>,
-  pub lyrics: Option<Vec<(u128, String)>>,
-  pub lyrics_status: LyricsStatus,
-  /// Title/artist pair whose lyrics response is currently desired. Detached
-  /// service responses must match this before mutating visible state.
-  pub desired_lyrics_identity: Option<(String, String)>,
-  /// Whether the current `lyrics` carry real LRC timestamps rather than
-  /// synthesized evenly-spaced ones derived from plain lyrics.
-  pub lyrics_synced: bool,
   pub global_song_count: Option<u64>,
   pub global_song_count_failed: bool,
   // Settings screen state

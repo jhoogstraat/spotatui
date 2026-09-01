@@ -5,8 +5,6 @@
 //! inputs. The driver probes live state (`player.is_finished()`, `Instant`),
 //! asks these functions what to do, then applies the answer.
 
-#[cfg(feature = "art-decode")]
-use crate::core::art::CoverArtStatus;
 #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
 use crate::infra::queue::{advance_decision, Decision, RepeatMode};
 
@@ -53,48 +51,6 @@ pub(super) fn decoded_advance(
     Decision::SuspendToQueue => DecodedAdvance::SuspendToQueue,
     Decision::Teardown => DecodedAdvance::Teardown,
     Decision::None => DecodedAdvance::None,
-  }
-}
-
-/// What the per-tick cover-art evaluation should do. See the call site for why
-/// this re-evaluates every tick against the desired key instead of latching to
-/// the track identity.
-#[cfg(feature = "art-decode")]
-#[derive(Debug, PartialEq)]
-pub(super) enum CoverArtAction {
-  /// New art resolved: latch its key, mark it loading, dispatch the fetch.
-  Fetch,
-  /// Same art as already requested: leave everything alone.
-  Keep,
-  /// No art to show (radio, art disabled, nothing playing): drop any stale
-  /// image once, then show `status` in the pane.
-  Drop { clear: bool, status: CoverArtStatus },
-}
-
-#[cfg(feature = "art-decode")]
-pub(super) fn cover_art_action(
-  desired_key: Option<&str>,
-  last_requested_key: Option<&str>,
-  art_loaded: bool,
-  enabled: bool,
-  snapshot_present: bool,
-) -> CoverArtAction {
-  match desired_key {
-    Some(key) => {
-      if last_requested_key == Some(key) {
-        CoverArtAction::Keep
-      } else {
-        CoverArtAction::Fetch
-      }
-    }
-    None => CoverArtAction::Drop {
-      clear: last_requested_key.is_some() || art_loaded,
-      status: if enabled && snapshot_present {
-        CoverArtStatus::Unavailable
-      } else {
-        CoverArtStatus::NotStarted
-      },
-    },
   }
 }
 
@@ -158,83 +114,6 @@ mod tests {
       assert_eq!(
         decoded_advance(false, false, true, 0, RepeatMode::Off),
         DecodedAdvance::None
-      );
-    }
-  }
-
-  #[cfg(feature = "art-decode")]
-  mod cover_art {
-    use super::*;
-
-    #[test]
-    fn newly_resolved_art_fetches_and_unchanged_art_keeps() {
-      assert_eq!(
-        cover_art_action(Some("url-a"), None, false, true, true),
-        CoverArtAction::Fetch
-      );
-      assert_eq!(
-        cover_art_action(Some("url-a"), Some("url-a"), true, true, true),
-        CoverArtAction::Keep
-      );
-    }
-
-    #[test]
-    fn art_resolving_late_still_fetches() {
-      // Native streaming: the snapshot's image_url catches up seconds after
-      // the track identity flips, so the desired key appears (or changes)
-      // ticks later. The key comparison, not an identity latch, must fire.
-      assert_eq!(
-        cover_art_action(None, None, false, true, true),
-        CoverArtAction::Drop {
-          clear: false,
-          status: CoverArtStatus::Unavailable
-        }
-      );
-      assert_eq!(
-        cover_art_action(Some("real-url"), None, false, true, true),
-        CoverArtAction::Fetch
-      );
-      assert_eq!(
-        cover_art_action(Some("next-url"), Some("real-url"), true, true, true),
-        CoverArtAction::Fetch
-      );
-    }
-
-    #[test]
-    fn losing_the_art_drops_the_stale_image_once() {
-      // A track with art was playing; now radio (no art) is: clear once...
-      assert_eq!(
-        cover_art_action(None, Some("url-a"), true, true, true),
-        CoverArtAction::Drop {
-          clear: true,
-          status: CoverArtStatus::Unavailable
-        }
-      );
-      // ...and quiet ticks afterwards have nothing left to clear.
-      assert_eq!(
-        cover_art_action(None, None, false, true, true),
-        CoverArtAction::Drop {
-          clear: false,
-          status: CoverArtStatus::Unavailable
-        }
-      );
-    }
-
-    #[test]
-    fn disabled_art_and_silence_read_as_not_started() {
-      assert_eq!(
-        cover_art_action(None, Some("url-a"), true, false, true),
-        CoverArtAction::Drop {
-          clear: true,
-          status: CoverArtStatus::NotStarted
-        }
-      );
-      assert_eq!(
-        cover_art_action(None, None, false, true, false),
-        CoverArtAction::Drop {
-          clear: false,
-          status: CoverArtStatus::NotStarted
-        }
       );
     }
   }

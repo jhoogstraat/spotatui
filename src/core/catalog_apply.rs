@@ -266,7 +266,7 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         app.library.saved_artists.add_pages(page.clone());
       }
       // No plugin-data bump: followed artists never had a kind (the old
-      // inline write bumped nothing either); scripting reads it via the
+      // inline write bumped nothing either); consumers read it via the
       // artists cache refresh instead.
       CatalogOutcome {
         library_page_upserted: true,

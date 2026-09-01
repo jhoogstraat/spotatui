@@ -429,29 +429,6 @@ impl App {
               .unwrap_or_default(),
           ),
         },
-        #[cfg(feature = "cover-art")]
-        SettingItem {
-          id: "behavior.draw_cover_art".to_string(),
-          name: "Draw Cover Art".to_string(),
-          description: "Enable rendering song/episode cover art".to_string(),
-          value: SettingValue::Bool(self.user_config.behavior.draw_cover_art),
-        },
-        #[cfg(feature = "cover-art")]
-        SettingItem {
-          id: "behavior.draw_cover_art_forced".to_string(),
-          name: "Force Draw Cover Art".to_string(),
-          description: "Force rendering of cover art despite terminal support".to_string(),
-          value: SettingValue::Bool(self.user_config.behavior.draw_cover_art_forced),
-        },
-        #[cfg(feature = "cover-art")]
-        SettingItem {
-          id: "behavior.playbar_cover_art_size_percent".to_string(),
-          name: "Cover Art Size".to_string(),
-          description: "Playbar cover art size as a percentage (25-200)".to_string(),
-          value: SettingValue::Number(
-            self.user_config.behavior.playbar_cover_art_size_percent as i64,
-          ),
-        },
       ],
       SettingsCategory::Icons => vec![
         SettingItem {
@@ -724,23 +701,10 @@ impl App {
           value: SettingValue::Key(key_to_string(&self.user_config.keys.audio_analysis)),
         },
         SettingItem {
-          id: "keys.lyrics_view".to_string(),
-          name: "Lyrics View".to_string(),
-          description: "Open lyrics view".to_string(),
-          value: SettingValue::Key(key_to_string(&self.user_config.keys.lyrics_view)),
-        },
-        SettingItem {
           id: "keys.miniplayer_view".to_string(),
           name: "Miniplayer View".to_string(),
           description: "Toggle full-screen playbar view".to_string(),
           value: SettingValue::Key(key_to_string(&self.user_config.keys.miniplayer_view)),
-        },
-        #[cfg(feature = "cover-art")]
-        SettingItem {
-          id: "keys.cover_art_view".to_string(),
-          name: "Cover Art View".to_string(),
-          description: "Open full-screen cover art view".to_string(),
-          value: SettingValue::Key(key_to_string(&self.user_config.keys.cover_art_view)),
         },
       ],
       SettingsCategory::Theme => {
@@ -773,14 +737,6 @@ impl App {
             description: "Animated RGB gradient on the home banner; off uses the Banner Color"
               .to_string(),
             value: SettingValue::Bool(self.user_config.behavior.banner_gradient),
-          },
-          #[cfg(feature = "art-decode")]
-          SettingItem {
-            id: "behavior.cover_art_theme".to_string(),
-            name: "Adaptive Theme".to_string(),
-            description: "Recolor UI accents from the current cover art, fading on track change"
-              .to_string(),
-            value: SettingValue::Bool(self.user_config.behavior.cover_art_theme),
           },
           SettingItem {
             id: "theme.hint".to_string(),
@@ -847,12 +803,6 @@ impl App {
             name: "Playbar Text".to_string(),
             description: "Color for playbar text".to_string(),
             value: SettingValue::Color(color_to_string(user_theme.playbar_text)),
-          },
-          SettingItem {
-            id: "theme.highlighted_lyrics".to_string(),
-            name: "Lyrics Highlight".to_string(),
-            description: "Color for current lyrics line".to_string(),
-            value: SettingValue::Color(color_to_string(user_theme.highlighted_lyrics)),
           },
           SettingItem {
             id: "theme.background".to_string(),

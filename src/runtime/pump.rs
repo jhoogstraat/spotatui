@@ -26,7 +26,7 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
       }
     };
 
-    // Source-agnostic service events (lyrics, cover art, telemetry,
+    // Source-agnostic service events (telemetry,
     // announcements, friends, stats/recap) only touch `App` and their own HTTP
     // clients — never the Spotify client, pacing, or `Network` state — so they
     // run concurrently on a detached task instead of queueing behind

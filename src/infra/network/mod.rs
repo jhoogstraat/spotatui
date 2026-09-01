@@ -178,7 +178,6 @@ pub enum IoEvent {
   IncrementGlobalSongCount,
   FetchGlobalSongCount,
   FetchAnnouncements,
-  GetLyrics(String, Vec<String>, f64),
   /// Get user's top tracks for Discover feature (with time range)
   /// Get Top Artists Mix - fetches top artists and their top tracks
   /// Fetch all playlist tracks and apply sorting
@@ -414,9 +413,8 @@ impl Network {
   /// run even without a Spotify session (free-source launch). Keep this in sync
   /// with the handlers: an event listed here MUST NOT reach the `spotify()`
   /// accessor. Covered here: auth refresh (a no-op when there is no client),
-  /// source-agnostic services (telemetry, announcements, LRCLIB lyrics, cover
-  /// art), the spotatui.com friends/party features (their own HTTP/relay
-  /// clients), pure-state updates, and the per-source browse events that the
+  /// source-agnostic services (telemetry, announcements), pure-state updates,
+  /// and the per-source browse events that the
   /// source dispatchers handle upstream (only reaching here as no-ops when their
   /// feature is disabled).
   fn event_bypasses_spotify_auth(io_event: &IoEvent) -> bool {
@@ -450,7 +448,6 @@ impl Network {
         | IoEvent::FetchGlobalSongCount
         | IoEvent::IncrementGlobalSongCount
         | IoEvent::FetchAnnouncements
-        | IoEvent::GetLyrics(..)
         | IoEvent::UpdateSearchLimits(..)
         | IoEvent::LoadListeningStats(_)
         | IoEvent::GenerateRecap(_)
@@ -474,8 +471,8 @@ impl Network {
   /// Events that run on the concurrent service lane in `start_tokio`: a strict
   /// subset of [`Self::event_bypasses_spotify_auth`] whose handlers touch only
   /// `self.app` (plus their own HTTP clients / `spawn_blocking`) — never the
-  /// Spotify client, API pacing, or `Network` state (party connection, pending
-  /// login, search limits) — so they can execute on a detached task with a
+  /// Spotify client, API pacing, or pending login/search limits) — so they can
+  /// execute on a detached task with a
   /// throwaway `Network` instead of head-of-line-blocking the serial pump.
   /// Keep in sync with the handlers: an event listed here MUST NOT read or
   /// write anything on `Network` besides `app`.
@@ -492,7 +489,6 @@ impl Network {
       IoEvent::FetchGlobalSongCount
         | IoEvent::IncrementGlobalSongCount
         | IoEvent::FetchAnnouncements
-        | IoEvent::GetLyrics(..)
         | IoEvent::LoadListeningStats(_)
         | IoEvent::GenerateRecap(_)
     )
@@ -837,9 +833,6 @@ impl Network {
       }
       IoEvent::FetchAnnouncements => {
         self.fetch_announcements().await;
-      }
-      IoEvent::GetLyrics(track, artists, duration) => {
-        self.get_lyrics(track, artists, duration).await;
       }
       #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
       IoEvent::DjToolCall(payload) => {
@@ -1272,403 +1265,6 @@ impl Network {
         .await;
     }
   }
-
-  #[cfg(any())]
-  async fn start_party(&mut self, control_mode: sync::ControlMode) {
-    self
-      .emit_session(SessionFact::Party {
-        status: sync::PartyStatus::Connecting,
-        session: None,
-      })
-      .await;
-
-    let relay_url = match self
-      .fold_query(crate::runtime::engine::FoldQuery::PartyRelayUrl)
-      .await
-    {
-      Some(FoldAnswer::StatusText(url)) => url,
-      _ => return,
-    };
-
-    let mode_str = match &control_mode {
-      sync::ControlMode::HostOnly => "host_only",
-      sync::ControlMode::SharedControl => "shared_control",
-    };
-
-    match sync::connect_to_relay(&relay_url, "create", &[("control_mode", mode_str)]).await {
-      Ok((conn, read)) => {
-        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(sync::start_party_reader(read, incoming_tx));
-        self.party_connection = Some(conn);
-        self.party_incoming_rx = Some(incoming_rx);
-
-        self
-          .emit_session(SessionFact::Party {
-            status: sync::PartyStatus::Hosting,
-            session: Some(sync::PartySession {
-              role: sync::PartyRole::Host,
-              code: String::new(),
-              guests: Vec::new(),
-              control_mode,
-              host_name: "Host".to_string(),
-            }),
-          })
-          .await;
-      }
-      Err(e) => {
-        self
-          .emit_session(SessionFact::Party {
-            status: sync::PartyStatus::Disconnected,
-            session: None,
-          })
-          .await;
-        self
-          .handle_error(anyhow!("Failed to start party: {}", e))
-          .await;
-      }
-    }
-  }
-
-  #[cfg(any())]
-  async fn join_party(&mut self, code: String, name: String) {
-    self
-      .emit_session(SessionFact::Party {
-        status: sync::PartyStatus::Connecting,
-        session: None,
-      })
-      .await;
-
-    let relay_url = match self
-      .fold_query(crate::runtime::engine::FoldQuery::PartyRelayUrl)
-      .await
-    {
-      Some(FoldAnswer::StatusText(url)) => url,
-      _ => return,
-    };
-
-    match sync::connect_to_relay(&relay_url, "join", &[("code", &code), ("name", &name)]).await {
-      Ok((conn, read)) => {
-        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(sync::start_party_reader(read, incoming_tx));
-        self.party_connection = Some(conn);
-        self.party_incoming_rx = Some(incoming_rx);
-
-        self
-          .emit_session(SessionFact::Party {
-            status: sync::PartyStatus::Joined,
-            session: Some(sync::PartySession {
-              role: sync::PartyRole::Guest,
-              code: code.to_uppercase(),
-              guests: Vec::new(),
-              control_mode: sync::ControlMode::default(),
-              host_name: String::new(),
-            }),
-          })
-          .await;
-      }
-      Err(e) => {
-        self
-          .emit_session(SessionFact::Party {
-            status: sync::PartyStatus::Disconnected,
-            session: None,
-          })
-          .await;
-        self
-          .handle_error(anyhow!("Failed to join party: {}", e))
-          .await;
-      }
-    }
-  }
-
-  #[cfg(any())]
-  async fn leave_party(&mut self) {
-    if let Some(conn) = &mut self.party_connection {
-      conn.close().await;
-    }
-    self.party_connection = None;
-    self.party_incoming_rx = None;
-
-    self
-      .emit_session(SessionFact::Party {
-        status: sync::PartyStatus::Disconnected,
-        session: None,
-      })
-      .await;
-  }
-
-  #[cfg(any())]
-  async fn sync_playback(&mut self) {
-    // Ticket 17: the host gate + playback identity read is one fold query
-    // (the old single lock section); `None` means nothing to sync.
-    let sync_state = match self
-      .fold_query(crate::runtime::engine::FoldQuery::HostSyncState)
-      .await
-    {
-      Some(FoldAnswer::HostSync(Some(state))) => sync::SyncMessage::SyncState {
-        track_uri: state.track_uri,
-        position_ms: state.position_ms,
-        is_playing: state.is_playing,
-        timestamp: sync::now_ms(),
-      },
-      _ => return,
-    };
-
-    if let Some(conn) = &mut self.party_connection {
-      if let Err(e) = conn.send(&sync_state).await {
-        log::error!("Failed to send sync state: {}", e);
-      }
-    }
-  }
-
-  #[cfg(any())]
-  async fn set_party_control_mode(&mut self, control_mode: sync::ControlMode) {
-    let control_mode = match control_mode {
-      sync::ControlMode::HostOnly => "host_only",
-      sync::ControlMode::SharedControl => "shared_control",
-    };
-
-    let msg = sync::SyncMessage::SetControlMode {
-      control_mode: control_mode.to_string(),
-    };
-
-    if let Some(conn) = &mut self.party_connection {
-      if let Err(e) = conn.send(&msg).await {
-        log::error!("Failed to send control mode update: {}", e);
-      }
-    }
-  }
-
-  #[cfg(any())]
-  async fn party_playback_command(&mut self, action: sync::PlaybackAction) {
-    let msg = sync::SyncMessage::PlaybackCommand { action, from: None };
-    if let Some(conn) = &mut self.party_connection {
-      if let Err(e) = conn.send(&msg).await {
-        log::error!("Failed to send playback command: {}", e);
-      }
-    }
-  }
-
-  #[cfg(any())]
-  pub async fn process_party_messages(&mut self) {
-    let messages: Vec<sync::SyncMessage> = {
-      match &mut self.party_incoming_rx {
-        Some(rx) => {
-          let mut msgs = Vec::new();
-          while let Ok(msg) = rx.try_recv() {
-            msgs.push(msg);
-          }
-          msgs
-        }
-        None => return,
-      }
-    };
-
-    for msg in messages {
-      match msg {
-        sync::SyncMessage::RoomCreated { code, .. } => {
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::RoomCode(code),
-            ))
-            .await;
-        }
-        sync::SyncMessage::JoinedRoom { host_name } => {
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::HostName(host_name),
-            ))
-            .await;
-        }
-        sync::SyncMessage::GuestJoined { name } => {
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::GuestJoined(name),
-            ))
-            .await;
-        }
-        sync::SyncMessage::GuestLeft { name } => {
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::GuestLeft(name),
-            ))
-            .await;
-        }
-        sync::SyncMessage::SetControlMode { control_mode } => {
-          let mode = match control_mode.as_str() {
-            "shared_control" => sync::ControlMode::SharedControl,
-            _ => sync::ControlMode::HostOnly,
-          };
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::ControlMode(mode),
-            ))
-            .await;
-        }
-        sync::SyncMessage::SyncState {
-          track_uri,
-          position_ms,
-          is_playing,
-          timestamp,
-        } => {
-          self
-            .handle_incoming_sync_state(track_uri, position_ms, is_playing, timestamp)
-            .await;
-        }
-        sync::SyncMessage::PlaybackCommand { action, .. } => {
-          self.handle_incoming_playback_command(action).await;
-        }
-        sync::SyncMessage::RoomClosed => {
-          self.party_connection = None;
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::Ended("Party ended".to_string()),
-            ))
-            .await;
-        }
-        sync::SyncMessage::Error { message } => {
-          self.party_connection = None;
-          self.party_incoming_rx = None;
-          self
-            .emit_session(SessionFact::PartySessionUpdate(
-              sync::PartySessionFact::Error(message),
-            ))
-            .await;
-        }
-        _ => {}
-      }
-    }
-  }
-
-  #[cfg(any())]
-  async fn handle_incoming_sync_state(
-    &mut self,
-    track_uri: String,
-    position_ms: u64,
-    is_playing: bool,
-    timestamp: u64,
-  ) {
-    let is_guest = match self
-      .fold_query(crate::runtime::engine::FoldQuery::IsPartyGuest)
-      .await
-    {
-      Some(FoldAnswer::Bool(is_guest)) => is_guest,
-      _ => false,
-    };
-    if !is_guest {
-      return;
-    }
-
-    // Latency compensation: estimate how much time passed since the host sent this state
-    let now = sync::now_ms();
-    let transit_ms = if now > timestamp {
-      (now - timestamp).min(5000) // cap at 5s to avoid wild jumps from clock skew
-    } else {
-      0
-    };
-    let compensated_position = if is_playing {
-      position_ms + transit_ms
-    } else {
-      position_ms
-    };
-
-    let (current_uri, current_is_playing, current_progress) = match self
-      .fold_query(crate::runtime::engine::FoldQuery::GuestSyncCurrent)
-      .await
-    {
-      Some(FoldAnswer::GuestSyncCurrent(uri, playing, progress)) => (uri, playing, progress),
-      _ => (String::new(), false, 0),
-    };
-
-    let mut switched_track = false;
-
-    // Track change takes priority
-    if current_uri != track_uri && !track_uri.is_empty() {
-      let playable: Option<PlayableId<'static>> = if let Ok(id) = TrackId::from_uri(&track_uri) {
-        let p: PlayableId<'_> = id.into();
-        Some(p.into_static())
-      } else if let Ok(id) = EpisodeId::from_uri(&track_uri) {
-        let p: PlayableId<'_> = id.into();
-        Some(p.into_static())
-      } else {
-        None
-      };
-      if let Some(playable_id) = playable {
-        self
-          .start_playback(None, Some(vec![playable_id]), None)
-          .await;
-        switched_track = true;
-      }
-    }
-
-    // Play/pause sync
-    // After a track switch, explicitly apply host pause state since starting playback may
-    // begin playing even when host is paused.
-    if (switched_track && !is_playing) || (!switched_track && current_is_playing != is_playing) {
-      if is_playing {
-        self.start_playback(None, None, None).await;
-      } else {
-        self.pause_playback().await;
-      }
-    }
-
-    // Position drift correction (>3s triggers seek)
-    let drift = current_progress.abs_diff(compensated_position);
-
-    if drift > 3000 && current_uri == track_uri {
-      self.seek(compensated_position as u32).await;
-    }
-  }
-
-  #[cfg(any())]
-  async fn handle_incoming_playback_command(&mut self, action: sync::PlaybackAction) {
-    let is_host = match self
-      .fold_query(crate::runtime::engine::FoldQuery::IsPartyHost)
-      .await
-    {
-      Some(FoldAnswer::Bool(is_host)) => is_host,
-      _ => false,
-    };
-    if !is_host {
-      return;
-    }
-
-    match action {
-      sync::PlaybackAction::Play => {
-        self.start_playback(None, None, None).await;
-      }
-      sync::PlaybackAction::Pause => {
-        self.pause_playback().await;
-      }
-      sync::PlaybackAction::NextTrack => {
-        self.next_track().await;
-      }
-      sync::PlaybackAction::PrevTrack => {
-        self.previous_track().await;
-      }
-      sync::PlaybackAction::Seek { position_ms } => {
-        self.seek(position_ms as u32).await;
-      }
-      sync::PlaybackAction::PlayTrack { uri } => {
-        let playable: Option<PlayableId<'static>> = if let Ok(id) = TrackId::from_uri(&uri) {
-          let p: PlayableId<'_> = id.into();
-          Some(p.into_static())
-        } else if let Ok(id) = EpisodeId::from_uri(&uri) {
-          let p: PlayableId<'_> = id.into();
-          Some(p.into_static())
-        } else {
-          None
-        };
-        if let Some(playable_id) = playable {
-          self
-            .start_playback(None, Some(vec![playable_id]), None)
-            .await;
-        }
-      }
-    }
-
-    // After executing, broadcast updated state
-    self.sync_playback().await;
-  }
 }
 
 #[cfg(test)]
@@ -1712,7 +1308,6 @@ mod tests {
       IoEvent::FetchGlobalSongCount,
       IoEvent::IncrementGlobalSongCount,
       IoEvent::FetchAnnouncements,
-      IoEvent::GetLyrics(String::new(), Vec::new(), 0.0),
       IoEvent::LoadListeningStats(RecapPeriod::SevenDays),
       IoEvent::GenerateRecap(RecapPeriod::SevenDays),
     ];

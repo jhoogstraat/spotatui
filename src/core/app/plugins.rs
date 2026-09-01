@@ -11,11 +11,10 @@ pub enum PluginDataKind {
   SavedShows,
   RecentlyPlayed,
   Devices,
-  Lyrics,
 }
 
 impl PluginDataKind {
-  pub const COUNT: usize = 9;
+  pub const COUNT: usize = 8;
   pub fn index(self) -> usize {
     self as usize
   }

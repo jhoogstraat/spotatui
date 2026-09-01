@@ -2,8 +2,7 @@
 //!
 //! [`LocalPlayer`] decodes an audio file and plays it through the system's
 //! default output device, independent of librespot. The decoded audio reaches
-//! the same default device the visualizer's loopback/monitor captures, so the
-//! spectrum visualizer works for local playback without any extra wiring.
+//! the same default output device used for local playback.
 //!
 //! ## Encapsulation
 //!

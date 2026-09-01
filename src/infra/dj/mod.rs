@@ -17,8 +17,7 @@
 // to be pulled in by `mcp-server` and `ai-dj`, exactly as `audio-decode` is
 // pulled in by the media sources. Enabled on its own, everything here is
 // legitimately unreachable, so scope the allow to that case rather than blanket
-// it (cf. `#[cfg_attr(not(feature = "scripting"), allow(dead_code))]` in
-// `infra::network`).
+// it.
 #![cfg_attr(not(any(feature = "mcp-server", feature = "ai-dj")), allow(dead_code))]
 
 /// The in-TUI DJ's turn loop: brain, tools, repeat.
@@ -128,7 +127,7 @@ impl DjSuggestion {
 #[cfg_attr(not(feature = "ai-dj"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DjSpeaker {
-  // Constructed only by the scripting chat path; tests cover it elsewhere.
+  // Constructed only by the optional chat path; tests cover it elsewhere.
   #[allow(dead_code)]
   User,
   Dj,
@@ -211,8 +210,7 @@ pub struct DjState {
   ///
   /// **Load-bearing, not defensive.** A top-up dispatched from the advance path
   /// lands seconds later; without re-checking this value before writing, a stale
-  /// batch queues tracks for a session the user already left. Same idiom as
-  /// `App::desired_lyrics_identity` and `App::desired_cover_art_key`.
+  /// batch queues tracks for a session the user already left.
   pub generation: u64,
   pub transcript: Vec<DjLine>,
   /// The DJ's own progress flag. Deliberately *not* the global `App::is_loading`:

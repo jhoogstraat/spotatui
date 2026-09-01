@@ -33,8 +33,6 @@ clap = { version = "4.6", features = ["cargo"] }
 clap_complete = "4.6"
 unicode-width = "0.2.2"
 backtrace = "0.3.76"
-# Optional because the headless build needs neither half of it: `art-decode`
-# pulls it for the HSV math in `core/cover_theme.rs`.
 tokio = { version = "1.52", features = ["full"] }
 rand = "0.10.2"
 anyhow = "1.0.102"
@@ -48,8 +46,6 @@ hex = { version = "0.4", optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 openssl = { version = "0.10", optional = true }
 discord-rich-presence = { version = "1.1", optional = true }
-# ratatui-image was terminal-only (cover-art preview rendering); removed with
-# the terminal frontend.
 md-5 = { version = "0.11", optional = true }
 # Subsonic streams each track to a tempfile before playing it through the shared
 # rodio sink. Also a dev-dependency (used by tests across features).
@@ -147,9 +143,6 @@ mpris = ["mpris-server"]  # MPRIS D-Bus integration (Linux only)
 macos-media = ["objc2-media-player", "objc2-foundation", "objc2-app-kit", "objc2", "block2", "streaming"]  # macOS Now Playing integration
 windows-media = ["smtc-tokio", "streaming"] # windows SMTC integration
 discord-rpc = ["discord-rich-presence"]
-# The frontend-agnostic decode half of cover art: fetch + `image`-decode into
-# the store frontends render from (also feeds the adaptive theme's palette
-# extraction). Not meant to be enabled by hand.
 # Shared audio decode/output engine (rodio bundles symphonia). Pulled by any
 # source that plays decoded audio through the local sink (local files, Subsonic).
 audio-decode = ["dep:rodio"]

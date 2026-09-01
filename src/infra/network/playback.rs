@@ -85,9 +85,6 @@ pub trait PlaybackNetwork {
   #[allow(dead_code)]
   async fn add_item_to_queue(&mut self, item: PlayableId<'static>);
   async fn get_queue(&mut self);
-  /// Legacy cover-art fetch (disabled until a windowed frontend renders it).
-  #[cfg(any())]
-  async fn fetch_cover_art(&mut self, request: crate::core::art::CoverArtRequest);
 }
 
 fn trim_api_playback_uris(
@@ -1154,10 +1151,6 @@ impl PlaybackNetwork for Network {
       )
       .await;
 
-    // Cover-art download (network + synchronous image decode) must NOT happen
-    // in this handler: art is fetched by the shared track-change detector
-    // (see `core/driver/`), which dispatches `IoEvent::FetchCoverArt` off the
-    // `App` lock for every source.
     match context {
       Ok(Some(c)) => {
         self.consecutive_playback_auth_failures = 0;
@@ -1435,67 +1428,6 @@ impl PlaybackNetwork for Network {
         self.emit_error(err).await;
       }
     }
-  }
-
-  /// Fetch and decode the current track's cover art, then store it. Runs entirely
-  /// off the `App` lock (the download/decode is the slow part and must never hold
-  /// the render loop's mutex, #142); completion is acknowledged by the fold,
-  /// which re-gates the request key before storing the image. Cover art is non-essential,
-  /// so a failure only logs and flips the status to `Failed` (never surfaces a
-  /// blocking error).
-  #[cfg(any())]
-  async fn fetch_cover_art(&mut self, request: crate::core::art::CoverArtRequest) {
-    use crate::core::art::{fetch_and_decode, CoverArtRequest};
-
-    let key = request.key().to_string();
-
-    // Skip the download/decode when we already hold art for this exact key
-    // (e.g. consecutive tracks that share an album cover): just mark it loaded.
-    match self
-      .fold_query(crate::runtime::engine::FoldQuery::CoverArtState { key: key.clone() })
-      .await
-    {
-      Some(crate::runtime::engine::FoldAnswer::CoverArt {
-        current: true,
-        loaded: true,
-      }) => return,
-      Some(crate::runtime::engine::FoldAnswer::CoverArt {
-        current: true,
-        loaded: false,
-      }) => {}
-      _ => return,
-    }
-
-    let result = match request {
-      CoverArtRequest::Url(url) => fetch_and_decode(&url).await,
-      #[cfg(feature = "local-files")]
-      CoverArtRequest::LocalFile { path, .. } => {
-        // Tag read + image decode are blocking; keep them off the async runtime.
-        match tokio::task::spawn_blocking(move || {
-          crate::infra::local::extract_embedded_cover(&path)
-        })
-        .await
-        {
-          Ok(inner) => inner,
-          Err(join_err) => Err(anyhow!(join_err)),
-        }
-      }
-    };
-
-    // Dominant-color extraction for the adaptive theme: one pass over a 64x64
-    // thumbnail, but still done here, off the App lock, like the decode above.
-    let palette = result
-      .as_ref()
-      .ok()
-      .and_then(crate::core::cover_theme::extract_palette);
-
-    self
-      .emit_session_acked(crate::runtime::engine::SessionFact::CoverArtFetched {
-        key,
-        image: result.map_err(|e| e.to_string()),
-        palette,
-      })
-      .await;
   }
 
   async fn start_playback(

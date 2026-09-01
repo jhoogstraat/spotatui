@@ -2,9 +2,8 @@
 //! applied by [`App::apply`](crate::core::app::App).
 //!
 //! Every producer that is not the network layer's own result handling routes
-//! its `App` mutations through here: the Lua scripting engine drains its
-//! queued actions into `apply`, the mutating DJ/MCP tools call `apply`
-//! directly, and the terminal handlers adopt it screen by screen as the
+//! its `App` mutations through here: mutating DJ/MCP tools call `apply`
+//! directly, and frontend handlers adopt it screen by screen as the
 //! conversion sub-PRs land. Each arm delegates to the same ownership-aware
 //! `App` method the equivalent keybinding uses, so the
 //! `queue_owns_playback()` / `active_decoded_source()` /
@@ -273,7 +272,6 @@ pub enum NavTarget {
   Settings,
   Devices,
   Help,
-  Lyrics,
   RecentlyPlayed,
   Analysis,
   MiniPlayer,
@@ -281,13 +279,12 @@ pub enum NavTarget {
 
 impl NavTarget {
   /// Every target, in the order the Lua API has always advertised them.
-  pub const ALL: [NavTarget; 9] = [
+  pub const ALL: [NavTarget; 8] = [
     NavTarget::Home,
     NavTarget::Queue,
     NavTarget::Settings,
     NavTarget::Devices,
     NavTarget::Help,
-    NavTarget::Lyrics,
     NavTarget::RecentlyPlayed,
     NavTarget::Analysis,
     NavTarget::MiniPlayer,
@@ -301,7 +298,6 @@ impl NavTarget {
       NavTarget::Settings => "settings",
       NavTarget::Devices => "devices",
       NavTarget::Help => "help",
-      NavTarget::Lyrics => "lyrics",
       NavTarget::RecentlyPlayed => "recently_played",
       NavTarget::Analysis => "analysis",
       NavTarget::MiniPlayer => "miniplayer",

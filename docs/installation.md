@@ -54,23 +54,6 @@ paru -S spotatui
 
 ## Platform-Specific Requirements
 
-### Linux
-
-The pre-built Linux binary (and the `spotatui-bin` AUR package) is compiled with the PipeWire audio-visualization backend, so you need PipeWire installed for the visualizer:
-
-```bash
-# Debian/Ubuntu
-sudo apt-get install libpipewire-0.3-0
-
-# Arch Linux (already included with pipewire)
-sudo pacman -S pipewire
-
-# Fedora (already included with pipewire)
-sudo dnf install pipewire
-```
-
-> **Note:** Most modern Linux distributions already have PipeWire installed by default. If you build from source instead (`cargo install`), the default build uses the `cpal`-based visualizer backend and does not require PipeWire.
-
 ### macOS
 
 spotatui uses the `portaudio` backend for better stability and bluetooth device support (AirPods, etc.):
@@ -116,7 +99,7 @@ cd spotatui
 
 **macOS:**
 ```bash
-cargo install --path . --no-default-features --features telemetry,streaming,discord-rpc,cover-art,self-update,scripting,portaudio-backend,audio-viz-cpal,macos-media
+cargo install --path . --no-default-features --features telemetry,streaming,discord-rpc,self-update,portaudio-backend,macos-media
 ```
 
 **Linux/Windows:**

@@ -4,15 +4,12 @@
 //!
 //! One tick advances playback state (`App::update_on_tick` plus the debounced
 //! seek/volume flushes), refreshes the OAuth token, syncs OS presence
-//! (Discord, MPRIS, window title), detects track changes (lyrics + cover
-//! art), auto-advances the native queue and the decoded sources, and feeds the
-//! audio visualizer. Runtime-state and decoded-session persistence are owned by
+//! (Discord, MPRIS, window title), and auto-advances the native queue and
+//! decoded sources. Runtime-state and decoded-session persistence are owned by
 //! the Playback Engine's explicit deadline facts.
 //!
-//! What stays with the frontend, injected through [`TickEnv`] or kept at the
-//! call site: the visualizer bar count (a function of frontend geometry), the
-//! terminal image-protocol probe behind `TickEnv::cover_art_full_image_support`,
-//! and the macOS `NSRunLoop` pump (the frontend owns the main thread).
+//! The macOS `NSRunLoop` pump remains frontend-owned (the frontend owns the
+//! main thread).
 //!
 //! A frontend that stops ticking is a bug this module makes loud:
 //! `App::playback_position_ms` reports stale once no tick has run for two

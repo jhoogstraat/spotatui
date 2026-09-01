@@ -37,7 +37,6 @@ one query can be walked across tabs.
 | `z`         | Add to queue              |
 | `Q`         | Show queue                |
 | `F`         | Like / save track         |
-| `B`         | Lyrics view               |
 | `T`         | Toggle miniplayer view    |
 | `R`         | Generate recap            |
 | `,`         | Open sort menu            |

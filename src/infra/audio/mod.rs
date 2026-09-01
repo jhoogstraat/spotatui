@@ -2,8 +2,8 @@
 //!
 //! System-output capture and FFT visualization were terminal presentation
 //! concerns and are intentionally not part of the playback engine. A future
-//! GPUI visualizer can subscribe to playback telemetry without reopening an
-//! audio capture device here.
+//! Frontends can subscribe to playback telemetry without reopening an audio
+//! capture device here.
 
 #[cfg(feature = "audio-decode")]
 mod player;

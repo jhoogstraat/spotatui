@@ -1,6 +1,6 @@
 //! `App::apply`: the single write path from an [`Action`] into `App`.
 //!
-//! Ported from the scripting engine's effect drain, which this replaces.
+//! Frontend-neutral action application.
 //! Every arm routes through the same `App` method as the equivalent
 //! keybinding, so native-streaming fast paths and throttling/coalescing are
 //! automatically honoured.
@@ -255,7 +255,6 @@ fn apply_navigate(app: &mut App, target: NavTarget) {
     // The help KEY also clears the help filter first (`help_menu::open`); that
     // reset needs the TUI's filtered-docs count, so it cannot live here.
     NavTarget::Help => app.push_navigation_stack(RouteId::HelpMenu, ActiveBlock::HelpMenu),
-    NavTarget::Lyrics => app.push_navigation_stack(RouteId::LyricsView, ActiveBlock::LyricsView),
     // The network handler pushes the route once the data arrives, exactly like
     // the keybinding.
     NavTarget::RecentlyPlayed => app.dispatch(IoEvent::GetRecentlyPlayed),

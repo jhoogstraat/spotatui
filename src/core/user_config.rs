@@ -13,32 +13,6 @@ const FILE_NAME: &str = "config.yml";
 pub const DEFAULT_TICK_RATE_MILLISECONDS: u64 = 250;
 pub const DEFAULT_ANIMATION_TICK_RATE_MILLISECONDS: u64 = 16;
 pub const MAX_TICK_RATE_MILLISECONDS: u64 = 999;
-#[cfg(feature = "art-decode")]
-pub const MIN_PLAYBAR_COVER_ART_SIZE_PERCENT: u16 = 25;
-#[cfg(feature = "art-decode")]
-pub const MAX_PLAYBAR_COVER_ART_SIZE_PERCENT: u16 = 200;
-
-#[cfg(feature = "art-decode")]
-pub fn clamp_playbar_cover_art_size_percent(value: u16) -> u16 {
-  value.clamp(
-    MIN_PLAYBAR_COVER_ART_SIZE_PERCENT,
-    MAX_PLAYBAR_COVER_ART_SIZE_PERCENT,
-  )
-}
-
-// Only the settings arm for the playbar size (a render-side setting) calls
-// this, so it follows `cover-art` while its `clamp` sibling stays with the
-// decode half for config loading.
-#[cfg(feature = "cover-art")]
-// TUI-only normalization: the settings row died with the terminal UI.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn normalize_playbar_cover_art_size_percent(value: i64) -> u16 {
-  value.clamp(
-    MIN_PLAYBAR_COVER_ART_SIZE_PERCENT as i64,
-    MAX_PLAYBAR_COVER_ART_SIZE_PERCENT as i64,
-  ) as u16
-}
-
 #[allow(dead_code)]
 pub fn validate_tick_rate_milliseconds(value: u64, label: &str) -> Result<u64> {
   if (1..=MAX_TICK_RATE_MILLISECONDS).contains(&value) {
@@ -116,206 +90,10 @@ pub struct UserTheme {
   pub text: Option<String>,
   pub background: Option<String>,
   pub header: Option<String>,
-  pub highlighted_lyrics: Option<String>,
 }
 
 // `Theme`, `ThemePreset`, `parse_theme_item` and `color_to_string` moved to
 // `core/theme.rs` (re-exported above).
-
-/// Available audio visualizer styles
-#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
-pub enum VisualizerStyle {
-  /// Cava mode: cava's engine and mirrored stereo layout drawn in eighth blocks
-  ///
-  /// Note: Older configs may contain `Equalizer` (a removed style) or `Classic`
-  /// (its even older name); both are accepted as aliases so existing config
-  /// files keep loading and roll over to Cava.
-  #[default]
-  #[serde(alias = "Classic", alias = "Equalizer")]
-  Cava,
-  /// BarGraph mode: Uses tui-bar-graph with Braille patterns for high-resolution display
-  BarGraph,
-}
-
-impl VisualizerStyle {
-  #[allow(dead_code)] // TEMPORARY (ticket 01): settings-screen UI was TUI-only.
-  pub fn all() -> &'static [VisualizerStyle] {
-    &[VisualizerStyle::Cava, VisualizerStyle::BarGraph]
-  }
-
-  #[allow(dead_code)] // TEMPORARY (ticket 01): settings-screen UI was TUI-only.
-  pub fn name(&self) -> &'static str {
-    match self {
-      VisualizerStyle::Cava => "Cava",
-      VisualizerStyle::BarGraph => "Bar Graph",
-    }
-  }
-
-  #[allow(dead_code)]
-  pub fn next(&self) -> Self {
-    let styles = Self::all();
-    let current_idx = styles.iter().position(|s| s == self).unwrap_or(0);
-    let next_idx = (current_idx + 1) % styles.len();
-    styles[next_idx]
-  }
-}
-
-/// Controls the playback state on startup, both for Spotify and for a persisted
-/// non-Spotify session (local/Subsonic/radio/YouTube) that spotatui resumes on
-/// launch.
-#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StartupBehavior {
-  /// Restore the last state: leave Spotify playback as-is, and resume a persisted
-  /// non-Spotify session to the exact play/pause state it had when spotatui last
-  /// closed (a track playing at exit resumes playing). This is the default.
-  #[default]
-  Continue,
-  /// Always start playing on launch (Spotify, or the restored session).
-  Play,
-  /// Always pause on launch (Spotify, or the restored session).
-  Pause,
-}
-
-impl StartupBehavior {
-  pub fn name(self) -> &'static str {
-    match self {
-      StartupBehavior::Continue => "Continue",
-      StartupBehavior::Play => "Play",
-      StartupBehavior::Pause => "Pause",
-    }
-  }
-
-  pub fn options() -> &'static [&'static str] {
-    &["Continue", "Play", "Pause"]
-  }
-
-  #[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted settings screen.
-  pub fn from_name(name: &str) -> Self {
-    match name {
-      "Play" => StartupBehavior::Play,
-      "Pause" => StartupBehavior::Pause,
-      _ => StartupBehavior::Continue,
-    }
-  }
-}
-
-fn parse_key(key: String) -> Result<Key> {
-  // "ctrl" with no dash and "ctrl-" with nothing after the dash are config
-  // typos; they must surface as config errors naming the binding, never a
-  // panic before the UI starts (#441).
-  fn modifier_char(key: &str, sections: &[&str]) -> Result<char> {
-    let mut chars = sections
-      .get(1)
-      .map(|section| section.chars())
-      .ok_or_else(|| {
-        anyhow!(
-          "The shortcut \"{}\" is missing its key, e.g. \"ctrl-a\"",
-          key
-        )
-      })?;
-    match (chars.next(), chars.next()) {
-      (Some(c), None) => Ok(c),
-      _ => Err(anyhow!(
-        "The shortcut \"{}\" must combine the modifier with exactly one key, e.g. \"ctrl-a\"",
-        key
-      )),
-    }
-  }
-
-  match key.len() {
-    1 => match key.chars().next() {
-      Some(c) => Ok(Key::Char(c)),
-      None => Err(anyhow!("The key binding is empty")),
-    },
-    _ => {
-      let sections: Vec<&str> = key.split('-').collect();
-
-      if sections.len() > 2 {
-        return Err(anyhow!(
-          "Shortcut can only have 2 keys, \"{}\" has {}",
-          key,
-          sections.len()
-        ));
-      }
-
-      match sections[0].to_lowercase().as_str() {
-        "ctrl" => Ok(Key::Ctrl(modifier_char(&key, &sections)?)),
-        "alt" => Ok(Key::Alt(modifier_char(&key, &sections)?)),
-        "left" => Ok(Key::Left),
-        "right" => Ok(Key::Right),
-        "up" => Ok(Key::Up),
-        "down" => Ok(Key::Down),
-        "backspace" | "delete" => Ok(Key::Backspace),
-        "del" => Ok(Key::Delete),
-        "esc" | "escape" => Ok(Key::Esc),
-        "pageup" => Ok(Key::PageUp),
-        "pagedown" => Ok(Key::PageDown),
-        "space" => Ok(Key::Char(' ')),
-        "enter" => Ok(Key::Enter),
-        "tab" => Ok(Key::Tab),
-        "home" => Ok(Key::Home),
-        "end" => Ok(Key::End),
-        "ins" | "insert" => Ok(Key::Ins),
-        "f0" => Ok(Key::F0),
-        "f1" => Ok(Key::F1),
-        "f2" => Ok(Key::F2),
-        "f3" => Ok(Key::F3),
-        "f4" => Ok(Key::F4),
-        "f5" => Ok(Key::F5),
-        "f6" => Ok(Key::F6),
-        "f7" => Ok(Key::F7),
-        "f8" => Ok(Key::F8),
-        "f9" => Ok(Key::F9),
-        "f10" => Ok(Key::F10),
-        "f11" => Ok(Key::F11),
-        "f12" => Ok(Key::F12),
-        _ => Err(anyhow!("The key \"{}\" is unknown.", sections[0])),
-      }
-    }
-  }
-}
-
-/// Public version of parse_key for use in app.rs
-#[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted keybinding UI.
-pub fn parse_key_public(key: String) -> Result<Key> {
-  parse_key(key)
-}
-
-fn check_reserved_keys(key: Key) -> Result<()> {
-  let reserved = [
-    Key::Char('H'),
-    Key::Char('M'),
-    Key::Char('L'),
-    Key::Up,
-    Key::Down,
-    Key::Left,
-    Key::Right,
-    Key::Backspace,
-    Key::Enter,
-  ];
-  for item in reserved.iter() {
-    if key == *item {
-      // TODO: Add pretty print for key
-      return Err(anyhow!(
-        "The key {:?} is reserved and cannot be remapped",
-        key
-      ));
-    }
-  }
-  Ok(())
-}
-
-/// Public version of check_reserved_keys for use in handlers
-#[allow(dead_code)] // TEMPORARY (ticket 01): handler consumers were TUI-only.
-pub fn check_reserved_keys_public(key: Key) -> Result<()> {
-  check_reserved_keys(key)
-}
-
-#[derive(Clone)]
-pub struct UserConfigPaths {
-  pub config_file_path: PathBuf,
-}
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeyBindingsString {
@@ -358,10 +136,7 @@ pub struct KeyBindingsString {
   copy_song_url: Option<String>,
   copy_album_url: Option<String>,
   audio_analysis: Option<String>,
-  #[serde(alias = "basic_view")]
-  lyrics_view: Option<String>,
   miniplayer_view: Option<String>,
-  cover_art_view: Option<String>,
   add_item_to_queue: Option<String>,
   show_queue: Option<String>,
   remove_from_queue: Option<String>,
@@ -419,9 +194,7 @@ pub struct KeyBindings {
   pub copy_song_url: Key,
   pub copy_album_url: Key,
   pub audio_analysis: Key,
-  pub lyrics_view: Key,
   pub miniplayer_view: Key,
-  pub cover_art_view: Key,
   pub add_item_to_queue: Key,
   pub show_queue: Key,
   pub remove_from_queue: Key,
@@ -457,19 +230,10 @@ pub struct BehaviorConfigString {
   pub playing_icon: Option<String>,
   pub paused_icon: Option<String>,
   pub set_window_title: Option<bool>,
-  pub visualizer_style: Option<VisualizerStyle>,
   pub stop_after_current_track: Option<bool>,
   pub startup_behavior: Option<StartupBehavior>,
   pub disable_auto_update: Option<bool>,
   pub auto_update_delay: Option<String>,
-  #[cfg(feature = "art-decode")]
-  pub draw_cover_art: Option<bool>,
-  #[cfg(feature = "art-decode")]
-  pub draw_cover_art_forced: Option<bool>,
-  #[cfg(feature = "art-decode")]
-  pub playbar_cover_art_size_percent: Option<u16>,
-  #[cfg(feature = "art-decode")]
-  pub cover_art_theme: Option<bool>,
   #[cfg(feature = "mcp-server")]
   pub mcp_enabled: Option<bool>,
   #[cfg(feature = "ai-dj")]
@@ -572,21 +336,10 @@ pub struct BehaviorConfig {
   pub playing_icon: String,
   pub paused_icon: String,
   pub set_window_title: bool,
-  pub visualizer_style: VisualizerStyle,
   pub stop_after_current_track: bool,
   pub startup_behavior: StartupBehavior,
   pub disable_auto_update: bool,
   pub auto_update_delay: String,
-  #[cfg(feature = "art-decode")]
-  pub draw_cover_art: bool,
-  #[cfg(feature = "art-decode")]
-  pub draw_cover_art_forced: bool,
-  #[cfg(feature = "art-decode")]
-  pub playbar_cover_art_size_percent: u16,
-  /// Recolor the UI accents from the current track's cover art, fading on
-  /// track change. Off by default so a chosen preset stays untouched.
-  #[cfg(feature = "art-decode")]
-  pub cover_art_theme: bool,
   /// Whether to open the local MCP control socket so `spotatui mcp` (and through
   /// it Claude Code, Codex, or any MCP client) can drive playback.
   ///
@@ -972,9 +725,7 @@ impl UserConfig {
         copy_song_url: Key::Char('c'),
         copy_album_url: Key::Char('C'),
         audio_analysis: Key::Char('v'),
-        lyrics_view: Key::Char('B'),
         miniplayer_view: Key::Char('T'),
-        cover_art_view: Key::Char('G'),
         add_item_to_queue: Key::Char('z'),
         show_queue: Key::Char('Q'),
         remove_from_queue: Key::Char('x'),
@@ -1016,19 +767,10 @@ impl UserConfig {
         playing_icon: "▶".to_string(),
         paused_icon: "⏸".to_string(),
         set_window_title: true,
-        visualizer_style: VisualizerStyle::default(),
         stop_after_current_track: false,
         startup_behavior: StartupBehavior::Continue,
         disable_auto_update: false,
         auto_update_delay: "0".to_string(),
-        #[cfg(feature = "art-decode")]
-        draw_cover_art: true,
-        #[cfg(feature = "art-decode")]
-        draw_cover_art_forced: false,
-        #[cfg(feature = "art-decode")]
-        playbar_cover_art_size_percent: 100,
-        #[cfg(feature = "art-decode")]
-        cover_art_theme: false,
         #[cfg(feature = "mcp-server")]
         mcp_enabled: false,
         #[cfg(feature = "ai-dj")]
@@ -1199,9 +941,7 @@ impl UserConfig {
     to_keys!(copy_song_url);
     to_keys!(copy_album_url);
     to_keys!(audio_analysis);
-    to_keys!(lyrics_view);
     to_keys!(miniplayer_view);
-    to_keys!(cover_art_view);
     to_keys!(add_item_to_queue);
     to_keys!(show_queue);
     to_keys!(remove_from_queue);
@@ -1238,8 +978,7 @@ impl UserConfig {
       || theme.selected.is_some()
       || theme.text.is_some()
       || theme.background.is_some()
-      || theme.header.is_some()
-      || theme.highlighted_lyrics.is_some();
+      || theme.header.is_some();
 
     to_theme_item!(active);
     to_theme_item!(banner);
@@ -1256,7 +995,6 @@ impl UserConfig {
     to_theme_item!(text);
     to_theme_item!(background);
     to_theme_item!(header);
-    to_theme_item!(highlighted_lyrics);
 
     // If the preset value exists in the config, we load it
     if let Some(preset_name) = theme.preset {
@@ -1390,10 +1128,6 @@ impl UserConfig {
       self.behavior.discord_rpc_client_id = Some(discord_rpc_client_id);
     }
 
-    if let Some(visualizer_style) = behavior_config.visualizer_style {
-      self.behavior.visualizer_style = visualizer_style;
-    }
-
     if let Some(sync_token) = behavior_config.sync_token {
       let trimmed = sync_token.trim();
       if trimmed.is_empty() {
@@ -1436,24 +1170,6 @@ impl UserConfig {
       self.behavior.auto_update_delay = auto_update_delay;
     }
 
-    #[cfg(feature = "art-decode")]
-    if let Some(draw_cover_art) = behavior_config.draw_cover_art {
-      self.behavior.draw_cover_art = draw_cover_art;
-    }
-
-    #[cfg(feature = "art-decode")]
-    if let Some(draw_cover_art_forced) = behavior_config.draw_cover_art_forced {
-      self.behavior.draw_cover_art_forced = draw_cover_art_forced;
-    }
-    #[cfg(feature = "art-decode")]
-    if let Some(playbar_cover_art_size_percent) = behavior_config.playbar_cover_art_size_percent {
-      self.behavior.playbar_cover_art_size_percent =
-        clamp_playbar_cover_art_size_percent(playbar_cover_art_size_percent);
-    }
-    #[cfg(feature = "art-decode")]
-    if let Some(cover_art_theme) = behavior_config.cover_art_theme {
-      self.behavior.cover_art_theme = cover_art_theme;
-    }
     #[cfg(feature = "mcp-server")]
     if let Some(mcp_enabled) = behavior_config.mcp_enabled {
       self.behavior.mcp_enabled = mcp_enabled;
@@ -1833,9 +1549,7 @@ impl UserConfig {
       k.copy_song_url,
       k.copy_album_url,
       k.audio_analysis,
-      k.lyrics_view,
       k.miniplayer_view,
-      k.cover_art_view,
       k.add_item_to_queue,
       k.show_queue,
       k.remove_from_queue,
@@ -2003,7 +1717,6 @@ impl UserConfig {
       playing_icon: Some(self.behavior.playing_icon.clone()),
       paused_icon: Some(self.behavior.paused_icon.clone()),
       set_window_title: Some(self.behavior.set_window_title),
-      visualizer_style: Some(self.behavior.visualizer_style),
       sync_token: self.behavior.sync_token.clone(),
       local_music_path: self.behavior.local_music_path.clone(),
       subsonic_url: self.behavior.subsonic_url.clone(),
@@ -2019,14 +1732,6 @@ impl UserConfig {
       startup_behavior: Some(self.behavior.startup_behavior),
       disable_auto_update: Some(self.behavior.disable_auto_update),
       auto_update_delay: Some(self.behavior.auto_update_delay.clone()),
-      #[cfg(feature = "art-decode")]
-      draw_cover_art: Some(self.behavior.draw_cover_art),
-      #[cfg(feature = "art-decode")]
-      draw_cover_art_forced: Some(self.behavior.draw_cover_art_forced),
-      #[cfg(feature = "art-decode")]
-      playbar_cover_art_size_percent: Some(self.behavior.playbar_cover_art_size_percent),
-      #[cfg(feature = "art-decode")]
-      cover_art_theme: Some(self.behavior.cover_art_theme),
       #[cfg(feature = "mcp-server")]
       mcp_enabled: Some(self.behavior.mcp_enabled),
       #[cfg(feature = "ai-dj")]
@@ -2169,9 +1874,7 @@ impl UserConfig {
       copy_song_url: Some(key_to_config_string(self.keys.copy_song_url)),
       copy_album_url: Some(key_to_config_string(self.keys.copy_album_url)),
       audio_analysis: Some(key_to_config_string(self.keys.audio_analysis)),
-      lyrics_view: Some(key_to_config_string(self.keys.lyrics_view)),
       miniplayer_view: Some(key_to_config_string(self.keys.miniplayer_view)),
-      cover_art_view: Some(key_to_config_string(self.keys.cover_art_view)),
       add_item_to_queue: Some(key_to_config_string(self.keys.add_item_to_queue)),
       show_queue: Some(key_to_config_string(self.keys.show_queue)),
       remove_from_queue: Some(key_to_config_string(self.keys.remove_from_queue)),
@@ -2199,7 +1902,6 @@ impl UserConfig {
       text: Some(color_to_string(self.custom_theme.text)),
       background: Some(color_to_string(self.custom_theme.background)),
       header: Some(color_to_string(self.custom_theme.header)),
-      highlighted_lyrics: Some(color_to_string(self.custom_theme.highlighted_lyrics)),
     };
 
     // If the file exists, try to read it first to preserve keybindings
@@ -2255,19 +1957,6 @@ impl UserConfig {
   #[allow(dead_code)]
   pub fn padded_playing_icon(&self) -> String {
     format!("{} ", self.behavior.playing_icon)
-  }
-  #[cfg(feature = "art-decode")]
-  pub fn do_draw_cover_art(&self, full_image_support: bool) -> bool {
-    self.behavior.draw_cover_art && (self.behavior.draw_cover_art_forced || full_image_support)
-  }
-
-  /// Whether anything needs the cover art fetched and decoded: the art pane,
-  /// or the adaptive theme, which extracts its palette from the decoded image
-  /// even when the pane itself is hidden (disabled, or a terminal without
-  /// image support). Draw sites keep their own `do_draw_cover_art` gate.
-  #[cfg(feature = "art-decode")]
-  pub fn needs_cover_art(&self, full_image_support: bool) -> bool {
-    self.do_draw_cover_art(full_image_support) || self.behavior.cover_art_theme
   }
 }
 
@@ -2366,19 +2055,6 @@ fn resolve_table_specs(
 
 #[cfg(test)]
 mod tests {
-  #[test]
-  fn removed_visualizer_styles_deserialize_as_cava() {
-    use super::VisualizerStyle;
-    // Configs written before the Equalizer style was removed (or before it
-    // was renamed from Classic) must keep loading, rolling over to Cava.
-    for old_name in ["Equalizer", "Classic", "Cava"] {
-      let style: VisualizerStyle = serde_yaml::from_str(old_name).unwrap();
-      assert_eq!(style, VisualizerStyle::Cava, "{old_name}");
-    }
-    let style: VisualizerStyle = serde_yaml::from_str("BarGraph").unwrap();
-    assert_eq!(style, VisualizerStyle::BarGraph);
-  }
-
   #[test]
   fn test_parse_key() {
     use super::parse_key;
@@ -2498,7 +2174,6 @@ mod tests {
     assert_eq!(config.theme.banner, Color::Black);
     assert_eq!(config.theme.playbar_text, Color::Gray);
     assert_eq!(config.theme.header, Color::Rgb(23, 43, 45));
-    assert_eq!(config.theme.highlighted_lyrics, Color::Rgb(255, 145, 205));
 
     // Save through the real path and compare the theme section field by
     // field: every string must be byte-identical to the fixture's.
@@ -2529,7 +2204,6 @@ mod tests {
         t.text.clone(),
         t.background.clone(),
         t.header.clone(),
-        t.highlighted_lyrics.clone(),
       ]
     };
     assert_eq!(fields(&saved_theme), fields(&fixture_theme));
@@ -2623,48 +2297,6 @@ mod tests {
     let mut config = UserConfig::new();
 
     assert!(config.load_behaviorconfig(behavior).is_err());
-  }
-
-  #[cfg(feature = "art-decode")]
-  #[test]
-  fn missing_playbar_cover_art_size_keeps_default() {
-    use super::{BehaviorConfigString, UserConfig};
-
-    let behavior: BehaviorConfigString = serde_yaml::from_str("{}").unwrap();
-    let mut config = UserConfig::new();
-    config.load_behaviorconfig(behavior).unwrap();
-
-    assert_eq!(config.behavior.playbar_cover_art_size_percent, 100);
-  }
-
-  #[cfg(feature = "art-decode")]
-  #[test]
-  fn playbar_cover_art_size_loads_from_yaml() {
-    use super::{BehaviorConfigString, UserConfig};
-
-    let behavior: BehaviorConfigString =
-      serde_yaml::from_str("playbar_cover_art_size_percent: 150").unwrap();
-    let mut config = UserConfig::new();
-    config.load_behaviorconfig(behavior).unwrap();
-
-    assert_eq!(config.behavior.playbar_cover_art_size_percent, 150);
-  }
-
-  #[cfg(feature = "art-decode")]
-  #[test]
-  fn playbar_cover_art_size_clamps_out_of_range_values() {
-    use super::{BehaviorConfigString, UserConfig};
-
-    let behavior: BehaviorConfigString =
-      serde_yaml::from_str("playbar_cover_art_size_percent: 10").unwrap();
-    let mut config = UserConfig::new();
-    config.load_behaviorconfig(behavior).unwrap();
-    assert_eq!(config.behavior.playbar_cover_art_size_percent, 25);
-
-    let behavior: BehaviorConfigString =
-      serde_yaml::from_str("playbar_cover_art_size_percent: 250").unwrap();
-    config.load_behaviorconfig(behavior).unwrap();
-    assert_eq!(config.behavior.playbar_cover_art_size_percent, 200);
   }
 
   /// A config written by a build *with* the DJ features must still load in a
@@ -2979,11 +2611,11 @@ dj_api_key: null
     // Ctrl+K rather than Ctrl+G: with `ai-dj` built in, Ctrl+G is `dj_pick_model`
     // and `load_plugin_commands` correctly refuses to shadow a named action, so the
     // old fixture would only have passed in the slim build.
-    entries.insert("toggle_lyrics".to_string(), "ctrl-k".to_string());
+    entries.insert("custom_command".to_string(), "ctrl-k".to_string());
     config.load_plugin_commands(entries);
     assert_eq!(
       config.plugin_command_keys.get(&Key::Ctrl('k')),
-      Some(&"toggle_lyrics".to_string())
+      Some(&"custom_command".to_string())
     );
   }
 
@@ -3326,4 +2958,160 @@ playbar_control_labels:
     )
     .is_ok());
   }
+}
+/// Controls the playback state on startup, both for Spotify and for a persisted
+/// non-Spotify session (local/Subsonic/radio/YouTube) that spotatui resumes on
+/// launch.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupBehavior {
+  /// Restore the last state: leave Spotify playback as-is, and resume a persisted
+  /// non-Spotify session to the exact play/pause state it had when spotatui last
+  /// closed (a track playing at exit resumes playing). This is the default.
+  #[default]
+  Continue,
+  /// Always start playing on launch (Spotify, or the restored session).
+  Play,
+  /// Always pause on launch (Spotify, or the restored session).
+  Pause,
+}
+
+impl StartupBehavior {
+  pub fn name(self) -> &'static str {
+    match self {
+      StartupBehavior::Continue => "Continue",
+      StartupBehavior::Play => "Play",
+      StartupBehavior::Pause => "Pause",
+    }
+  }
+
+  pub fn options() -> &'static [&'static str] {
+    &["Continue", "Play", "Pause"]
+  }
+
+  #[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted settings screen.
+  pub fn from_name(name: &str) -> Self {
+    match name {
+      "Play" => StartupBehavior::Play,
+      "Pause" => StartupBehavior::Pause,
+      _ => StartupBehavior::Continue,
+    }
+  }
+}
+
+fn parse_key(key: String) -> Result<Key> {
+  // "ctrl" with no dash and "ctrl-" with nothing after the dash are config
+  // typos; they must surface as config errors naming the binding, never a
+  // panic before the UI starts (#441).
+  fn modifier_char(key: &str, sections: &[&str]) -> Result<char> {
+    let mut chars = sections
+      .get(1)
+      .map(|section| section.chars())
+      .ok_or_else(|| {
+        anyhow!(
+          "The shortcut \"{}\" is missing its key, e.g. \"ctrl-a\"",
+          key
+        )
+      })?;
+    match (chars.next(), chars.next()) {
+      (Some(c), None) => Ok(c),
+      _ => Err(anyhow!(
+        "The shortcut \"{}\" must combine the modifier with exactly one key, e.g. \"ctrl-a\"",
+        key
+      )),
+    }
+  }
+
+  match key.len() {
+    1 => match key.chars().next() {
+      Some(c) => Ok(Key::Char(c)),
+      None => Err(anyhow!("The key binding is empty")),
+    },
+    _ => {
+      let sections: Vec<&str> = key.split('-').collect();
+
+      if sections.len() > 2 {
+        return Err(anyhow!(
+          "Shortcut can only have 2 keys, \"{}\" has {}",
+          key,
+          sections.len()
+        ));
+      }
+
+      match sections[0].to_lowercase().as_str() {
+        "ctrl" => Ok(Key::Ctrl(modifier_char(&key, &sections)?)),
+        "alt" => Ok(Key::Alt(modifier_char(&key, &sections)?)),
+        "left" => Ok(Key::Left),
+        "right" => Ok(Key::Right),
+        "up" => Ok(Key::Up),
+        "down" => Ok(Key::Down),
+        "backspace" | "delete" => Ok(Key::Backspace),
+        "del" => Ok(Key::Delete),
+        "esc" | "escape" => Ok(Key::Esc),
+        "pageup" => Ok(Key::PageUp),
+        "pagedown" => Ok(Key::PageDown),
+        "space" => Ok(Key::Char(' ')),
+        "enter" => Ok(Key::Enter),
+        "tab" => Ok(Key::Tab),
+        "home" => Ok(Key::Home),
+        "end" => Ok(Key::End),
+        "ins" | "insert" => Ok(Key::Ins),
+        "f0" => Ok(Key::F0),
+        "f1" => Ok(Key::F1),
+        "f2" => Ok(Key::F2),
+        "f3" => Ok(Key::F3),
+        "f4" => Ok(Key::F4),
+        "f5" => Ok(Key::F5),
+        "f6" => Ok(Key::F6),
+        "f7" => Ok(Key::F7),
+        "f8" => Ok(Key::F8),
+        "f9" => Ok(Key::F9),
+        "f10" => Ok(Key::F10),
+        "f11" => Ok(Key::F11),
+        "f12" => Ok(Key::F12),
+        _ => Err(anyhow!("The key \"{}\" is unknown.", sections[0])),
+      }
+    }
+  }
+}
+
+/// Public version of parse_key for use in app.rs
+#[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted keybinding UI.
+pub fn parse_key_public(key: String) -> Result<Key> {
+  parse_key(key)
+}
+
+fn check_reserved_keys(key: Key) -> Result<()> {
+  let reserved = [
+    Key::Char('H'),
+    Key::Char('M'),
+    Key::Char('L'),
+    Key::Up,
+    Key::Down,
+    Key::Left,
+    Key::Right,
+    Key::Backspace,
+    Key::Enter,
+  ];
+  for item in reserved.iter() {
+    if key == *item {
+      // TODO: Add pretty print for key
+      return Err(anyhow!(
+        "The key {:?} is reserved and cannot be remapped",
+        key
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Public version of check_reserved_keys for use in handlers
+#[allow(dead_code)] // TEMPORARY (ticket 01): handler consumers were TUI-only.
+pub fn check_reserved_keys_public(key: Key) -> Result<()> {
+  check_reserved_keys(key)
+}
+
+#[derive(Clone)]
+pub struct UserConfigPaths {
+  pub config_file_path: PathBuf,
 }
