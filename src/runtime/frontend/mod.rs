@@ -414,6 +414,18 @@ fn next_deadline(app: &App) -> Option<(Instant, crate::runtime::engine::TimerFac
         crate::runtime::engine::TimerFact::SeekThrottleElapsed,
       )
     }),
+    app.state_save_due.map(|deadline| {
+      (
+        deadline,
+        crate::runtime::engine::TimerFact::RuntimeStateSaveDue,
+      )
+    }),
+    app.persisted_session_deadline().map(|deadline| {
+      (
+        deadline,
+        crate::runtime::engine::TimerFact::PlaybackSessionPersistDue,
+      )
+    }),
   ];
   if app.auth_state.connected && !app.auth_state.refresh_in_progress {
     if let Some(expiry) = app.auth_state.token_expiry {
@@ -592,16 +604,9 @@ async fn driver_loop(
   }
 
   // The runner's quit sequence, minus terminal teardown.
-  let session = app.lock().await.current_persisted_session();
-  if let Some(session) = session {
-    if let Ok(path) = crate::core::persisted_playback::default_session_path() {
-      if let Err(e) = crate::core::persisted_playback::save(&path, &session) {
-        log::warn!("[session] failed to persist playback session on exit: {e}");
-      }
-    }
-  }
   {
     let mut app = app.lock().await;
+    app.flush_persisted_session_force();
     driver.on_quit(&mut app);
   }
   // Persistence scheduling is fold-owned; producers only request the flush.
@@ -1115,6 +1120,8 @@ fn apply_timer_fact(app: &mut App, fact: crate::runtime::engine::TimerFact) {
       app.flush_pending_api_seek();
       app.flush_pending_source_seek();
     }
+    TimerFact::RuntimeStateSaveDue => app.flush_state_save(false),
+    TimerFact::PlaybackSessionPersistDue => app.flush_persisted_session(),
   }
 }
 
@@ -3599,6 +3606,13 @@ mod tests {
     assert_eq!(
       next_deadline(&app).map(|(_, fact)| fact),
       Some(crate::runtime::engine::TimerFact::AuthRefreshDue)
+    );
+
+    let mut app = App::default();
+    app.state_save_due = Some(now);
+    assert_eq!(
+      next_deadline(&app).map(|(_, fact)| fact),
+      Some(crate::runtime::engine::TimerFact::RuntimeStateSaveDue)
     );
   }
 

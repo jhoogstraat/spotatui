@@ -474,6 +474,11 @@ pub struct App {
   /// the status bar into error mode, where `set_status_message` refuses to
   /// overwrite it and every ordinary message is dropped for the rest of the run.
   pub state_save_error_reported: bool,
+  /// Next explicit deadline for persisting the active decoded playback
+  /// session; `None` means no session is active or a save is not armed.
+  pub session_save_due: Option<Instant>,
+  /// Whether a persisted session file represents the previous active session.
+  pub session_was_present: bool,
   /// Reference to the native streaming player for direct control (bypasses event channel)
   #[cfg(feature = "streaming")]
   pub streaming_player: Option<Arc<crate::infra::player::StreamingPlayer>>,

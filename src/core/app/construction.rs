@@ -172,6 +172,8 @@ impl Default for App {
       state_save_due: None,
       pending_state_save_patch: PersistedRuntimeState::default(),
       state_save_error_reported: false,
+      session_save_due: None,
+      session_was_present: false,
       pending_volume: None,
       last_dispatched_volume: None,
       #[cfg(feature = "streaming")]

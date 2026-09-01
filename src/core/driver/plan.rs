@@ -9,48 +9,6 @@
 use crate::core::art::CoverArtStatus;
 #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
 use crate::infra::queue::{advance_decision, Decision, RepeatMode};
-use std::time::{Duration, Instant};
-
-/// How often the active non-Spotify playback session is persisted to
-/// `last_session.yml` while it keeps playing.
-const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(3);
-
-/// What the session persister should do this tick.
-#[derive(Debug, PartialEq)]
-pub(super) enum SessionPersist {
-  /// A save is due: snapshot the session and write it.
-  Save,
-  /// The session just ended (Some -> None transition): clear the file so a
-  /// stale session is never resurrected on the next launch.
-  Clear,
-  None,
-}
-
-/// Throttled `last_session.yml` persistence: save at most every
-/// [`SESSION_SAVE_INTERVAL`] while a session is active (immediately on the
-/// first tick that has one), and clear the file exactly once when it goes
-/// away.
-pub(super) fn session_persist_action(
-  has_session: bool,
-  was_present: bool,
-  last_save: Option<Instant>,
-  now: Instant,
-) -> SessionPersist {
-  if has_session {
-    let due = last_save
-      .map(|t| now.duration_since(t) >= SESSION_SAVE_INTERVAL)
-      .unwrap_or(true);
-    if due {
-      SessionPersist::Save
-    } else {
-      SessionPersist::None
-    }
-  } else if was_present {
-    SessionPersist::Clear
-  } else {
-    SessionPersist::None
-  }
-}
 
 /// Whether the native queue slot's finished track should advance the queue.
 /// `advancing` is the atomic check-and-set flag that guarantees one dispatch
@@ -143,46 +101,6 @@ pub(super) fn cover_art_action(
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn first_tick_with_a_session_saves_immediately() {
-    let now = Instant::now();
-    assert_eq!(
-      session_persist_action(true, false, None, now),
-      SessionPersist::Save
-    );
-  }
-
-  #[test]
-  fn session_saves_are_throttled_to_the_interval() {
-    let t0 = Instant::now();
-    let just_after = t0 + Duration::from_secs(1);
-    let past_interval = t0 + SESSION_SAVE_INTERVAL;
-
-    assert_eq!(
-      session_persist_action(true, true, Some(t0), just_after),
-      SessionPersist::None
-    );
-    assert_eq!(
-      session_persist_action(true, true, Some(t0), past_interval),
-      SessionPersist::Save
-    );
-  }
-
-  #[test]
-  fn ending_a_session_clears_the_file_exactly_once() {
-    let now = Instant::now();
-    // Some -> None transition: clear.
-    assert_eq!(
-      session_persist_action(false, true, Some(now), now),
-      SessionPersist::Clear
-    );
-    // Already cleared (was_present false): nothing left to do.
-    assert_eq!(
-      session_persist_action(false, false, None, now),
-      SessionPersist::None
-    );
-  }
 
   #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
   mod decoded {

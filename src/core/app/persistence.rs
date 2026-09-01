@@ -3,8 +3,71 @@ use super::*;
 /// Debounce window for coalescing hot-path runtime-state saves (volume,
 /// shuffle) into one disk write, and the retry delay after a failed save.
 const STATE_SAVE_DEBOUNCE_MS: u64 = 500;
+const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(3);
 
 impl App {
+  /// Return the next explicit deadline for persisted playback. The first save
+  /// is immediate; subsequent saves retain the historical three-second
+  /// cadence. A transition to no session gets one immediate clear deadline.
+  pub(crate) fn persisted_session_deadline(&self) -> Option<Instant> {
+    if self.has_persistable_session() {
+      Some(self.session_save_due.unwrap_or_else(Instant::now))
+    } else if self.session_was_present {
+      Some(Instant::now())
+    } else {
+      None
+    }
+  }
+
+  /// Handle the named persisted-session deadline. Disk work runs on the
+  /// blocking pool; the fold only snapshots state and arms the next deadline.
+  pub(crate) fn flush_persisted_session(&mut self) {
+    let Some(deadline) = self.persisted_session_deadline() else {
+      return;
+    };
+    if Instant::now() < deadline {
+      return;
+    }
+    if let Some(session) = self.current_persisted_session() {
+      self.session_save_due = Some(Instant::now() + SESSION_SAVE_INTERVAL);
+      self.session_was_present = true;
+      tokio::task::spawn_blocking(move || {
+        if let Ok(path) = crate::core::persisted_playback::default_session_path() {
+          if let Err(error) = crate::core::persisted_playback::save(&path, &session) {
+            log::warn!("[session] failed to persist playback session: {error}");
+          }
+        }
+      });
+    } else if self.session_was_present {
+      self.session_save_due = None;
+      self.session_was_present = false;
+      tokio::task::spawn_blocking(|| {
+        if let Ok(path) = crate::core::persisted_playback::default_session_path() {
+          if let Err(error) = crate::core::persisted_playback::clear(&path) {
+            log::warn!("[session] failed to clear playback session: {error}");
+          }
+        }
+      });
+    }
+  }
+
+  /// Synchronously flush the persisted session during shutdown. Unlike the
+  /// deadline path this must complete before the runtime is dropped.
+  pub(crate) fn flush_persisted_session_force(&mut self) {
+    let result = match self.current_persisted_session() {
+      Some(session) => crate::core::persisted_playback::default_session_path()
+        .and_then(|path| crate::core::persisted_playback::save(&path, &session)),
+      None if self.session_was_present => crate::core::persisted_playback::default_session_path()
+        .and_then(|path| crate::core::persisted_playback::clear(&path)),
+      None => return,
+    };
+    if let Err(error) = result {
+      log::warn!("[session] failed to flush playback session on shutdown: {error}");
+    }
+    self.session_save_due = None;
+    self.session_was_present = self.current_persisted_session().is_some();
+  }
+
   /// Snapshot the currently-playing non-Spotify session for persistence, or
   /// `None` when Spotify (or nothing) owns playback. Reads the live position and
   /// pause state straight from whichever source's player is active, mirroring
@@ -427,6 +490,29 @@ mod tests {
     app.flush_state_save(false);
 
     assert!(!app.state_save_error_reported);
+  }
+
+  #[test]
+  fn an_inactive_session_only_arms_a_clear_after_one_was_saved() {
+    let mut app = make_app_simple();
+    assert!(app.persisted_session_deadline().is_none());
+
+    app.session_was_present = true;
+    assert!(app.persisted_session_deadline().is_some());
+  }
+
+  #[test]
+  fn stale_session_timer_does_not_bypass_the_armed_interval() {
+    let mut app = make_app_simple();
+    app
+      .native_queue
+      .push(queue_track(Some("track:queued"), "queued"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    app.session_save_due = Some(deadline);
+
+    app.flush_persisted_session();
+
+    assert_eq!(app.session_save_due, Some(deadline));
   }
 }
 

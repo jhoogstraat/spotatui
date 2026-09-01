@@ -3,10 +3,11 @@
 //! playback correctly by calling [`Driver::tick`] at its tick rate.
 //!
 //! One tick advances playback state (`App::update_on_tick` plus the debounced
-//! seek/volume/state flushes), refreshes the OAuth token, syncs OS presence
+//! seek/volume flushes), refreshes the OAuth token, syncs OS presence
 //! (Discord, MPRIS, window title), detects track changes (lyrics + cover
-//! art), auto-advances the native queue and the decoded sources, persists the
-//! non-Spotify session, and feeds the audio visualizer.
+//! art), auto-advances the native queue and the decoded sources, and feeds the
+//! audio visualizer. Runtime-state and decoded-session persistence are owned by
+//! the Playback Engine's explicit deadline facts.
 //!
 //! What stays with the frontend, injected through [`TickEnv`] or kept at the
 //! call site: the visualizer bar count (a function of frontend geometry), the
@@ -140,12 +141,6 @@ pub struct Driver {
   /// art changes.
   #[cfg(feature = "art-decode")]
   last_cover_art_key: Option<String>,
-  /// Throttle state for `last_session.yml` (see `plan::session_persist_action`):
-  /// `last_session_save` spaces the periodic writes; `session_was_present`
-  /// lets a Some -> None transition (queue ended, switched to Spotify) clear
-  /// the file so a stale session is never resurrected.
-  last_session_save: Option<Instant>,
-  session_was_present: bool,
   /// Whether the active internet-radio stream has produced audio yet, so the
   /// tick can tell "stream just started, sink not filled" apart from "stream
   /// died / drained" — both of which report `is_finished()` (empty sink).
@@ -211,8 +206,6 @@ impl Driver {
       last_track_identity: None,
       #[cfg(feature = "art-decode")]
       last_cover_art_key: None,
-      last_session_save: None,
-      session_was_present: false,
       #[cfg(feature = "internet-radio")]
       radio_stream_started: false,
     }
@@ -220,9 +213,9 @@ impl Driver {
 
   /// One tick. The frontend calls this at its tick rate with the `App` lock
   /// held; everything slow (file I/O, network) is dispatched off-lock. Must
-  /// run inside a Tokio runtime: session persistence goes through
+  /// run inside a Tokio runtime: some source operations use
   /// `tokio::task::spawn_blocking`, which panics without one.
-  pub fn tick(&mut self, app: &mut App, elapsed: Duration, env: TickEnv) {
+  pub fn tick(&mut self, app: &mut App, elapsed: Duration, _env: TickEnv) {
     #[cfg(feature = "streaming")]
     if let Some(player) = app.streaming_player.clone() {
       if let Some(error) = player.take_audio_backend_error() {
@@ -245,7 +238,6 @@ impl Driver {
     app.update_on_tick(elapsed);
 
     app.flush_pending_volume();
-    app.flush_state_save(false);
 
     #[cfg(feature = "scripting")]
     if let Some(engine) = self.script_engine.as_mut() {
@@ -330,7 +322,7 @@ impl Driver {
         use crate::core::art::CoverArtStatus;
         let enabled = app
           .user_config
-          .needs_cover_art(env.cover_art_full_image_support);
+          .needs_cover_art(_env.cover_art_full_image_support);
         let desired = if enabled {
           snapshot
             .as_ref()
@@ -547,46 +539,6 @@ impl Driver {
       }
     }
 
-    // Persist the active non-Spotify session so it resumes on next launch.
-    // Throttled to avoid churning the file every tick; a Some -> None
-    // transition (queue ended, or switched to Spotify) clears it instead.
-    let has_session = app.has_persistable_session();
-    match plan::session_persist_action(
-      has_session,
-      self.session_was_present,
-      self.last_session_save,
-      env.now,
-    ) {
-      plan::SessionPersist::Save => {
-        self.last_session_save = Some(env.now);
-        // Snapshot (clones the queue) only when a save is actually due,
-        // not on every tick.
-        if let Some(session) = app.current_persisted_session() {
-          // Fire-and-forget on the blocking pool: file I/O never blocks the
-          // UI tick, and a dropped handle still runs to completion.
-          tokio::task::spawn_blocking(move || {
-            if let Ok(path) = crate::core::persisted_playback::default_session_path() {
-              if let Err(e) = crate::core::persisted_playback::save(&path, &session) {
-                log::warn!("[session] failed to persist playback session: {e}");
-              }
-            }
-          });
-        }
-      }
-      plan::SessionPersist::Clear => {
-        self.last_session_save = None;
-        tokio::task::spawn_blocking(|| {
-          if let Ok(path) = crate::core::persisted_playback::default_session_path() {
-            if let Err(e) = crate::core::persisted_playback::clear(&path) {
-              log::warn!("[session] failed to clear playback session: {e}");
-            }
-          }
-        });
-      }
-      plan::SessionPersist::None => {}
-    }
-    self.session_was_present = has_session;
-
     #[cfg(feature = "streaming")]
     if !source_owns_playback {
       if let Some(ref pos) = self.shared_position {
@@ -617,7 +569,7 @@ impl Driver {
     }
 
     #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-    match env.viz_bars {
+    match _env.viz_bars {
       Some(desired_bars) => {
         if self.audio_capture.is_none() {
           // Built at the count we are about to ask for, so the first frame

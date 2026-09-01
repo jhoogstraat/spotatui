@@ -87,6 +87,10 @@ pub enum TimerFact {
   PlaybackResync,
   /// Flush the latest coalesced seek after its throttle window.
   SeekThrottleElapsed,
+  /// Flush a debounced runtime-state patch.
+  RuntimeStateSaveDue,
+  /// Persist or clear the active decoded playback session.
+  PlaybackSessionPersistDue,
 }
 
 /// Fold-owned writes produced by the listening-history collector.
