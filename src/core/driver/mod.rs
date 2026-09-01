@@ -22,17 +22,11 @@ mod plan;
 mod presence;
 
 use crate::core::app::{App, RouteId};
-#[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-use crate::infra::audio;
 #[cfg(feature = "discord-rpc")]
 use crate::infra::discord_rpc;
 #[cfg(all(feature = "mpris", target_os = "linux"))]
 use crate::infra::mpris;
 use crate::infra::network::IoEvent;
-#[cfg(feature = "scripting")]
-use crate::infra::scripting::ScriptEngine;
-#[cfg(feature = "scripting")]
-use log::info;
 use std::sync::{atomic::AtomicU64, Arc};
 use std::time::{Duration, Instant};
 
@@ -46,68 +40,11 @@ pub type MprisHandle = Option<Arc<mpris::MprisManager>>;
 #[cfg(not(all(feature = "mpris", target_os = "linux")))]
 pub type MprisHandle = Option<()>;
 
-/// Identity of the currently-playing track, used by the shared track-change
-/// detector to fire lyrics + cover-art fetches exactly once per track (rather
-/// than every tick). Title + artists + album + duration distinguishes tracks
-/// across every source without depending on a source-specific id.
-type TrackIdentity = (String, Vec<String>, String, u32);
-
-fn track_identity(snapshot: &crate::infra::media_metadata::PlaybackSnapshot) -> TrackIdentity {
-  (
-    snapshot.metadata.title.clone(),
-    snapshot.metadata.artists.clone(),
-    snapshot.metadata.album.clone(),
-    snapshot.metadata.duration_ms,
-  )
-}
-
-/// Resolve what cover art to fetch for the track described by `snapshot`.
-///
-/// Local files carry embedded artwork read straight from the file (no URL), so
-/// they take a dedicated `LocalFile` request. Every other source that can supply
-/// art (Spotify album art, YouTube thumbnail, Subsonic getCoverArt) surfaces it
-/// as `snapshot.metadata.image_url`. `None` means the current track has no art
-/// to show (e.g. internet radio, or a Spotify item without images).
-#[cfg(feature = "art-decode")]
-fn cover_art_request_for(
-  app: &App,
-  snapshot: &crate::infra::media_metadata::PlaybackSnapshot,
-) -> Option<crate::core::art::CoverArtRequest> {
-  use crate::core::art::CoverArtRequest;
-
-  #[cfg(feature = "local-files")]
-  if let Some(local) = app.local_playback.as_ref() {
-    let uri = local.queue.get(local.index)?;
-    let path = crate::infra::local::file_uri_to_path(uri).ok()?;
-    return Some(CoverArtRequest::LocalFile {
-      key: uri.clone(),
-      path,
-    });
-  }
-  #[cfg(not(feature = "local-files"))]
-  let _ = app;
-
-  snapshot
-    .metadata
-    .image_url
-    .clone()
-    .map(CoverArtRequest::Url)
-}
-
 /// Per-tick inputs only the frontend can supply.
 pub struct TickEnv {
   /// Wall-clock instant of this tick; injected so the driver's throttling
   /// decisions stay deterministic under test.
   pub now: Instant,
-  /// Visualizer bar count resolved from the frontend's geometry, or `None`
-  /// while the analysis view is not showing (which releases the capture).
-  #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-  pub viz_bars: Option<usize>,
-  /// Whether the frontend renders real pixels for cover art (the terminal
-  /// image-protocol probe); false in a decode-only build, where art is
-  /// fetched solely for the adaptive theme.
-  #[cfg(feature = "art-decode")]
-  pub cover_art_full_image_support: bool,
 }
 
 /// The scheduler's own state: everything that used to live as locals of the
@@ -120,10 +57,6 @@ pub struct Driver {
   mpris_manager: MprisHandle,
   #[cfg(feature = "discord-rpc")]
   discord_rpc_manager: DiscordRpcHandle,
-  #[cfg(feature = "scripting")]
-  script_engine: Option<ScriptEngine>,
-  #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-  audio_capture: Option<audio::AudioCaptureManager>,
   /// Previous tick's `is_streaming_active`, so a native session that ends can
   /// push a final stopped state to MPRIS clients.
   #[cfg(all(feature = "mpris", target_os = "linux"))]
@@ -133,14 +66,6 @@ pub struct Driver {
   #[cfg(all(feature = "mpris", target_os = "linux"))]
   mpris_state: presence::MprisState,
   window_title: presence::WindowTitleState,
-  /// Last track the shared detector fired lyrics for, so the lookup re-fires
-  /// only on an actual track change rather than every tick.
-  last_track_identity: Option<TrackIdentity>,
-  /// Cache key (URL / file URI) of the cover art last requested, so the
-  /// per-tick cover-art evaluation dispatches a fetch only when the resolved
-  /// art changes.
-  #[cfg(feature = "art-decode")]
-  last_cover_art_key: Option<String>,
   /// Whether the active internet-radio stream has produced audio yet, so the
   /// tick can tell "stream just started, sink not filled" apart from "stream
   /// died / drained" — both of which report `is_finished()` (empty sink).
@@ -159,43 +84,12 @@ impl Driver {
     #[cfg(not(feature = "discord-rpc"))]
     let _ = discord_rpc_manager;
 
-    // The Lua VM (plus its HTTP client) is only constructed when the user
-    // actually has script files; a zero-plugin install skips the engine — and
-    // its per-tick `on_tick` dispatch — entirely.
-    #[cfg(feature = "scripting")]
-    let script_engine: Option<ScriptEngine> = {
-      let config_dir = crate::core::user_config::default_app_config_dir();
-      match config_dir {
-        Some(config_dir) if ScriptEngine::has_user_scripts(&config_dir) => {
-          match ScriptEngine::new() {
-            Ok(mut engine) => {
-              let loaded = engine.load_user_scripts(&config_dir);
-              info!("loaded {loaded} lua plugin file(s)");
-              Some(engine)
-            }
-            Err(e) => {
-              log::error!("failed to initialize lua scripting engine: {e}");
-              None
-            }
-          }
-        }
-        _ => {
-          info!("no lua plugin files found; scripting engine not started");
-          None
-        }
-      }
-    };
-
     Driver {
       shared_position,
       #[cfg(all(feature = "mpris", target_os = "linux"))]
       mpris_manager,
       #[cfg(feature = "discord-rpc")]
       discord_rpc_manager,
-      #[cfg(feature = "scripting")]
-      script_engine,
-      #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-      audio_capture: None,
       #[cfg(all(feature = "mpris", target_os = "linux"))]
       prev_is_streaming_active: false,
       #[cfg(feature = "discord-rpc")]
@@ -203,9 +97,6 @@ impl Driver {
       #[cfg(all(feature = "mpris", target_os = "linux"))]
       mpris_state: presence::MprisState::default(),
       window_title: presence::WindowTitleState::default(),
-      last_track_identity: None,
-      #[cfg(feature = "art-decode")]
-      last_cover_art_key: None,
       #[cfg(feature = "internet-radio")]
       radio_stream_started: false,
     }
@@ -239,11 +130,6 @@ impl Driver {
 
     app.flush_pending_volume();
 
-    #[cfg(feature = "scripting")]
-    if let Some(engine) = self.script_engine.as_mut() {
-      engine.on_tick(app);
-    }
-
     #[cfg(feature = "discord-rpc")]
     if let Some(ref manager) = self.discord_rpc_manager {
       presence::update_discord_presence(manager, &mut self.discord_presence, app);
@@ -252,115 +138,6 @@ impl Driver {
     #[cfg(all(feature = "mpris", target_os = "linux"))]
     if let Some(ref mpris) = self.mpris_manager {
       presence::update_mpris_state(mpris, &mut self.mpris_state, app);
-    }
-
-    // Shared track-change detector. One place decides "the playing track
-    // changed" off the source-agnostic snapshot, then drives BOTH lyrics
-    // (every source) and cover art (cover-art feature) — so both light up
-    // for Spotify, local files, Subsonic, radio and YouTube through a single
-    // path.
-    {
-      let snapshot = crate::infra::media_metadata::current_playback_snapshot(app);
-
-      // Lyrics fire once per track (identity latch): their inputs — title,
-      // artist, duration — ARE the identity, so they are correct at the
-      // instant the identity changes.
-      let identity = snapshot.as_ref().map(track_identity);
-      if identity != self.last_track_identity {
-        self.last_track_identity = identity;
-        match snapshot.as_ref() {
-          Some(snapshot) => {
-            use crate::infra::media_metadata::PlaybackItemKind;
-            // LRCLIB lookup by title + artist + duration. Source agnostic;
-            // radio (duration 0) simply resolves to "not found". Podcast
-            // episodes have no lyrics, so skip the lookup and show the
-            // not-found message rather than stale lyrics.
-            if snapshot.item_kind == PlaybackItemKind::Track {
-              let title = snapshot.metadata.title.clone();
-              // The identity latch keys on the joined display credit, but the
-              // LRCLIB lookup needs the structured artist list so it can fall
-              // back to the primary artist alone for collaborations (#410).
-              let artists = snapshot.metadata.artists.clone();
-              app.desired_lyrics_identity = Some((title.clone(), artists.join(", ")));
-              app.dispatch(IoEvent::GetLyrics(
-                title,
-                artists,
-                snapshot.metadata.duration_ms as f64 / 1000.0,
-              ));
-            } else {
-              app.desired_lyrics_identity = None;
-              app.lyrics = None;
-              app.lyrics_status = crate::core::app::LyricsStatus::NotFound;
-              app
-                .plugin_data_generations
-                .bump(crate::core::app::PluginDataKind::Lyrics);
-            }
-          }
-          None => {
-            app.desired_lyrics_identity = None;
-            // Nothing is playing: reset so no stale lyrics linger.
-            app.lyrics = None;
-            app.lyrics_status = crate::core::app::LyricsStatus::NotStarted;
-            app
-              .plugin_data_generations
-              .bump(crate::core::app::PluginDataKind::Lyrics);
-          }
-        }
-      }
-
-      // Cover art is re-evaluated EVERY tick against the desired image key,
-      // NOT latched to the identity change. With native streaming the
-      // snapshot's `image_url` comes from the polled Spotify context, which
-      // catches up seconds *after* `native_track_info` flips the identity —
-      // an identity-latched fetch would fire once with the previous track's
-      // URL (or none at startup) and never see the real one, leaving the art
-      // stuck or missing until restart. Comparing against
-      // `last_cover_art_key` keeps this a no-op on quiet ticks and fires
-      // exactly once whenever the resolved art actually changes.
-      #[cfg(feature = "art-decode")]
-      {
-        use crate::core::art::CoverArtStatus;
-        let enabled = app
-          .user_config
-          .needs_cover_art(_env.cover_art_full_image_support);
-        let desired = if enabled {
-          snapshot
-            .as_ref()
-            .and_then(|snapshot| cover_art_request_for(app, snapshot))
-        } else {
-          None
-        };
-        match plan::cover_art_action(
-          desired.as_ref().map(|request| request.key()),
-          self.last_cover_art_key.as_deref(),
-          app.cover_art.available(),
-          enabled,
-          snapshot.is_some(),
-        ) {
-          plan::CoverArtAction::Fetch => {
-            let request = desired.expect("Fetch is only planned with a desired request");
-            app.desired_cover_art_key = Some(request.key().to_string());
-            self.last_cover_art_key = Some(request.key().to_string());
-            // Keep the previous image on screen until the new one
-            // resolves (smooth swap); the fetch runs off-lock.
-            app.cover_art.status = CoverArtStatus::Loading;
-            app.dispatch(IoEvent::FetchCoverArt(request));
-          }
-          plan::CoverArtAction::Keep => {
-            app.desired_cover_art_key = desired.map(|request| request.key().to_string());
-          }
-          plan::CoverArtAction::Drop { clear, status } => {
-            app.desired_cover_art_key = None;
-            self.last_cover_art_key = None;
-            // No art to show (radio, art disabled, nothing playing): drop
-            // any stale image once, so the pane shows the placeholder.
-            if clear {
-              app.clear_cover_art();
-            }
-            app.cover_art.status = status;
-          }
-        }
-      }
     }
 
     // Native queue slot: when the queued track finishes, advance the queue
@@ -567,34 +344,6 @@ impl Driver {
         }
       }
     }
-
-    #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-    match _env.viz_bars {
-      Some(desired_bars) => {
-        if self.audio_capture.is_none() {
-          // Built at the count we are about to ask for, so the first frame
-          // does not immediately throw the fresh cavacore plan away.
-          self.audio_capture = audio::AudioCaptureManager::new(desired_bars);
-          app.audio_capture_active = self.audio_capture.is_some();
-        }
-
-        if let Some(ref capture) = self.audio_capture {
-          if let Some(spectrum) = capture.get_spectrum(desired_bars) {
-            app.spectrum_data = Some(spectrum);
-          }
-          // Kept outside the spectrum arm: a dead stream must drop the
-          // "Capturing audio" status instead of freezing it on.
-          app.audio_capture_active = capture.is_active();
-        }
-      }
-      None => {
-        if self.audio_capture.is_some() {
-          self.audio_capture = None;
-          app.audio_capture_active = false;
-          app.spectrum_data = None;
-        }
-      }
-    }
   }
 
   /// The one-shot startup dispatch, fired by the frontend right after its
@@ -649,22 +398,6 @@ impl Driver {
     if let Some(uri) = app.pending_play_file.take() {
       app.dispatch(IoEvent::StartPlayback(Some(uri), None, None));
     }
-
-    #[cfg(feature = "scripting")]
-    if let Some(engine) = self.script_engine.as_mut() {
-      engine.on_start(app);
-    }
-  }
-
-  /// Run any plugin commands a keypress queued; the frontend calls this after
-  /// each key event. No-op without the `scripting` feature.
-  pub fn run_pending_script_commands(&mut self, app: &mut App) {
-    #[cfg(feature = "scripting")]
-    if let Some(engine) = self.script_engine.as_mut() {
-      engine.run_pending_commands(app);
-    }
-    #[cfg(not(feature = "scripting"))]
-    let _ = app;
   }
 
   /// The window title the frontend should apply now, or `None` when it is
@@ -677,16 +410,6 @@ impl Driver {
   /// On teardown: the default title to restore if this session changed it.
   pub fn window_title_reset(&mut self) -> Option<&'static str> {
     presence::window_title_reset(&mut self.window_title)
-  }
-
-  /// The scripting quit hook. No-op without the `scripting` feature.
-  pub fn on_quit(&mut self, app: &mut App) {
-    #[cfg(feature = "scripting")]
-    if let Some(engine) = self.script_engine.as_mut() {
-      engine.on_quit(app);
-    }
-    #[cfg(not(feature = "scripting"))]
-    let _ = app;
   }
 
   /// Clear any published rich presence on the way out.

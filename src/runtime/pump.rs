@@ -1,5 +1,4 @@
-//! The serial IoEvent pump: source routing by URI scheme, the service lane,
-//! and the party-relay drain. Every frontend drives `App` through this.
+//! The serial IoEvent pump: source routing by URI scheme and the service lane.
 
 use crate::infra::network::{IoEvent, Network};
 
@@ -19,20 +18,11 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
     }
   });
 
-  // Party relay messages used to piggyback on the 5ms poll loop; with the pump
-  // parked on recv(), drain them on an interval instead.
-  let mut party_poll = tokio::time::interval(std::time::Duration::from_millis(25));
-  party_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
   loop {
     let io_event = tokio::select! {
       maybe_event = bridge_rx.recv() => match maybe_event {
         Some(io_event) => io_event,
         None => break,
-      },
-      _ = party_poll.tick(), if network.party_incoming_rx.is_some() => {
-        network.process_party_messages().await;
-        continue;
       }
     };
 
@@ -132,7 +122,6 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
         network.app.lock().await.is_loading = false;
       }
     }
-    network.process_party_messages().await;
     // Bell the frontend snapshot publisher: one poke per pump iteration.
     network.app.lock().await.change_notify.notify_one();
   }

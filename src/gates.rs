@@ -9,11 +9,8 @@
 //! every counter to its baseline exactly, so a PR that moves a number must
 //! also move the file. The direction is enforced by
 //! `tools/check_gates_ratchet.sh` against the merge base: coupling counters
-//! may only fall, while the two adoption counters may only rise.
-//! `test_attribute_total` is the first adoption counter, so a refactor cannot
-//! silently delete a test module's worth of tests (it is a text count over
-//! `src/`, so it catches deletions, not a module that still compiles under a
-//! stale feature gate but stops running). `action_refs_in_tui_handlers` is
+//! may only fall. The historical test-count adoption counter was retired with
+//! terminal-only test modules in issue #16. `action_refs_in_tui_handlers` is
 //! the second: shared `Action::` uses in production handler code, which must
 //! rise with every handler conversion. Without it a conversion could replace
 //! field writes with arbitrary `App` method calls and never adopt the shared
@@ -236,9 +233,6 @@ fn ratchet_counters_match_the_checked_in_baselines() {
 
   // Needles that would otherwise count their own literal in this file are
   // assembled with concat! (this file lives under the `src/` scan).
-  let test_attribute_total = count_occurrences(&["src"], &[], concat!("#[", "test]"))
-    + count_occurrences(&["src"], &[], concat!("#[", "tokio::test"));
-
   // Every Rust file is in scope; a new module cannot re-import the deleted
   // terminal frontend unseen. This file is the one exclusion: it names its own
   // needles in doc and data, and being test-only it cannot couple anything to
@@ -277,12 +271,11 @@ fn ratchet_counters_match_the_checked_in_baselines() {
       .join("events.rs");
     count_handler_mirror_writes(&read_source(&events_path))
   };
-  let measured: [(&str, usize); 3] = [
+  let measured: [(&str, usize); 2] = [
     (
       "wildcard_arms_in_action_tree",
       count_occurrences(&["src/core/action"], &[], "_ =>"),
     ),
-    ("test_attribute_total", test_attribute_total),
     ("handler_mirror_writes", handler_mirror_writes),
   ];
 

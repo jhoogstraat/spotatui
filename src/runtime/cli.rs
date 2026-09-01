@@ -11,10 +11,7 @@ use clap::{Arg, ArgMatches, Command as ClapApp};
 
 pub(super) fn build_clap_app() -> ClapApp {
   // `mut` is only exercised by the feature-gated subcommand additions below.
-  #[cfg_attr(
-    not(any(feature = "scripting", feature = "mcp-server")),
-    allow(unused_mut)
-  )]
+  #[cfg_attr(not(feature = "mcp-server"), allow(unused_mut))]
   let mut clap_app = add_self_update_cli(
     ClapApp::new(env!("CARGO_PKG_NAME"))
     .version(env!("CARGO_PKG_VERSION"))
@@ -57,11 +54,6 @@ pub(super) fn build_clap_app() -> ClapApp {
     .subcommand(cli::history_subcommand())
     .subcommand(cli::search_subcommand()),
   );
-
-  #[cfg(feature = "scripting")]
-  {
-    clap_app = clap_app.subcommand(cli::plugin_subcommand());
-  }
 
   #[cfg(feature = "mcp-server")]
   {

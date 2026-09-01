@@ -151,7 +151,7 @@ use crate::infra::network::library::{
   build_flat_playlist_items, maybe_prompt_community_pin, reconcile_playlist_selection,
 };
 use crate::infra::network::IoEvent;
-use crate::runtime::engine::{DeviceList, FoldAck, HostSyncState, PlaylistRefreshPrevious};
+use crate::runtime::engine::{DeviceList, FoldAck, PlaylistRefreshPrevious};
 
 pub use super::engine::EngineCommand as FrontendEngineCommand;
 
@@ -587,8 +587,6 @@ async fn driver_loop(
         elapsed,
         crate::core::driver::TickEnv {
           now: Instant::now(),
-          #[cfg(any(feature = "audio-viz", feature = "audio-viz-cpal"))]
-          viz_bars: None,
           #[cfg(feature = "art-decode")]
           cover_art_full_image_support: false,
         },
@@ -1021,9 +1019,6 @@ fn publish_playlist_refresh(
   let folder_items = build_folder_items(app, &playlists, folder_nodes);
 
   app.all_playlists = playlists;
-  app
-    .plugin_data_generations
-    .bump(crate::core::app::PluginDataKind::Playlists);
   app.playlist_folder_items = folder_items;
 
   reconcile_playlist_selection(
@@ -1566,9 +1561,6 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         } else {
           app.lyrics_status = crate::core::app::LyricsStatus::NotFound;
         }
-        app
-          .plugin_data_generations
-          .bump(crate::core::app::PluginDataKind::Lyrics);
       }
     }
     SessionFact::GlobalSongCount { count, failed } => {
@@ -1602,69 +1594,9 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         app.stats_loading = false;
       }
     }
-    SessionFact::Party { status, session } => {
-      app.party_status = status;
-      app.party_session = session;
-    }
-    SessionFact::PartySessionUpdate(update) => {
-      use crate::infra::network::sync::PartySessionFact;
-      match update {
-        PartySessionFact::RoomCode(code) => {
-          if let Some(session) = &mut app.party_session {
-            session.code = code;
-          }
-        }
-        PartySessionFact::HostName(name) => {
-          if let Some(session) = &mut app.party_session {
-            session.host_name = name;
-          }
-        }
-        PartySessionFact::GuestJoined(name) => {
-          if let Some(session) = &mut app.party_session {
-            if !session.guests.contains(&name) {
-              session.guests.push(name.clone());
-            }
-          }
-          // The old relay handlers wrote the toast fields directly (unscaled
-          // TTL, error message untouched) — keep that parity, not the
-          // `set_status_message` sink's scaling and error-suppression rules.
-          app.status_message = Some(format!("{name} joined the party"));
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
-        }
-        PartySessionFact::GuestLeft(name) => {
-          if let Some(session) = &mut app.party_session {
-            if let Some(pos) = session.guests.iter().position(|g| g == &name) {
-              session.guests.remove(pos);
-            }
-          }
-          app.status_message = Some(format!("{name} left the party"));
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(3));
-        }
-        PartySessionFact::ControlMode(mode) => {
-          if let Some(session) = &mut app.party_session {
-            session.control_mode = mode;
-          }
-        }
-        PartySessionFact::Ended(message) => {
-          app.party_status = crate::infra::network::sync::PartyStatus::Disconnected;
-          app.party_session = None;
-          // Direct write for parity with the old relay handler (see above).
-          app.status_message = Some(message);
-          app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(5));
-        }
-        PartySessionFact::Error(message) => {
-          app.party_status = crate::infra::network::sync::PartyStatus::Disconnected;
-          app.party_session = None;
-          app.handle_error(anyhow::anyhow!("Party: {message}"));
-        }
-      }
-    }
     SessionFact::RecentlyPlayed { page, navigate } => {
       app.recently_played.result = Some(page);
       app.sort_recently_played_items();
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::RecentlyPlayed);
       if navigate {
         app.push_navigation_stack(
           crate::core::app::RouteId::RecentlyPlayed,
@@ -1690,10 +1622,6 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     }
     SessionFact::QueueLanded(queue) => {
       app.queue = queue;
-      // Completion, not success, is what plugin data requests wait on.
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::Queue);
     }
     #[cfg(feature = "streaming")]
     SessionFact::PlaybackPolled {
@@ -1814,27 +1742,6 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     SessionFact::NativePlaybackIntentStopped => app.set_native_playback_intent(false),
     #[cfg(feature = "streaming")]
     SessionFact::ForceNativeRecovery => app.force_native_streaming_recovery(true),
-    #[cfg(feature = "art-decode")]
-    SessionFact::CoverArtFetched {
-      key,
-      image,
-      palette,
-    } => {
-      use crate::core::art::CoverArtStatus;
-      if app.desired_cover_art_key.as_deref() == Some(key.as_str()) {
-        match image {
-          Ok(image) => {
-            app.store_cover_art(key, image, palette);
-            app.cover_art.status = CoverArtStatus::Loaded;
-          }
-          Err(err) => {
-            log::warn!("cover art load failed: {err}");
-            app.clear_cover_art();
-            app.cover_art.status = CoverArtStatus::Failed;
-          }
-        }
-      }
-    }
     SessionFact::TransientStatus { message, ttl_secs } => {
       // Raw write for parity with the old direct `status_message` stores: no
       // TTL scaling, no error coupling.
@@ -1950,9 +1857,6 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
         }
       }
       app.devices = Some(payload);
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::Devices);
     }
     #[cfg(feature = "streaming")]
     SessionFact::ParkStartPlayback {
@@ -2231,9 +2135,6 @@ pub(crate) fn answer_query(
         || selected_is_in_first_page
       {
         app.all_playlists = first_items.clone();
-        app
-          .plugin_data_generations
-          .bump(crate::core::app::PluginDataKind::Playlists);
         app.playlist_folder_items = build_flat_playlist_items(&first_items);
         reconcile_playlist_selection(
           app,
@@ -2283,68 +2184,6 @@ pub(crate) fn answer_query(
       feed_url: app.user_config.behavior.announcement_feed_url.clone(),
       seen_ids: seen_ids.then(|| app.runtime_state.seen_announcement_ids.clone()),
     },
-    FoldQuery::PartyRelayUrl => {
-      FoldAnswer::StatusText(app.user_config.behavior.relay_server_url.clone())
-    }
-    FoldQuery::IsPartyHost => FoldAnswer::Bool(
-      matches!(&app.party_session, Some(s) if s.role == crate::infra::network::sync::PartyRole::Host),
-    ),
-    FoldQuery::IsPartyGuest => FoldAnswer::Bool(matches!(
-      &app.party_session,
-      Some(s) if s.role == crate::infra::network::sync::PartyRole::Guest
-    )),
-    FoldQuery::HostSyncState => {
-      let sync = match (&app.party_session, &app.current_playback_context) {
-        (Some(s), Some(ctx)) if s.role == crate::infra::network::sync::PartyRole::Host => {
-          let uri = match &ctx.item {
-            Some(rspotify::model::PlayableItem::Track(t)) => {
-              t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
-            }
-            Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
-            Some(_) | None => return FoldAnswer::HostSync(None),
-          };
-          Some(HostSyncState {
-            track_uri: uri,
-            position_ms: app.song_progress_ms as u64,
-            is_playing: ctx.is_playing,
-          })
-        }
-        _ => None,
-      };
-      FoldAnswer::HostSync(sync)
-    }
-    FoldQuery::GuestSyncCurrent => {
-      let uri = match &app.current_playback_context {
-        Some(ctx) => match &ctx.item {
-          Some(rspotify::model::PlayableItem::Track(t)) => {
-            t.id.as_ref().map(|id| id.uri()).unwrap_or_default()
-          }
-          Some(rspotify::model::PlayableItem::Episode(e)) => e.id.uri(),
-          Some(_) | None => String::new(),
-        },
-        None => String::new(),
-      };
-      let playing = app
-        .current_playback_context
-        .as_ref()
-        .map(|c| c.is_playing)
-        .unwrap_or(false);
-      let progress = app.song_progress_ms as u64;
-      FoldAnswer::GuestSyncCurrent(uri, playing, progress)
-    }
-    FoldQuery::ClaimLyricsFetch { identity } => {
-      // The lyrics fetch's claim (ticket 17): atomic identity re-check plus
-      // loading flip — the old two-block inline section. A superseded
-      // request (the track already changed again) never shows a spinner.
-      if app.desired_lyrics_identity.as_ref() == Some(&identity) {
-        app.lyrics_status = crate::core::app::LyricsStatus::Loading;
-        app.lyrics = None;
-        app.lyrics_synced = false;
-        FoldAnswer::Bool(true)
-      } else {
-        FoldAnswer::Bool(false)
-      }
-    }
     #[cfg(feature = "dj-core")]
     FoldQuery::DjVibe => FoldAnswer::DjVibe {
       vibe: app.dj.vibe.clone(),
@@ -2706,11 +2545,6 @@ pub(crate) fn answer_query(
       raw_next: app.native_raw_list_next_request(&previous_track_id),
       raw_list_exhausted: app.native_raw_list_playback_exhausted(&previous_track_id),
       native_device_id: app.native_device_id.clone(),
-    },
-    #[cfg(feature = "art-decode")]
-    FoldQuery::CoverArtState { key } => FoldAnswer::CoverArt {
-      current: app.desired_cover_art_key.as_deref() == Some(key.as_str()),
-      loaded: app.cover_art.key() == Some(key.as_str()),
     },
     FoldQuery::SavedTracksViewInfo => FoldAnswer::Bool(
       app.track_table.context == Some(crate::core::app::TrackTableContext::SavedTracks),

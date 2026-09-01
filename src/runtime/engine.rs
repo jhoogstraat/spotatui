@@ -460,14 +460,6 @@ pub enum SessionFact {
     stats: crate::infra::history::StatsData,
     streaks: crate::infra::history::StreakSummary,
   },
-  /// Party-mode state transition (status bar + optional session swap).
-  Party {
-    status: crate::infra::network::sync::PartyStatus,
-    session: Option<crate::infra::network::sync::PartySession>,
-  },
-  /// Party session field updates from the relay (room code, host name,
-  /// guest join/leave, control mode, room ended/error teardown).
-  PartySessionUpdate(crate::infra::network::sync::PartySessionFact),
   /// A completed recently-played page (liked checks are dispatched by the
   /// producer; the fold sorts + bumps + optionally navigates).
   RecentlyPlayed {
@@ -700,12 +692,6 @@ pub enum SessionFact {
   NativePlaybackIntentStopped,
   #[cfg(feature = "streaming")]
   ForceNativeRecovery,
-  #[cfg(feature = "art-decode")]
-  CoverArtFetched {
-    key: String,
-    image: Result<image::DynamicImage, String>,
-    palette: Option<crate::core::cover_theme::AlbumPalette>,
-  },
 }
 
 /// The parts of a DJ turn outcome the epilogue reports on.
@@ -861,12 +847,6 @@ impl std::fmt::Debug for SessionFact {
       SessionFact::NativePlaybackIntentStopped => f.write_str("NativePlaybackIntentStopped"),
       #[cfg(feature = "streaming")]
       SessionFact::ForceNativeRecovery => f.write_str("ForceNativeRecovery"),
-      #[cfg(feature = "art-decode")]
-      SessionFact::CoverArtFetched { key, image, .. } => f
-        .debug_struct("CoverArtFetched")
-        .field("key", key)
-        .field("ok", &image.is_ok())
-        .finish(),
       SessionFact::TransportStateMirrored {
         is_playing,
         shuffle,
@@ -910,14 +890,6 @@ impl std::fmt::Debug for SessionFact {
         .finish(),
       SessionFact::StatsLoaded { period, .. } => {
         f.debug_tuple("StatsLoaded").field(period).finish()
-      }
-      SessionFact::Party { status, session } => f
-        .debug_struct("Party")
-        .field("status", status)
-        .field("session", &session.is_some())
-        .finish(),
-      SessionFact::PartySessionUpdate(update) => {
-        f.debug_tuple("PartySessionUpdate").field(&update).finish()
       }
       SessionFact::RecentlyPlayed { navigate, .. } => f
         .debug_struct("RecentlyPlayed")
@@ -1255,22 +1227,6 @@ pub enum FoldQuery {
   /// The standing DJ vibe and whether auto-queue is on (vibe-effect text).
   #[cfg(feature = "dj-core")]
   DjVibe,
-  ClaimLyricsFetch {
-    /// The (track, joined-artists) identity the fetch was dispatched for.
-    identity: (String, String),
-  },
-  /// The relay server URL from the user config (the party connect paths).
-  PartyRelayUrl,
-  /// Whether a party session is live and hosting (relay commands from
-  /// guests are only accepted by the host).
-  IsPartyHost,
-  /// Whether a party session is live as a guest (incoming sync handling).
-  IsPartyGuest,
-  /// The host's playback identity to broadcast: current track URI, position,
-  /// and play state. `None` when not hosting or nothing is playing.
-  HostSyncState,
-  /// The guest's current playback identity: (uri, is_playing, progress).
-  GuestSyncCurrent,
   /// The announcement-surface sources: whether the feature is enabled, the
   /// configured feed URL, and the seen-announcement dedup set.
   AnnouncementSources { seen_ids: bool },
@@ -1454,9 +1410,6 @@ pub enum FoldQuery {
   /// Native continuation's check-and-read step.
   #[cfg(feature = "streaming")]
   NativeContinuationState { previous_track_id: String },
-  /// Cover-art key gate before starting an off-lock fetch.
-  #[cfg(feature = "art-decode")]
-  CoverArtState { key: String },
 }
 
 /// The answer side of [`FoldQuery`]. Kept as a plain enum so the fold can
@@ -1518,10 +1471,6 @@ pub enum FoldAnswer {
     feed_url: Option<String>,
     seen_ids: Option<Vec<String>>,
   },
-  /// The host's playback identity to broadcast (`None` = nothing to sync).
-  HostSync(Option<HostSyncState>),
-  /// The guest's current playback identity: (uri, is_playing, progress).
-  GuestSyncCurrent(String, bool, u64),
   /// Status text a fold query computed (the add-to-playlist ack).
   StatusText(String),
   /// The registration result for a playlist refresh (the page-1 install).
@@ -1594,11 +1543,6 @@ pub enum FoldAnswer {
     raw_next: Option<crate::core::app::PendingStartPlayback>,
     raw_list_exhausted: bool,
     native_device_id: Option<String>,
-  },
-  #[cfg(feature = "art-decode")]
-  CoverArt {
-    current: bool,
-    loaded: bool,
   },
 }
 
@@ -1679,13 +1623,6 @@ impl std::fmt::Debug for FoldAnswer {
         .field("enabled", enabled)
         .field("seen_ids", &seen_ids.is_some())
         .finish_non_exhaustive(),
-      FoldAnswer::HostSync(v) => f.debug_tuple("HostSync").field(&v.is_some()).finish(),
-      FoldAnswer::GuestSyncCurrent(uri, playing, progress) => f
-        .debug_tuple("GuestSyncCurrent")
-        .field(&uri.len())
-        .field(playing)
-        .field(&progress)
-        .finish(),
       FoldAnswer::StatusText(v) => f.debug_tuple("StatusText").field(v).finish(),
       FoldAnswer::PlaylistRefreshRegistered { generation, .. } => f
         .debug_struct("PlaylistRefreshRegistered")
@@ -1759,12 +1696,6 @@ impl std::fmt::Debug for FoldAnswer {
         .field("exhausted", raw_list_exhausted)
         .field("device", &native_device_id)
         .finish(),
-      #[cfg(feature = "art-decode")]
-      FoldAnswer::CoverArt { current, loaded } => f
-        .debug_struct("CoverArt")
-        .field("current", current)
-        .field("loaded", loaded)
-        .finish(),
     }
   }
 }
@@ -1814,15 +1745,6 @@ impl From<&rspotify::model::device::DevicePayload> for DeviceList {
         .collect(),
     }
   }
-}
-
-/// The host's playback identity to broadcast from the fold (ticket 17):
-/// the old inline read of party host + context + progress.
-#[derive(Debug, Clone)]
-pub struct HostSyncState {
-  pub track_uri: String,
-  pub position_ms: u64,
-  pub is_playing: bool,
 }
 
 // --- Ticket 17 (playback family): native-shuffle session claims. All

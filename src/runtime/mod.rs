@@ -116,13 +116,6 @@ pub async fn run_cli() -> Result<()> {
     return Ok(());
   }
 
-  // Plugin management is pure git + filesystem work; it must not require Spotify auth.
-  #[cfg(feature = "scripting")]
-  if let Some(plugin_matches) = matches.subcommand_matches("plugin") {
-    crate::cli::handle_plugin_command(plugin_matches)?;
-    return Ok(());
-  }
-
   // Without any UI, a bare invocation has nothing to launch; only the CLI
   // subcommands work. Bail before any first-run prompt would fire.
   if matches.subcommand_name().is_none() {

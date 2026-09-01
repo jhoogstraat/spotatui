@@ -3,8 +3,6 @@ use super::*;
 impl Default for App {
   fn default() -> Self {
     App {
-      spectrum_data: None,
-      audio_capture_active: false,
       album_table_context: AlbumTableContext::Full,
       discover_top_tracks: vec![],
       discover_artists_mix: vec![],
@@ -147,12 +145,9 @@ impl Default for App {
       album_sort: SortState::new(),
       artist_sort: SortState::new(),
       recently_played_sort: SortState::new(),
-      last_party_sync_at: Instant::now(),
       status_message: None,
       status_message_expires_at: None,
       status_message_is_error: false,
-      party_status: PartyStatus::default(),
-      party_session: None,
       pending_track_table_selection: None,
       playlist_track_positions: None,
       pending_playlist_track_add: None,
@@ -204,16 +199,6 @@ impl Default for App {
       native_playback_generation: 0,
       #[cfg(all(feature = "mpris", target_os = "linux"))]
       mpris_manager: None,
-      #[cfg(feature = "art-decode")]
-      cover_art: crate::core::art::CoverArtStore::default(),
-      #[cfg(feature = "art-decode")]
-      desired_cover_art_key: None,
-      #[cfg(feature = "art-decode")]
-      cover_art_palette: None,
-      #[cfg(feature = "art-decode")]
-      cover_theme_state: crate::core::cover_theme::CoverThemeState::default(),
-      #[cfg(feature = "art-decode")]
-      theme_transition: None,
       #[cfg(feature = "dj-core")]
       dj: crate::infra::dj::DjState::default(),
       create_playlist_tracks: Vec::new(),

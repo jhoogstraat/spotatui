@@ -24,8 +24,6 @@ pub mod queue;
 #[cfg(feature = "internet-radio")]
 pub mod radio;
 pub mod redirect_uri;
-#[cfg(feature = "scripting")]
-pub mod scripting;
 #[cfg(feature = "subsonic")]
 pub mod subsonic;
 #[cfg(feature = "youtube")]

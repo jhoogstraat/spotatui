@@ -71,7 +71,6 @@ pub enum ActiveBlock {
   Settings,
   SortMenu,
   Queue,
-  Party,
   CreatePlaylistForm,
   Friends,
   LocalBrowser,
@@ -79,10 +78,8 @@ pub enum ActiveBlock {
   /// The AI DJ screen's prompt + transcript.
   #[cfg(feature = "ai-dj")]
   AiDj,
-  /// A plugin-registered custom screen (the screen name lives in
-  /// [`RouteId::PluginScreen`]; `ActiveBlock` is `Copy` and can't carry it).
-  /// Only script effects construct it.
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  /// A custom screen retained for future frontends.
+  #[allow(dead_code)]
   PluginScreen,
 }
 
@@ -122,7 +119,6 @@ pub enum RouteId {
   Settings,
   HelpMenu,
   Queue,
-  Party,
   CreatePlaylist,
   Friends,
   /// Only reachable when `local-files` is built in (the sidebar row that opens it
@@ -132,9 +128,8 @@ pub enum RouteId {
   Stats,
   #[cfg(feature = "ai-dj")]
   AiDj,
-  /// A plugin-registered custom screen, keyed by its registered name.
-  /// Only script effects construct it.
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  /// A custom screen, keyed by its registered name.
+  #[allow(dead_code)]
   PluginScreen(String),
 }
 

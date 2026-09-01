@@ -10,7 +10,6 @@ pub mod recommend;
 pub mod requests;
 pub mod search;
 pub mod spotify_source;
-pub mod sync;
 pub mod user;
 pub mod utils;
 
@@ -60,8 +59,8 @@ pub enum IoEvent {
   RefreshAuthentication,
   GetPlaylists,
   GetDevices,
-  /// Refresh the device list without opening the device picker (plugin data reads).
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  /// Refresh the device list without opening the device picker.
+  #[allow(dead_code)]
   GetDevicesSilent,
   GetSearchResults(String, Option<Country>),
   /// Playlist id/URI, page offset.
@@ -118,8 +117,8 @@ pub enum IoEvent {
   /// Track id/URI, market.
   GetRecommendationsForTrackId(String, Option<Country>),
   GetRecentlyPlayed,
-  /// Refresh recently-played data without opening the screen (plugin data reads).
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  /// Refresh recently-played data without opening a screen.
+  #[allow(dead_code)]
   GetRecentlyPlayedSilent,
   /// Pagination cursor: artist id/URI to fetch after.
   GetFollowedArtists(Option<String>),
@@ -184,22 +183,6 @@ pub enum IoEvent {
   /// Get Top Artists Mix - fetches top artists and their top tracks
   /// Fetch all playlist tracks and apply sorting
   FetchAllPlaylistTracksAndSort(String),
-  /// Start hosting a listening party
-  StartParty(sync::ControlMode),
-  /// Join an existing listening party by code
-  JoinParty {
-    code: String,
-    name: String,
-  },
-  /// Update the host control mode in the relay
-  SetPartyControlMode(sync::ControlMode),
-  /// Leave the current listening party
-  LeaveParty,
-  /// Broadcast current playback state to party guests (host only)
-  SyncPlayback,
-  /// Send a playback command to the party host (guest only, Phase 2)
-  #[allow(dead_code)]
-  PartyPlaybackCommand(sync::PlaybackAction),
   /// Search tracks to add to a new playlist
   SearchTracksForPlaylist(String),
   /// Create a new playlist: playlist name, track ids/URIs.
@@ -277,13 +260,6 @@ pub enum IoEvent {
   /// Abandon an in-flight in-TUI Spotify login (callback server timed out or
   /// failed), clearing the pending state so the user can retry.
   CancelSpotifyLogin,
-  /// Fetch and decode the current track's cover art (album-art URL, source
-  /// thumbnail, or a local file's embedded picture). Dispatched by the shared
-  /// track-change detector; handled off the `App` lock so the render loop never
-  /// blocks on the download/decode. Source-agnostic and independent of Spotify
-  /// auth.
-  #[cfg(feature = "art-decode")]
-  FetchCoverArt(crate::core::art::CoverArtRequest),
   /// A DJ tool call that needs the live Spotify client, plus the channel to
   /// answer on.
   ///
@@ -358,8 +334,6 @@ pub struct Network {
   pub spine: Option<crate::runtime::engine::Spine>,
   #[cfg(feature = "streaming")]
   native_idle_recovery: playback::NativeIdleRecoveryState,
-  pub party_connection: Option<sync::PartyConnection>,
-  pub party_incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<sync::SyncMessage>>,
   pub token_cache_path: PathBuf,
   /// In-flight in-TUI Spotify login, if any (see `begin_spotify_login`).
   pending_login: Option<PendingLogin>,
@@ -392,8 +366,6 @@ impl Network {
       app: Arc::clone(app),
       spine: None,
       native_idle_recovery: playback::NativeIdleRecoveryState::default(),
-      party_connection: None,
-      party_incoming_rx: None,
       token_cache_path,
       pending_login: None,
       consecutive_playback_auth_failures: 0,
@@ -417,8 +389,6 @@ impl Network {
       client_config,
       app: Arc::clone(app),
       spine: None,
-      party_connection: None,
-      party_incoming_rx: None,
       token_cache_path,
       pending_login: None,
       consecutive_playback_auth_failures: 0,
@@ -450,10 +420,6 @@ impl Network {
   /// source dispatchers handle upstream (only reaching here as no-ops when their
   /// feature is disabled).
   fn event_bypasses_spotify_auth(io_event: &IoEvent) -> bool {
-    #[cfg(feature = "art-decode")]
-    if matches!(io_event, IoEvent::FetchCoverArt(_)) {
-      return true;
-    }
     #[cfg(feature = "streaming")]
     if matches!(
       io_event,
@@ -488,12 +454,6 @@ impl Network {
         | IoEvent::UpdateSearchLimits(..)
         | IoEvent::LoadListeningStats(_)
         | IoEvent::GenerateRecap(_)
-        | IoEvent::StartParty(_)
-        | IoEvent::JoinParty { .. }
-        | IoEvent::SetPartyControlMode(_)
-        | IoEvent::LeaveParty
-        | IoEvent::SyncPlayback
-        | IoEvent::PartyPlaybackCommand(_)
         | IoEvent::GetLocalPlaylists
         | IoEvent::GetLocalTracks(_)
         | IoEvent::GetSubsonicPlaylists
@@ -522,10 +482,6 @@ impl Network {
   pub fn runs_on_service_lane(io_event: &IoEvent) -> bool {
     if !Self::event_bypasses_spotify_auth(io_event) {
       return false;
-    }
-    #[cfg(feature = "art-decode")]
-    if matches!(io_event, IoEvent::FetchCoverArt(_)) {
-      return true;
     }
     #[cfg(feature = "ai-dj")]
     if matches!(io_event, IoEvent::AskDj(_) | IoEvent::DjTopUp(..)) {
@@ -885,10 +841,6 @@ impl Network {
       IoEvent::GetLyrics(track, artists, duration) => {
         self.get_lyrics(track, artists, duration).await;
       }
-      #[cfg(feature = "art-decode")]
-      IoEvent::FetchCoverArt(request) => {
-        self.fetch_cover_art(request).await;
-      }
       #[cfg(any(feature = "mcp-server", feature = "ai-dj"))]
       IoEvent::DjToolCall(payload) => {
         let (call, responder) = *payload;
@@ -910,24 +862,6 @@ impl Network {
         if let Some(id) = ids::playlist_id(&playlist_id) {
           self.fetch_all_playlist_tracks_and_sort(id).await;
         }
-      }
-      IoEvent::StartParty(control_mode) => {
-        self.start_party(control_mode).await;
-      }
-      IoEvent::JoinParty { code, name } => {
-        self.join_party(code, name).await;
-      }
-      IoEvent::SetPartyControlMode(control_mode) => {
-        self.set_party_control_mode(control_mode).await;
-      }
-      IoEvent::LeaveParty => {
-        self.leave_party().await;
-      }
-      IoEvent::SyncPlayback => {
-        self.sync_playback().await;
-      }
-      IoEvent::PartyPlaybackCommand(action) => {
-        self.party_playback_command(action).await;
       }
       IoEvent::SearchTracksForPlaylist(query) => {
         self.search_tracks_for_playlist(query).await;
@@ -1339,6 +1273,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn start_party(&mut self, control_mode: sync::ControlMode) {
     self
       .emit_session(SessionFact::Party {
@@ -1394,6 +1329,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn join_party(&mut self, code: String, name: String) {
     self
       .emit_session(SessionFact::Party {
@@ -1444,6 +1380,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn leave_party(&mut self) {
     if let Some(conn) = &mut self.party_connection {
       conn.close().await;
@@ -1459,6 +1396,7 @@ impl Network {
       .await;
   }
 
+  #[cfg(any())]
   async fn sync_playback(&mut self) {
     // Ticket 17: the host gate + playback identity read is one fold query
     // (the old single lock section); `None` means nothing to sync.
@@ -1482,6 +1420,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn set_party_control_mode(&mut self, control_mode: sync::ControlMode) {
     let control_mode = match control_mode {
       sync::ControlMode::HostOnly => "host_only",
@@ -1499,6 +1438,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn party_playback_command(&mut self, action: sync::PlaybackAction) {
     let msg = sync::SyncMessage::PlaybackCommand { action, from: None };
     if let Some(conn) = &mut self.party_connection {
@@ -1508,6 +1448,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   pub async fn process_party_messages(&mut self) {
     let messages: Vec<sync::SyncMessage> = {
       match &mut self.party_incoming_rx {
@@ -1598,6 +1539,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn handle_incoming_sync_state(
     &mut self,
     track_uri: String,
@@ -1677,6 +1619,7 @@ impl Network {
     }
   }
 
+  #[cfg(any())]
   async fn handle_incoming_playback_command(&mut self, action: sync::PlaybackAction) {
     let is_host = match self
       .fold_query(crate::runtime::engine::FoldQuery::IsPartyHost)

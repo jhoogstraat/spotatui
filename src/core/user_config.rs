@@ -367,7 +367,6 @@ pub struct KeyBindingsString {
   remove_from_queue: Option<String>,
   open_settings: Option<String>,
   save_settings: Option<String>,
-  listening_party: Option<String>,
   like_track: Option<String>,
   generate_recap: Option<String>,
 }
@@ -428,7 +427,6 @@ pub struct KeyBindings {
   pub remove_from_queue: Key,
   pub open_settings: Key,
   pub save_settings: Key,
-  pub listening_party: Key,
   pub like_track: Key,
   pub generate_recap: Key,
 }
@@ -460,7 +458,6 @@ pub struct BehaviorConfigString {
   pub paused_icon: Option<String>,
   pub set_window_title: Option<bool>,
   pub visualizer_style: Option<VisualizerStyle>,
-  pub relay_server_url: Option<String>,
   pub stop_after_current_track: Option<bool>,
   pub startup_behavior: Option<StartupBehavior>,
   pub disable_auto_update: Option<bool>,
@@ -576,7 +573,6 @@ pub struct BehaviorConfig {
   pub paused_icon: String,
   pub set_window_title: bool,
   pub visualizer_style: VisualizerStyle,
-  pub relay_server_url: String,
   pub stop_after_current_track: bool,
   pub startup_behavior: StartupBehavior,
   pub disable_auto_update: bool,
@@ -780,7 +776,7 @@ impl BehaviorConfig {
 
 /// Placeholder keys available to every format template, in index order.
 pub const FORMAT_KEYS: &[&str] = &[
-  "state", "device", "source", "queue", "shuffle", "repeat", "volume", "party",
+  "state", "device", "source", "queue", "shuffle", "repeat", "volume",
 ];
 
 /// On-disk format config: all templates optional, defaulting to today's output.
@@ -795,7 +791,7 @@ pub struct FormatConfigString {
 /// byte-for-byte.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FormatConfig {
-  /// Spotify playbar title: `"{state} ({device} | Shuffle: {shuffle} | Repeat: {repeat} | Volume: {volume}%){party}"`
+  /// Spotify playbar title template.
   pub playbar_status: Template,
   /// Local-source playbar title: `"{state} ({source}{queue}{shuffle}{repeat} | Volume: {volume}%)"`.
   /// The `{shuffle}` / `{repeat}` placeholders carry their own ` | Label: value`
@@ -810,7 +806,7 @@ pub struct FormatConfig {
 impl FormatConfig {
   /// Today's hardcoded Spotify playbar format string.
   pub const DEFAULT_PLAYBAR_STATUS: &'static str =
-    "{state} ({device} | Shuffle: {shuffle} | Repeat: {repeat} | Volume: {volume}%){party}";
+    "{state} ({device} | Shuffle: {shuffle} | Repeat: {repeat} | Volume: {volume}%)";
   /// Today's hardcoded local-source playbar format string. `{shuffle}` and
   /// `{repeat}` include their own ` | Label: value` prefix so they can render
   /// empty (hiding the whole segment) for sources without those controls.
@@ -990,7 +986,6 @@ impl UserConfig {
           Key::Alt(',')
         },
         save_settings: Key::Alt('s'),
-        listening_party: Key::Ctrl('p'),
         like_track: Key::Char('F'),
         generate_recap: Key::Char('R'),
       },
@@ -1022,7 +1017,6 @@ impl UserConfig {
         paused_icon: "⏸".to_string(),
         set_window_title: true,
         visualizer_style: VisualizerStyle::default(),
-        relay_server_url: "wss://spotatui-party.spotatui.workers.dev/ws".to_string(),
         stop_after_current_track: false,
         startup_behavior: StartupBehavior::Continue,
         disable_auto_update: false,
@@ -1126,7 +1120,7 @@ impl UserConfig {
         }
 
         // Restrict the app's own config directory (holds config.yml, which
-        // carries the Subsonic password and party sync_token in cleartext,
+        // carries the Subsonic password in cleartext,
         // plus the Spotify token cache) to owner-only. Never touch
         // `home_config_dir` (`~/.config`) — that's shared with every other
         // application on the system.
@@ -1213,7 +1207,6 @@ impl UserConfig {
     to_keys!(remove_from_queue);
     to_keys!(open_settings);
     to_keys!(save_settings);
-    to_keys!(listening_party);
     to_keys!(like_track);
     to_keys!(generate_recap);
 
@@ -1401,12 +1394,6 @@ impl UserConfig {
       self.behavior.visualizer_style = visualizer_style;
     }
 
-    if let Some(relay_server_url) = behavior_config.relay_server_url {
-      let trimmed = relay_server_url.trim();
-      if !trimmed.is_empty() {
-        self.behavior.relay_server_url = trimmed.to_string();
-      }
-    }
     if let Some(sync_token) = behavior_config.sync_token {
       let trimmed = sync_token.trim();
       if trimmed.is_empty() {
@@ -1854,7 +1841,6 @@ impl UserConfig {
       k.remove_from_queue,
       k.open_settings,
       k.save_settings,
-      k.listening_party,
       k.like_track,
       k.generate_recap,
     ]
@@ -2018,7 +2004,6 @@ impl UserConfig {
       paused_icon: Some(self.behavior.paused_icon.clone()),
       set_window_title: Some(self.behavior.set_window_title),
       visualizer_style: Some(self.behavior.visualizer_style),
-      relay_server_url: Some(self.behavior.relay_server_url.clone()),
       sync_token: self.behavior.sync_token.clone(),
       local_music_path: self.behavior.local_music_path.clone(),
       subsonic_url: self.behavior.subsonic_url.clone(),
@@ -2192,7 +2177,6 @@ impl UserConfig {
       remove_from_queue: Some(key_to_config_string(self.keys.remove_from_queue)),
       open_settings: Some(key_to_config_string(self.keys.open_settings)),
       save_settings: Some(key_to_config_string(self.keys.save_settings)),
-      listening_party: Some(key_to_config_string(self.keys.listening_party)),
       like_track: Some(key_to_config_string(self.keys.like_track)),
       generate_recap: Some(key_to_config_string(self.keys.generate_recap)),
     };

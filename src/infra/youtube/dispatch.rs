@@ -488,15 +488,15 @@ async fn release_other_backends(app: &Arc<Mutex<App>>) {
     }
     #[cfg(feature = "local-files")]
     if let Some(state) = local {
-      state.player.stop();
+      state.stop();
     }
     #[cfg(feature = "subsonic")]
     if let Some(state) = subsonic {
-      state.player.stop();
+      state.stop();
     }
     #[cfg(feature = "internet-radio")]
     if let Some(state) = radio {
-      state.player.stop();
+      state.stop();
     }
   }
 }

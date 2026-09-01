@@ -40,7 +40,6 @@ one query can be walked across tabs.
 | `B`         | Lyrics view               |
 | `T`         | Toggle miniplayer view    |
 | `R`         | Generate recap            |
-| `Ctrl-p`    | Listening party           |
 | `,`         | Open sort menu            |
 | `Alt-,`     | Open settings (`Ctrl-,` on macOS) |
 | `?`         | Show help                 |

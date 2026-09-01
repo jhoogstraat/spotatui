@@ -85,8 +85,8 @@ pub trait PlaybackNetwork {
   #[allow(dead_code)]
   async fn add_item_to_queue(&mut self, item: PlayableId<'static>);
   async fn get_queue(&mut self);
-  /// Fetch, decode and store the current track's cover art (off the `App` lock).
-  #[cfg(feature = "art-decode")]
+  /// Legacy cover-art fetch (disabled until a windowed frontend renders it).
+  #[cfg(any())]
   async fn fetch_cover_art(&mut self, request: crate::core::art::CoverArtRequest);
 }
 
@@ -1443,7 +1443,7 @@ impl PlaybackNetwork for Network {
   /// which re-gates the request key before storing the image. Cover art is non-essential,
   /// so a failure only logs and flips the status to `Failed` (never surfaces a
   /// blocking error).
-  #[cfg(feature = "art-decode")]
+  #[cfg(any())]
   async fn fetch_cover_art(&mut self, request: crate::core::art::CoverArtRequest) {
     use crate::core::art::{fetch_and_decode, CoverArtRequest};
 

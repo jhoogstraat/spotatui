@@ -89,7 +89,7 @@ fn preserve_refresh_token_from_file(token: &mut Token, path: &Path) {
 /// the platform supports it (0o600 on Unix). Shared by any caller that
 /// persists sensitive data to disk (the Spotify token cache, and — via
 /// `user_config::save_config` — the app config file, which holds the
-/// Subsonic password and party sync token in cleartext).
+/// Subsonic password in cleartext).
 #[cfg(unix)]
 pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
   use std::io::Write;

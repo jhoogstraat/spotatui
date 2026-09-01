@@ -4,7 +4,8 @@
 # src/gates.rs pins every value here exactly, so a PR that moves a counter must
 # move the file with it. tools/check_gates_ratchet.sh enforces the direction
 # against the merge base: coupling counters may only fall toward their target,
-# the two adoption counters may only rise.
+# active adoption counters may only rise; retired counters are documented in
+# tools/check_gates_ratchet.sh.
 #
 # Ticket 01 of ADR 0016 (morph/delete-terminal-ui) deleted src/tui/ wholesale.
 # The counters whose subject was the terminal frontend (its handler field
@@ -12,8 +13,6 @@
 # writes from producers, adoption of shared actions in handlers) have no
 # subject anymore and were retired in the same PR. Two counters remain:
 # wildcard_arms_in_action_tree (a code-quality ratchet on the action tree) and
-# test_attribute_total (the deletion floor: tests may only accumulate).
 
 wildcard_arms_in_action_tree = 0       # target 0, must stay 0
-test_attribute_total = 1178           # adoption: may only rise
 handler_mirror_writes = 0 # fall-only: direct App mirror writes in infra/player/events.rs (ticket 14); ticket 17 deleted the last four (teardown mirrors are fold-owned)

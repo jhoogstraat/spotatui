@@ -100,7 +100,7 @@ impl Default for Theme {
 /// match, and a new `Theme` field breaks the full destructuring at the top
 /// of `set`, so either half added alone is a compile error where the old
 /// parallel string whitelists silently dropped the write on a typo.
-#[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeField {
   Active,
@@ -123,7 +123,7 @@ pub enum ThemeField {
   AnalysisBarText,
 }
 
-#[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+#[allow(dead_code)]
 impl ThemeField {
   /// Every field, in the order the Lua API has always advertised them.
   pub const ALL: [ThemeField; 18] = [
@@ -179,7 +179,7 @@ impl ThemeField {
 
 impl Theme {
   /// Set one field by [`ThemeField`], the runtime-override write path.
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  #[allow(dead_code)]
   pub fn set(&mut self, field: ThemeField, color: Color) {
     // Full destructuring, no rest pattern: a new `Theme` field fails to
     // compile here until this function (and so the variant list) is updated.

@@ -350,14 +350,14 @@ impl App {
   /// offset into that list. The single place the shared action vocabulary
   /// builds a URI-list `StartPlayback`; ownership routing happens in the
   /// pump's source routers, exactly as for the equivalent keybinding.
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(crate) fn start_playback_uris(&mut self, uris: Vec<String>, offset: Option<usize>) {
     self.dispatch(IoEvent::StartPlayback(None, Some(uris), offset));
   }
 
   /// Start playback of a Spotify context URI, optionally from a 0-based track
   /// offset. The context twin of [`Self::start_playback_uris`].
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(crate) fn start_playback_context(&mut self, context_uri: String, offset: Option<usize>) {
     self.dispatch(IoEvent::StartPlayback(Some(context_uri), None, offset));
   }
@@ -366,7 +366,7 @@ impl App {
   /// context URI. The third start shape beside the two twins above: the
   /// network layer deliberately does not trim the uri list when a context is
   /// present, which is what keeps the selected track first under shuffle.
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  #[allow(dead_code)]
   pub(crate) fn start_playback_track_in_context(&mut self, context_uri: String, track_uri: String) {
     self.dispatch(IoEvent::StartPlayback(
       Some(context_uri),

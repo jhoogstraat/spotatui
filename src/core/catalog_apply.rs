@@ -82,12 +82,6 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         app.search_results.playlists = pages.playlists.clone();
         app.search_results.shows = pages.shows.clone();
       }
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::Search);
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::Search);
       // A replaced page can be shorter than the previous one (or empty),
       // which would otherwise leave a stale selected-index pointing past the
       // end of the new results (panic-1: unchecked `.items[selected_index]`
@@ -204,9 +198,6 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
       };
       app.library.saved_tracks.upsert_page_by_offset(domain_page);
       app.set_saved_tracks_to_table_continuous();
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::SavedTracks);
       CatalogOutcome {
         library_page_upserted: true,
         ..CatalogOutcome::default()
@@ -256,11 +247,6 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
       if let Some(page) = page {
         app.library.saved_albums.add_pages(page.clone());
       }
-      // Bump even on an empty page: completion is the signal plugin data
-      // requests wait on, and an empty library never writes a page.
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::SavedAlbums);
       CatalogOutcome {
         library_page_upserted: true,
         ..CatalogOutcome::default()
@@ -270,9 +256,6 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
       if let Some(page) = page {
         app.library.saved_shows.add_pages(page.clone());
       }
-      app
-        .plugin_data_generations
-        .bump(crate::core::app::PluginDataKind::SavedShows);
       CatalogOutcome {
         library_page_upserted: true,
         ..CatalogOutcome::default()

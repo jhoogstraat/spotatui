@@ -259,7 +259,6 @@ fn apply_navigate(app: &mut App, target: NavTarget) {
     // The network handler pushes the route once the data arrives, exactly like
     // the keybinding.
     NavTarget::RecentlyPlayed => app.dispatch(IoEvent::GetRecentlyPlayed),
-    NavTarget::Party => app.push_navigation_stack(RouteId::Party, ActiveBlock::Party),
     NavTarget::Analysis => app.get_audio_analysis(),
     NavTarget::MiniPlayer => {
       if app.get_current_route().id == RouteId::MiniPlayer {

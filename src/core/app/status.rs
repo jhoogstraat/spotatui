@@ -90,7 +90,7 @@ impl App {
 
   /// Set an error status message. Errors always replace whatever is currently shown
   /// (including a previous error) and are styled distinctly in the UI.
-  #[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+  #[allow(dead_code)]
   pub fn set_error_status_message(&mut self, message: impl Into<String>, ttl_secs: u64) {
     self.status_message = Some(message.into());
     let ttl = self.scaled_status_ttl(ttl_secs);

@@ -386,7 +386,7 @@ pub struct LyricsSnapshot {
 }
 
 /// Safe, plugin-visible behavior settings. Secrets and service credentials
-/// (sync_token, relay_server_url, subsonic credentials, discord client id,
+/// (sync_token, subsonic credentials, discord client id,
 /// announcement feeds) are deliberately excluded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct BehaviorSnapshot {
@@ -644,7 +644,6 @@ pub fn route_name(route: &crate::core::app::Route) -> String {
     RouteId::Settings => "settings",
     RouteId::HelpMenu => "help",
     RouteId::Queue => "queue",
-    RouteId::Party => "party",
     RouteId::CreatePlaylist => "create_playlist",
     RouteId::Friends => "friends",
     RouteId::LocalBrowser => "local_browser",

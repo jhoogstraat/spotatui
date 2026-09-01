@@ -1,7 +1,5 @@
-// `action` is allowed dead without `scripting`: the scripting engine and the
-// DJ tools are still its only producers, so a scripting-less leg counts the
-// un-adopted surface as dead.
-#[cfg_attr(not(feature = "scripting"), allow(dead_code))]
+// Frontend-neutral action vocabulary; retained for the GPUI command surface.
+#[allow(dead_code)]
 pub mod action;
 // TEMPORARY (ticket 01): dead-code allows for surface whose only caller was
 // the deleted terminal UI. Ticket 02 deletes that surface wholesale; these
@@ -25,13 +23,9 @@ pub use streaming::{AbsorbOutcome, StreamingState, StreamingStateEvent};
 #[allow(unused_imports)]
 pub use streaming_apply::apply_streaming_state;
 
-#[cfg(feature = "art-decode")]
-pub mod art;
 pub mod auth;
 pub mod banner;
 pub mod config;
-#[cfg(feature = "art-decode")]
-pub mod cover_theme;
 #[allow(dead_code)]
 pub mod driver;
 pub mod first_run;

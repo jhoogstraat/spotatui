@@ -808,9 +808,6 @@ fn navigate_help_lyrics_and_party_push_their_routes() {
 
   app.apply(EngineAction::Navigate(NavTarget::Lyrics));
   assert_eq!(app.get_current_route().id, RouteId::LyricsView);
-
-  app.apply(EngineAction::Navigate(NavTarget::Party));
-  assert_eq!(app.get_current_route().id, RouteId::Party);
 }
 
 #[test]

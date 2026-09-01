@@ -219,29 +219,22 @@ pub enum EngineAction {
   /// selected period on the Stats screen when that screen is current, 30
   /// days anywhere else.
   GenerateRecap,
-  /// Seed the track-radio recommendations flow from one track. The full
-  /// snapshot rides along because the results table prepends it as the
-  /// context row.
-  /// Set or clear a playbar segment for a plugin (keyed by plugin name).
   SetPlaybarSegment {
     plugin: String,
     text: Option<String>,
   },
-  /// Show a plugin popup dialog.
   ShowPopup(PluginPopup),
-  /// Dismiss the plugin popup, if one is shown.
   ClosePopup,
-  /// Apply theme color overrides at runtime.
   SetTheme(Vec<(ThemeField, Color)>),
-  /// Publish (retained) content for a registered plugin screen.
   SetScreenContent {
     name: String,
     content: PluginScreenContent,
   },
-  /// Navigate to a registered plugin screen.
   ShowScreen(String),
-  /// Pop the named plugin screen if it is the current route.
   CloseScreen(String),
+  /// Seed the track-radio recommendations flow from one track. The full
+  /// snapshot rides along because the results table prepends it as the
+  /// context row.
   /// Queue a batch of DJ-chosen tracks; the outcome reports how many were
   /// accepted. A no-op outside `dj-core` builds.
   #[cfg_attr(not(feature = "dj-core"), allow(dead_code))]
@@ -282,14 +275,13 @@ pub enum NavTarget {
   Help,
   Lyrics,
   RecentlyPlayed,
-  Party,
   Analysis,
   MiniPlayer,
 }
 
 impl NavTarget {
   /// Every target, in the order the Lua API has always advertised them.
-  pub const ALL: [NavTarget; 10] = [
+  pub const ALL: [NavTarget; 9] = [
     NavTarget::Home,
     NavTarget::Queue,
     NavTarget::Settings,
@@ -297,7 +289,6 @@ impl NavTarget {
     NavTarget::Help,
     NavTarget::Lyrics,
     NavTarget::RecentlyPlayed,
-    NavTarget::Party,
     NavTarget::Analysis,
     NavTarget::MiniPlayer,
   ];
@@ -312,7 +303,6 @@ impl NavTarget {
       NavTarget::Help => "help",
       NavTarget::Lyrics => "lyrics",
       NavTarget::RecentlyPlayed => "recently_played",
-      NavTarget::Party => "party",
       NavTarget::Analysis => "analysis",
       NavTarget::MiniPlayer => "miniplayer",
     }

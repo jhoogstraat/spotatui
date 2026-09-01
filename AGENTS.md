@@ -34,8 +34,8 @@ across a feature matrix:
 
 | Leg | Features |
 |-----|----------|
-| `default` | a plain `cargo test`: streaming + audio-viz-cpal + scripting + self-update + OS integrations |
-| `all-sources` | the **Linux** release feature set from `cd.yml` (adds cover-art, mcp-server, ai-dj, audio-viz, all four sources) |
+| `default` | a plain `cargo test`: streaming + self-update + OS integrations |
+| `all-sources` | all four source adapters (local, Subsonic, radio, YouTube) |
 | `mcp-only` | `telemetry,mcp-server` |
 | `ai-dj-only` | `telemetry,ai-dj` |
 | `slim` | `telemetry` |
@@ -48,10 +48,7 @@ across a feature matrix:
   `dj-core` **without** `streaming` (a combination nothing else covers), and each
   front door has to build without the other.
 - Reproducing legs locally: `cargo test` reproduces `default`. For `all-sources`,
-  copy the exact `--no-default-features --features …` string out of `ci.yml` -
-  `cargo test --features all-sources` is **not** it (the alias only adds the four
-  sources on top of default), and the leg includes `audio-viz` (PipeWire), so it
-  only compiles on Linux.
+  copy the exact `--no-default-features --features …` string out of `ci.yml`.
 - Every CI leg passes `--locked`; the local commands do not. Regenerate
   `Cargo.lock` after any `Cargo.toml` edit or all legs fail at once.
 - CI runs `clippy` on the **bin target only** (no `--all-targets`), so lints in
@@ -61,10 +58,10 @@ across a feature matrix:
 - The `all-sources` leg must stay in sync with `cd.yml`'s Linux release row
   (macOS releases ship a smaller set - no decoded sources).
 - A pull_request-only `Gates ratchet` job diffs `tools/gates.count` against the
-  merge-base (`tools/check_gates_ratchet.sh`): coupling counters may only fall;
-  the adoption counter (`test_attribute_total`) may only rise. `src/gates.rs`
-  pins every value exactly, so move the baseline in the same PR that moves the
-  number, in the ratchet's direction only.
+  merge-base (`tools/check_gates_ratchet.sh`): coupling counters may only fall.
+  The former `test_attribute_total` adoption counter was retired with the
+  terminal-only test modules in issue #16. `src/gates.rs` pins every active
+  value exactly, so move the baseline in the same PR that moves the number.
 
 ## Run a Single Test
 
@@ -230,13 +227,6 @@ session) lives in `src/core/app/native_{backend,recovery,shuffle}.rs`.
 - Verify native playback changes with the full `cargo run` build, not only the
   slim telemetry build.
 
-### Listening Party / sync
-
-`src/infra/network/sync.rs` is pure WebSocket transport (`SyncMessage`,
-`PartyConnection`); lifecycle logic lives in `src/infra/network/mod.rs`. Handlers
-dispatch `StartParty` / `JoinParty` / `SetPartyControlMode` / `LeaveParty`;
-`SyncPlayback` is fired by `App::on_tick` every 2s while hosting, not by a handler.
-
 ## Key Conventions
 
 ### Adding a new screen
@@ -382,8 +372,8 @@ never config:
 
 ### Feature flags
 
-- `default` = `telemetry, streaming, audio-viz-cpal, macos-media,
-  windows-media, mpris, discord-rpc, self-update, scripting`. Notably **not**
+- `default` = `telemetry, streaming, macos-media, windows-media, mpris,
+  discord-rpc, self-update`. Notably **not**
   in default: `cover-art` (so a plain `cargo run` has no album art, though
   every shipped binary enables it), the four sources, and the DJ features.
 - The terminal frontend's `tui` feature and its crates (ratatui, crossterm,
@@ -393,11 +383,6 @@ never config:
   (`dep:image`, fills `core::art::CoverArtStore`, feeds the adaptive theme;
   never enabled by hand); `cover-art` now adds only the ratatui-image-free
   rendering plumbing and keeps its historical name for users and CI.
-- `audio-viz` (PipeWire, Linux-only) and `audio-viz-cpal` are **visualizer
-  capture** backends, not playback. The librespot *playback* backend is chosen by
-  `[target.'cfg(...)']` dependency blocks in Cargo.toml, not by the `*-backend`
-  features: linux-gnu→alsa, linux-musl→rodio, Windows→rodio, macOS→portaudio -
-  the non-default picks avoid librespot's `pipe` sink writing raw audio to stdout.
 - `audio-decode` (rodio) is the shared engine pulled in by the sources;
   `all-sources` = `local-files, subsonic, internet-radio, youtube`.
 - `dj-core` is a shared implementation feature pulled in by `mcp-server` and

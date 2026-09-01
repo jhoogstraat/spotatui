@@ -10,7 +10,6 @@ use crate::core::state::{
 };
 use crate::core::user_config::{color_to_string, UserConfig};
 use crate::infra::history::{RecapPeriod, StatsData, StreakSummary};
-use crate::infra::network::sync::{PartySession, PartyStatus};
 use crate::infra::network::IoEvent;
 #[cfg(any(
   feature = "streaming",
@@ -77,8 +76,6 @@ mod dj;
 // Cover-art store + adaptive-theme syncing (stage 2a dropped the file with the
 // TUI; the all-sources leg still calls store/clear_cover_art from the network
 // layer and driver).
-#[cfg(feature = "art-decode")]
-mod cover_theme_impl;
 mod library;
 mod lyrics;
 mod models;
@@ -137,8 +134,6 @@ pub struct App {
   pub last_dispatched_volume: Option<u8>,
   pub instant_since_last_current_playback_poll: Instant,
   navigation_stack: Vec<Route>,
-  pub spectrum_data: Option<crate::infra::audio::SpectrumData>,
-  pub audio_capture_active: bool,
   /// Presentation state of the terminal frontend (cursors, scroll offsets, edit
   /// buffers, focus, popups, terminal geometry). See [`ViewState`]: handlers and
   /// draw functions write it freely; nothing outside `tui/` and these `App`
@@ -198,26 +193,6 @@ pub struct App {
   /// replay of the slot can honor a user's pause.
   #[cfg(feature = "streaming")]
   pub queue_slot_desired_playing: bool,
-  /// Decoded cover art for the current track plus its load status. The TUI
-  /// renderer (`tui::cover_art`) caches its terminal protocols on this
-  /// store's key.
-  #[cfg(feature = "art-decode")]
-  pub cover_art: crate::core::art::CoverArtStore,
-  /// Image key currently desired by the UI. Detached decode results for older
-  /// keys are discarded.
-  #[cfg(feature = "art-decode")]
-  pub desired_cover_art_key: Option<String>,
-  /// Accent colors extracted from the current cover art. Stored even while
-  /// Adaptive Theme is off, so toggling it on recolors immediately without a
-  /// refetch. Cleared together with the art itself.
-  #[cfg(feature = "art-decode")]
-  pub cover_art_palette: Option<crate::core::cover_theme::AlbumPalette>,
-  /// Whether an album-derived theme is applied, and the user theme to restore.
-  #[cfg(feature = "art-decode")]
-  pub cover_theme_state: crate::core::cover_theme::CoverThemeState,
-  /// In-flight fade of the live theme, advanced by `update_on_tick`.
-  #[cfg(feature = "art-decode")]
-  pub theme_transition: Option<crate::core::cover_theme::ThemeTransition>,
   /// AI DJ session state: transcript, auto-queue toggle, vibe, and the
   /// generation counter that invalidates in-flight background work.
   #[cfg(feature = "dj-core")]
@@ -411,18 +386,12 @@ pub struct App {
   pub album_sort: SortState,
   pub artist_sort: SortState,
   pub recently_played_sort: SortState,
-  /// Last time the listening party host broadcast playback state.
-  pub last_party_sync_at: Instant,
   /// Ephemeral status message shown in the playbar
   pub status_message: Option<String>,
   /// When to clear the status message
   pub status_message_expires_at: Option<Instant>,
   /// True when the current status message is an error (blocks normal message overwrites)
   pub status_message_is_error: bool,
-  /// Listening party status
-  pub party_status: PartyStatus,
-  /// Active listening party session data
-  pub party_session: Option<PartySession>,
   /// Pending track table selection to apply when new page loads
   pub pending_track_table_selection: Option<PendingTrackSelection>,
   /// Maps visible track table rows to source playlist item positions.
@@ -555,22 +524,12 @@ pub struct App {
   // Create Playlist form state
   pub create_playlist_tracks: Vec<TrackInfo>,
   pub create_playlist_search_results: Vec<TrackInfo>,
-  /// Commands queued by keybindings for the scripting engine to run.
   pub pending_plugin_commands: Vec<String>,
-  /// Per-domain write counters driving async plugin data reads (see
-  /// [`PluginDataKind`]). Ungated: the network layer bumps them in every build;
-  /// only the scripting engine reads them.
   pub plugin_data_generations: PluginDataGenerations,
-  /// Retained content of plugin-registered custom screens, keyed by screen
-  /// name. Written by script effects; read by the draw loop.
   pub plugin_screens:
     std::collections::BTreeMap<String, crate::core::plugin_api::PluginScreenContent>,
-  /// Keys pressed while a plugin screen was focused: `(screen_name, key_string)`,
-  /// drained by the script engine after each key event.
   pub pending_plugin_screen_keys: Vec<(String, String)>,
-  /// Per-plugin playbar segments, keyed by plugin name (BTreeMap for deterministic order).
   pub plugin_playbar_segments: std::collections::BTreeMap<String, String>,
-  /// Currently displayed plugin popup, if any.
   pub plugin_popup: Option<crate::core::plugin_api::PluginPopup>,
   /// Where this run's log file is being written, resolved once here so draw
   /// code can show it without doing the environment lookup every frame.

@@ -89,22 +89,6 @@ impl UtilsNetwork for Network {
     let request_identity = (track.clone(), artists.join(", "));
     let client = super::requests::shared_http_client();
 
-    // Register the fetch with the fold (ticket 17): the claim re-checks the
-    // desired identity and flips the loading state in one atomic step; a
-    // superseded request never leaves the ground.
-    let live = match self
-      .fold_query(FoldQuery::ClaimLyricsFetch {
-        identity: request_identity.clone(),
-      })
-      .await
-    {
-      Some(FoldAnswer::Bool(live)) => live,
-      _ => false,
-    };
-    if !live {
-      return;
-    }
-
     let lrc_resp = fetch_lrclib_lyrics(client, &track, &artists, duration).await;
 
     let (lyrics, synced, found) = match lrc_resp {
