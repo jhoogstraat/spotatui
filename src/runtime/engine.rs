@@ -74,10 +74,15 @@ pub enum EngineEvent {
 /// newer deadline replaced the one that was armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerFact {
+  /// Refresh the Spotify access token at the existing safety-margin deadline.
+  AuthRefreshDue,
   /// Retire the status-bar notice when its TTL has elapsed.
   NoticeExpired,
   /// Retire an API error page after its backstop lifetime.
   ApiErrorExpired,
+  /// Check a native load/restore that has produced no transport confirmation.
+  #[cfg(feature = "streaming")]
+  NativeLoadWatchdog,
 }
 
 /// Fold-owned writes produced by the listening-history collector.

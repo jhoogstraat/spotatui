@@ -11,7 +11,7 @@ use std::{
   fs,
   path::{Path, PathBuf},
   sync::{Arc, OnceLock},
-  time::{Duration, SystemTime},
+  time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::Mutex;
 
@@ -245,6 +245,14 @@ pub fn should_refresh_token_at(expiry: SystemTime, now: SystemTime) -> bool {
     .checked_add(TOKEN_REFRESH_MARGIN)
     .map(|refresh_deadline| refresh_deadline >= expiry)
     .unwrap_or(true)
+}
+
+/// Convert the existing safety-margin policy into a monotonic one-shot
+/// deadline. The caller supplies both clocks so this seam stays deterministic
+/// in tests and the scheduler never needs a periodic wake to re-check expiry.
+pub fn token_refresh_deadline(expiry: SystemTime, now: SystemTime, instant: Instant) -> Instant {
+  let target = expiry.checked_sub(TOKEN_REFRESH_MARGIN).unwrap_or(now);
+  instant + target.duration_since(now).unwrap_or_default()
 }
 
 fn expiry_from_token(token: &Token) -> SystemTime {
@@ -873,6 +881,16 @@ mod tests {
 
     assert!(!should_refresh_token_at(outside_margin, now));
     assert!(should_refresh_token_at(inside_margin, now));
+
+    let base = Instant::now();
+    assert_eq!(
+      token_refresh_deadline(outside_margin, now, base),
+      base + Duration::from_secs(30)
+    );
+    assert_eq!(
+      token_refresh_deadline(inside_margin, now, base),
+      base + Duration::from_secs(0)
+    );
   }
 
   #[tokio::test]

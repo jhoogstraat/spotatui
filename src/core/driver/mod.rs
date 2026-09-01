@@ -33,7 +33,7 @@ use crate::infra::scripting::ScriptEngine;
 #[cfg(feature = "scripting")]
 use log::info;
 use std::sync::{atomic::AtomicU64, Arc};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "discord-rpc")]
 pub type DiscordRpcHandle = Option<discord_rpc::DiscordRpcManager>;
@@ -240,17 +240,6 @@ impl Driver {
         }
       }
       self.prev_is_streaming_active = current_is_streaming_active;
-    }
-
-    // Only refresh when a Spotify session exists; a free-source launch has no
-    // token expiry and must not schedule refreshes. This lives on the tick so
-    // every frontend gets it: one that skipped it would work for exactly one
-    // token lifetime and then 401 forever.
-    if app.auth_state.needs_refresh(SystemTime::now()) {
-      app.auth_state.refresh_in_progress = true;
-      // Legacy mirror (deleted with App in ticket 11).
-      app.auth_refresh_in_progress = true;
-      app.dispatch(IoEvent::RefreshAuthentication);
     }
 
     app.update_on_tick(elapsed);

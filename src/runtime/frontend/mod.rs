@@ -12,7 +12,7 @@ use anyhow::Result;
 use log::info;
 use rspotify::model::idtypes::Id as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{watch, Mutex};
 
 pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget, OpenTarget};
@@ -218,6 +218,7 @@ impl Runtime {
     // The fold also answers producer queries (ticket 16): claim/release,
     // staleness checks, and the small read set detached workers need.
     let folds = rt.block_on(services.spine_queries.take());
+    let (deadline_tx, deadline_rx) = watch::channel(0u64);
     // The frontend's own spine handle for command-side pokes: on streaming
     // legs the command path reuses the shared producer spine so ordering with
     // player events is preserved.
@@ -230,8 +231,9 @@ impl Runtime {
     {
       let app = Arc::clone(&app);
       let tx = snapshot_tx.clone();
+      let deadline_tx = deadline_tx.clone();
       rt.spawn(async move {
-        fold_loop(app, tx, events_rx, folds).await;
+        fold_loop(app, tx, events_rx, folds, deadline_tx).await;
       });
     }
     // Legacy-bell wake: `apply`, the pump, and remaining direct writers ring
@@ -248,9 +250,9 @@ impl Runtime {
         }
       });
     }
-    // Deadlines are folded as named timer facts. The scheduler watches the
-    // published snapshot only to notice newly armed/replaced deadlines; it
-    // never wakes on a periodic cadence.
+    // Deadlines are folded as named timer facts. The private change watch
+    // wakes the scheduler whenever a fold arms/replaces a deadline; it never
+    // wakes on a periodic cadence.
     {
       let app = Arc::clone(&app);
       let spine = command_spine.clone();
@@ -259,6 +261,7 @@ impl Runtime {
         app,
         spine,
         snapshot_rx,
+        deadline_rx,
         Some(shutdown_rx),
       ));
     }
@@ -395,26 +398,44 @@ impl Runtime {
 /// current App state gives the scheduler one small, deterministic seam while
 /// the actual timer task stays private to the Playback Engine.
 fn next_deadline(app: &App) -> Option<(Instant, crate::runtime::engine::TimerFact)> {
-  [
+  let mut deadlines = vec![
     app
       .status_message_expires_at
       .map(|deadline| (deadline, crate::runtime::engine::TimerFact::NoticeExpired)),
     app
       .api_error_expires_at
       .map(|deadline| (deadline, crate::runtime::engine::TimerFact::ApiErrorExpired)),
-  ]
-  .into_iter()
-  .flatten()
-  .min_by_key(|(deadline, _)| *deadline)
+  ];
+  if app.auth_state.connected && !app.auth_state.refresh_in_progress {
+    if let Some(expiry) = app.auth_state.token_expiry {
+      deadlines.push(Some((
+        crate::core::auth::token_refresh_deadline(expiry, SystemTime::now(), Instant::now()),
+        crate::runtime::engine::TimerFact::AuthRefreshDue,
+      )));
+    }
+  }
+  #[cfg(feature = "streaming")]
+  if let Some(deadline) = app.native_load_watchdog_deadline() {
+    deadlines.push(Some((
+      deadline,
+      crate::runtime::engine::TimerFact::NativeLoadWatchdog,
+    )));
+  }
+  deadlines
+    .into_iter()
+    .flatten()
+    .min_by_key(|(deadline, _)| *deadline)
 }
 
-/// Sleep until the nearest armed deadline and emit its named fact. Snapshot
-/// changes wake the task so a newly armed or replaced deadline is re-evaluated
-/// immediately; with no deadline, it parks on the watch channel indefinitely.
+/// Sleep until the nearest armed deadline and emit its named fact. Fold-side
+/// deadline changes and snapshot changes wake the task so a newly armed or
+/// replaced deadline is re-evaluated immediately; with no deadline, it parks
+/// on the watches indefinitely.
 async fn deadline_scheduler(
   app: Arc<Mutex<App>>,
   spine: Spine,
   mut snapshots: watch::Receiver<Snapshot>,
+  mut deadline_changes: watch::Receiver<u64>,
   mut shutdown_rx: Option<watch::Receiver<bool>>,
 ) {
   loop {
@@ -431,12 +452,18 @@ async fn deadline_scheduler(
           changed = snapshots.changed() => {
             if changed.is_err() { break; }
           }
+          changed = deadline_changes.changed() => {
+            if changed.is_err() { break; }
+          }
           changed = shutdown_changed(&mut shutdown_rx) => if changed { break },
         }
       }
       None => {
         tokio::select! {
           changed = snapshots.changed() => {
+            if changed.is_err() { break; }
+          }
+          changed = deadline_changes.changed() => {
             if changed.is_err() { break; }
           }
           changed = shutdown_changed(&mut shutdown_rx) => if changed { break },
@@ -629,6 +656,7 @@ pub(crate) async fn spawn_fold(
   let (spine, events_rx, spine_queries) = crate::runtime::engine::Spine::open(Default::default());
   app.lock().await.spine = Some(spine.clone());
   let spine_queries = spine_queries.take().await;
+  let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(0u64);
   let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Snapshot {
     playback: None,
     library: Default::default(),
@@ -655,11 +683,13 @@ pub(crate) async fn spawn_fold(
     snapshot_tx,
     events_rx,
     spine_queries,
+    deadline_tx.clone(),
   ));
   tokio::spawn(deadline_scheduler(
     app.clone(),
     spine.clone(),
     snapshot_rx.clone(),
+    deadline_rx,
     None,
   ));
   (spine, snapshot_rx)
@@ -674,6 +704,7 @@ pub(super) async fn fold_loop(
   tx: watch::Sender<Snapshot>,
   mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
   folds: Option<crate::runtime::engine::FoldHandles>,
+  deadline_tx: watch::Sender<u64>,
 ) {
   let mut catalog = CatalogPublication::default();
   let (mut queries, mut acks) = match folds {
@@ -693,6 +724,7 @@ pub(super) async fn fold_loop(
           answer_query(&mut guard, query)
         };
         let _ = responder.send(Ok(answer));
+        signal_deadline(&deadline_tx);
       }
     }
     // Apply any acked event the same way: fold it, then complete the
@@ -705,6 +737,7 @@ pub(super) async fn fold_loop(
           apply_acked(&mut guard, event)
         };
         let _ = responder.send(ack);
+        signal_deadline(&deadline_tx);
         publish(&app, &tx, &mut catalog).await;
       }
     }
@@ -729,6 +762,7 @@ pub(super) async fn fold_loop(
               answer_query(&mut guard, query)
             };
             let _ = responder.send(Ok(answer));
+            signal_deadline(&deadline_tx);
           }
           // Query channel closed (spine dropped): stop watching it.
           None => queries = None,
@@ -748,6 +782,7 @@ pub(super) async fn fold_loop(
               apply_acked(&mut guard, event)
             };
             let _ = responder.send(ack);
+            signal_deadline(&deadline_tx);
             publish(&app, &tx, &mut catalog).await;
           }
           // Ack channel closed: stop watching it.
@@ -791,11 +826,16 @@ pub(super) async fn fold_loop(
       }
       EngineEvent::StateChanged(_) => {}
     }
+    signal_deadline(&deadline_tx);
     publish(&app, &tx, &mut catalog).await;
     if tx.is_closed() {
       break;
     }
   }
+}
+
+fn signal_deadline(tx: &watch::Sender<u64>) {
+  tx.send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 /// Rebuild the snapshot and equality-dedup the publication.
@@ -1041,6 +1081,13 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
 fn apply_timer_fact(app: &mut App, fact: crate::runtime::engine::TimerFact) {
   use crate::runtime::engine::TimerFact;
   match fact {
+    TimerFact::AuthRefreshDue => {
+      if app.auth_state.needs_refresh(SystemTime::now()) {
+        app.auth_state.refresh_in_progress = true;
+        app.auth_refresh_in_progress = true;
+        app.dispatch(IoEvent::RefreshAuthentication);
+      }
+    }
     TimerFact::NoticeExpired => {
       if app
         .status_message_expires_at
@@ -1050,6 +1097,8 @@ fn apply_timer_fact(app: &mut App, fact: crate::runtime::engine::TimerFact) {
       }
     }
     TimerFact::ApiErrorExpired => app.expire_api_error(),
+    #[cfg(feature = "streaming")]
+    TimerFact::NativeLoadWatchdog => app.handle_native_load_watchdog(),
   }
 }
 
@@ -1291,6 +1340,9 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
       refresh_in_progress,
       connected,
     } => {
+      app.auth_state.token_expiry = token_expiry;
+      app.auth_state.refresh_in_progress = refresh_in_progress;
+      app.auth_state.connected = connected;
       app.spotify_token_expiry = token_expiry;
       app.auth_refresh_in_progress = refresh_in_progress;
       app.spotify_connected = connected;
@@ -3524,6 +3576,14 @@ mod tests {
       next_deadline(&app).map(|(_, fact)| fact),
       Some(crate::runtime::engine::TimerFact::ApiErrorExpired)
     );
+
+    let mut app = App::default();
+    app.auth_state.connected = true;
+    app.auth_state.token_expiry = Some(SystemTime::now() + crate::core::auth::TOKEN_REFRESH_MARGIN);
+    assert_eq!(
+      next_deadline(&app).map(|(_, fact)| fact),
+      Some(crate::runtime::engine::TimerFact::AuthRefreshDue)
+    );
   }
 
   #[test]
@@ -3558,8 +3618,15 @@ mod tests {
     let app = Arc::new(Mutex::new(App::default()));
     let (spine, mut events, _) = crate::runtime::engine::Spine::open(Default::default());
     let (_snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+    let (_deadline_tx, deadline_rx) = watch::channel(0u64);
     app.lock().await.status_message_expires_at = Some(Instant::now() + Duration::from_millis(40));
-    tokio::spawn(deadline_scheduler(app, spine, snapshot_rx, None));
+    tokio::spawn(deadline_scheduler(
+      app,
+      spine,
+      snapshot_rx,
+      deadline_rx,
+      None,
+    ));
 
     assert!(
       tokio::time::timeout(Duration::from_millis(10), events.recv())
@@ -3573,6 +3640,41 @@ mod tests {
         .expect("deadline should fire")
         .expect("spine should remain open"),
       crate::runtime::engine::EngineEvent::Timer(crate::runtime::engine::TimerFact::NoticeExpired)
+    ));
+  }
+
+  #[tokio::test]
+  async fn scheduler_emits_auth_refresh_at_the_safety_margin() {
+    let app = Arc::new(Mutex::new(App::default()));
+    {
+      let mut guard = app.lock().await;
+      guard.auth_state.connected = true;
+      guard.auth_state.token_expiry = Some(
+        SystemTime::now() + crate::core::auth::TOKEN_REFRESH_MARGIN + Duration::from_millis(40),
+      );
+    }
+    let (spine, mut events, _) = crate::runtime::engine::Spine::open(Default::default());
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+    let (_deadline_tx, deadline_rx) = watch::channel(0u64);
+    tokio::spawn(deadline_scheduler(
+      app,
+      spine,
+      snapshot_rx,
+      deadline_rx,
+      None,
+    ));
+
+    assert!(
+      tokio::time::timeout(Duration::from_millis(20), events.recv())
+        .await
+        .is_err()
+    );
+    assert!(matches!(
+      tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("auth deadline should fire")
+        .expect("spine should remain open"),
+      crate::runtime::engine::EngineEvent::Timer(crate::runtime::engine::TimerFact::AuthRefreshDue)
     ));
   }
 

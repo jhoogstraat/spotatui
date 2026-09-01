@@ -163,6 +163,111 @@ pub struct NativePlaybackRestoreAttempt {
 }
 
 impl App {
+  /// Base response window for a native load. The effective deadline grows
+  /// with the already-spent recovery attempts, preserving the old watchdog's
+  /// bounded retry policy while letting the engine scheduler arm one shot.
+  #[cfg(feature = "streaming")]
+  pub(crate) const NATIVE_LOAD_WATCHDOG: Duration = Duration::from_secs(5);
+
+  #[cfg(feature = "streaming")]
+  pub(crate) fn native_load_watchdog_window(&self) -> Duration {
+    let restore_attempts = self
+      .native_restore_pending
+      .as_ref()
+      .and_then(|attempt| {
+        self
+          .native_playback_recovery
+          .as_ref()
+          .filter(|snapshot| snapshot.generation == attempt.generation)
+      })
+      .map_or(0, |snapshot| snapshot.recovery_attempts.saturating_sub(1));
+    Self::NATIVE_LOAD_WATCHDOG.saturating_mul(
+      u32::from(
+        self
+          .pending_start_playback
+          .as_ref()
+          .map_or(restore_attempts, |pending| pending.recovery_attempts),
+      ) + 1,
+    )
+  }
+
+  /// Return the monotonic deadline for the armed load watchdog. Reconnecting
+  /// sessions intentionally have no deadline; the reconnect fact re-arms it
+  /// once the replacement Spirc exists, matching the tick-era behavior.
+  #[cfg(feature = "streaming")]
+  pub(crate) fn native_load_watchdog_deadline(&self) -> Option<Instant> {
+    if self
+      .streaming_player
+      .as_ref()
+      .is_some_and(|player| player.is_recovering())
+    {
+      return None;
+    }
+    self
+      .native_load_watchdog
+      .map(|armed| armed + self.native_load_watchdog_window())
+  }
+
+  /// Apply one fired load-watchdog fact. The guard makes stale timer firings
+  /// harmless when a transport event disarmed or replaced the current load.
+  #[cfg(feature = "streaming")]
+  pub(crate) fn handle_native_load_watchdog(&mut self) {
+    let Some(armed) = self.native_load_watchdog else {
+      return;
+    };
+    if armed.elapsed() < self.native_load_watchdog_window() {
+      return;
+    }
+    if self
+      .streaming_player
+      .as_ref()
+      .is_some_and(|player| player.is_recovering())
+    {
+      self.native_load_watchdog = Some(Instant::now());
+      return;
+    }
+
+    self.native_load_watchdog = None;
+    const MAX_RECOVERY_ATTEMPTS: u8 = 2;
+    if let Some(pending) = self.pending_start_playback.as_mut() {
+      if pending.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+        self.pending_start_playback = None;
+        self.set_status_message(
+          "Native playback did not respond after recovery; request dropped.",
+          8,
+        );
+      } else {
+        pending.recovery_attempts += 1;
+        log::warn!(
+          "no player event within {}s of native load; forcing recovery attempt {}",
+          Self::NATIVE_LOAD_WATCHDOG.as_secs(),
+          pending.recovery_attempts
+        );
+        self.force_native_streaming_recovery(true);
+      }
+    } else if let Some(attempt) = self.native_restore_pending.clone() {
+      let recovery_attempts = self
+        .native_playback_recovery
+        .as_ref()
+        .filter(|snapshot| snapshot.generation == attempt.generation)
+        .map_or(0, |snapshot| snapshot.recovery_attempts);
+      if recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+        self.native_restore_pending = None;
+        self.set_status_message(
+          "Native connection recovered, but playback could not be restored.",
+          8,
+        );
+      } else {
+        log::warn!(
+          "native restore generation {} produced no matching player event; forcing recovery attempt {}",
+          attempt.generation,
+          recovery_attempts + 1
+        );
+        self.force_native_streaming_recovery(true);
+      }
+    }
+  }
+
   #[cfg(feature = "streaming")]
   fn next_native_playback_generation(&mut self) -> u64 {
     self.native_playback_generation = self.native_playback_generation.wrapping_add(1);
