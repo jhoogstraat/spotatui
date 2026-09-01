@@ -144,7 +144,7 @@ impl App {
   /// the page does not vanish leaving nothing behind. A frame that expired
   /// buried under something else goes quietly: a toast about a minute-old
   /// failure the user already navigated away from is noise.
-  pub(super) fn expire_api_error(&mut self) {
+  pub(crate) fn expire_api_error(&mut self) {
     let Some(expires_at) = self.api_error_expires_at else {
       return;
     };

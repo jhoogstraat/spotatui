@@ -41,6 +41,8 @@ use crate::core::streaming::StreamingStateEvent;
 /// as each domain extracts (tickets 08–11).
 #[derive(Debug)]
 pub enum EngineEvent {
+  /// A named one-shot deadline fired by the private engine scheduler.
+  Timer(TimerFact),
   /// Something mutated observable session state: rebuild + republish if it
   /// differs from what is live. Carries which surface changed so later stages
   /// can shard the fold task without re-plumbing producers.
@@ -63,6 +65,19 @@ pub enum EngineEvent {
   Decoded(DecodedSourceFact),
   /// Listening-history cache and recap facts, reduced by the fold.
   History(HistoryFact),
+}
+
+/// One-shot deadline facts emitted by the private engine scheduler.
+///
+/// The fact is deliberately named rather than carrying an arbitrary callback:
+/// the fold remains the only writer and stale firings can be ignored when a
+/// newer deadline replaced the one that was armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerFact {
+  /// Retire the status-bar notice when its TTL has elapsed.
+  NoticeExpired,
+  /// Retire an API error page after its backstop lifetime.
+  ApiErrorExpired,
 }
 
 /// Fold-owned writes produced by the listening-history collector.

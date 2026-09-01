@@ -34,9 +34,16 @@ pub struct LibrarySnapshot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchDetail {
-  Artist { tracks: Vec<TrackInfo>, albums: Vec<AlbumInfo> },
-  Album { tracks: Vec<TrackInfo> },
-  Playlist { tracks: Vec<TrackInfo> },
+  Artist {
+    tracks: Vec<TrackInfo>,
+    albums: Vec<AlbumInfo>,
+  },
+  Album {
+    tracks: Vec<TrackInfo>,
+  },
+  Playlist {
+    tracks: Vec<TrackInfo>,
+  },
 }
 
 /// One published runtime state. Composed from the existing snapshot builders;
@@ -198,7 +205,7 @@ impl Runtime {
     let services = rt.block_on(super::startup::start_services(boot))?;
 
     let app = Arc::clone(&services.app);
-    let (snapshot_tx, _snapshot_rx) = watch::channel(Snapshot::default());
+    let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // The event spine is opened by `start_services` so every producer shares
     // one channel; this side receives events, the fold reduces them.
@@ -235,6 +242,20 @@ impl Runtime {
           spine.emit(EngineEvent::changed(Changed::Session)).await;
         }
       });
+    }
+    // Deadlines are folded as named timer facts. The scheduler watches the
+    // published snapshot only to notice newly armed/replaced deadlines; it
+    // never wakes on a periodic cadence.
+    {
+      let app = Arc::clone(&app);
+      let spine = command_spine.clone();
+      let shutdown_rx = shutdown_tx.subscribe();
+      rt.spawn(deadline_scheduler(
+        app,
+        spine,
+        snapshot_rx,
+        Some(shutdown_rx),
+      ));
     }
 
     // The tick thread owns `Driver`, which is deliberately `!Send` (the Lua
@@ -362,6 +383,68 @@ impl Runtime {
   /// Call once before boot.
   pub fn install_panic_hook() {
     super::bootstrap::install_panic_hook();
+  }
+}
+
+/// Return the nearest armed deadline. Keeping this decision pure over the
+/// current App state gives the scheduler one small, deterministic seam while
+/// the actual timer task stays private to the Playback Engine.
+fn next_deadline(app: &App) -> Option<(Instant, crate::runtime::engine::TimerFact)> {
+  [
+    app
+      .status_message_expires_at
+      .map(|deadline| (deadline, crate::runtime::engine::TimerFact::NoticeExpired)),
+    app
+      .api_error_expires_at
+      .map(|deadline| (deadline, crate::runtime::engine::TimerFact::ApiErrorExpired)),
+  ]
+  .into_iter()
+  .flatten()
+  .min_by_key(|(deadline, _)| *deadline)
+}
+
+/// Sleep until the nearest armed deadline and emit its named fact. Snapshot
+/// changes wake the task so a newly armed or replaced deadline is re-evaluated
+/// immediately; with no deadline, it parks on the watch channel indefinitely.
+async fn deadline_scheduler(
+  app: Arc<Mutex<App>>,
+  spine: Spine,
+  mut snapshots: watch::Receiver<Snapshot>,
+  mut shutdown_rx: Option<watch::Receiver<bool>>,
+) {
+  loop {
+    let next = {
+      let guard = app.lock().await;
+      next_deadline(&guard)
+    };
+    match next {
+      Some((deadline, fact)) => {
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(sleep);
+        tokio::select! {
+          _ = &mut sleep => spine.emit(EngineEvent::Timer(fact)).await,
+          changed = snapshots.changed() => {
+            if changed.is_err() { break; }
+          }
+          changed = shutdown_changed(&mut shutdown_rx) => if changed { break },
+        }
+      }
+      None => {
+        tokio::select! {
+          changed = snapshots.changed() => {
+            if changed.is_err() { break; }
+          }
+          changed = shutdown_changed(&mut shutdown_rx) => if changed { break },
+        }
+      }
+    }
+  }
+}
+
+async fn shutdown_changed(shutdown_rx: &mut Option<watch::Receiver<bool>>) -> bool {
+  match shutdown_rx {
+    Some(rx) => rx.changed().await.is_err() || *rx.borrow(),
+    None => std::future::pending().await,
   }
 }
 
@@ -562,6 +645,12 @@ pub(crate) async fn spawn_fold(
     events_rx,
     spine_queries,
   ));
+  tokio::spawn(deadline_scheduler(
+    app.clone(),
+    spine.clone(),
+    snapshot_rx.clone(),
+    None,
+  ));
   (spine, snapshot_rx)
 }
 
@@ -683,6 +772,10 @@ pub(super) async fn fold_loop(
       EngineEvent::History(fact) => {
         let mut app = app.lock().await;
         apply_history_fact(&mut app, fact);
+      }
+      EngineEvent::Timer(fact) => {
+        let mut app = app.lock().await;
+        apply_timer_fact(&mut app, fact);
       }
       EngineEvent::StateChanged(_) => {}
     }
@@ -848,7 +941,23 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
     EngineEvent::Session(fact) => apply_session_fact(app, fact.clone()),
     EngineEvent::Decoded(_) => {}
     EngineEvent::History(fact) => apply_history_fact(app, fact.clone()),
+    EngineEvent::Timer(fact) => apply_timer_fact(app, *fact),
     EngineEvent::StateChanged(_) => {}
+  }
+}
+
+fn apply_timer_fact(app: &mut App, fact: crate::runtime::engine::TimerFact) {
+  use crate::runtime::engine::TimerFact;
+  match fact {
+    TimerFact::NoticeExpired => {
+      if app
+        .status_message_expires_at
+        .is_some_and(|deadline| Instant::now() >= deadline)
+      {
+        app.dismiss_status_message();
+      }
+    }
+    TimerFact::ApiErrorExpired => app.expire_api_error(),
   }
 }
 
@@ -3197,22 +3306,32 @@ fn build_snapshot(app: &App) -> Snapshot {
     crate::core::app::RouteId::AlbumTracks => app
       .selected_album_simplified
       .as_ref()
-      .map(|album| SearchDetail::Album { tracks: album.tracks.items.clone() })
-      .or_else(|| app.selected_album_full.as_ref().map(|album| SearchDetail::Album {
-        tracks: album.album.tracks.clone(),
-      })),
-    crate::core::app::RouteId::TrackTable => app.playlist_tracks.as_ref().map(|page| {
-      SearchDetail::Playlist {
-        tracks: page
-          .items
-          .iter()
-          .filter_map(|(_, item)| match item {
-            crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
-            crate::core::plugin_api::PlayableInfo::Episode(_) => None,
+      .map(|album| SearchDetail::Album {
+        tracks: album.tracks.items.clone(),
+      })
+      .or_else(|| {
+        app
+          .selected_album_full
+          .as_ref()
+          .map(|album| SearchDetail::Album {
+            tracks: album.album.tracks.clone(),
           })
-          .collect(),
-      }
-    }),
+      }),
+    crate::core::app::RouteId::TrackTable => {
+      app
+        .playlist_tracks
+        .as_ref()
+        .map(|page| SearchDetail::Playlist {
+          tracks: page
+            .items
+            .iter()
+            .filter_map(|(_, item)| match item {
+              crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
+              crate::core::plugin_api::PlayableInfo::Episode(_) => None,
+            })
+            .collect(),
+        })
+    }
     _ => None,
   };
   Snapshot {
@@ -3296,6 +3415,69 @@ mod tests {
       answered,
       Ok(crate::runtime::engine::FoldAnswer::U64(0))
     ));
+  }
+
+  #[test]
+  fn next_deadline_returns_the_nearest_named_fact() {
+    let mut app = App::default();
+    let now = Instant::now();
+    app.status_message_expires_at = Some(now + Duration::from_secs(2));
+    app.api_error_expires_at = Some(now + Duration::from_secs(1));
+
+    assert_eq!(
+      next_deadline(&app).map(|(_, fact)| fact),
+      Some(crate::runtime::engine::TimerFact::ApiErrorExpired)
+    );
+  }
+
+  #[tokio::test]
+  async fn scheduler_waits_for_a_deadline_instead_of_heartbeat_waking() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut events, _) = crate::runtime::engine::Spine::open(Default::default());
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+    app.lock().await.status_message_expires_at = Some(Instant::now() + Duration::from_millis(40));
+    tokio::spawn(deadline_scheduler(app, spine, snapshot_rx, None));
+
+    assert!(
+      tokio::time::timeout(Duration::from_millis(10), events.recv())
+        .await
+        .is_err(),
+      "scheduler must remain parked before the nearest deadline"
+    );
+    assert!(matches!(
+      tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("deadline should fire")
+        .expect("spine should remain open"),
+      crate::runtime::engine::EngineEvent::Timer(crate::runtime::engine::TimerFact::NoticeExpired)
+    ));
+  }
+
+  #[tokio::test]
+  async fn notice_expiry_reaches_the_fold_while_idle() {
+    let app = Arc::new(Mutex::new(App::default()));
+    {
+      let mut guard = app.lock().await;
+      guard.status_message = Some("temporary".to_string());
+      guard.status_message_expires_at = Some(Instant::now() + Duration::from_millis(40));
+    }
+    let (_spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots
+      .changed()
+      .await
+      .expect("fold should publish initial state");
+    assert_eq!(snapshots.borrow().notice.as_deref(), Some("temporary"));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+      loop {
+        snapshots.changed().await.expect("fold should remain open");
+        if snapshots.borrow().notice.is_none() {
+          break;
+        }
+      }
+    })
+    .await
+    .expect("notice should expire without another playback or catalog event");
   }
 
   #[cfg(feature = "local-files")]
