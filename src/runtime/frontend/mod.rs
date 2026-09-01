@@ -405,6 +405,15 @@ fn next_deadline(app: &App) -> Option<(Instant, crate::runtime::engine::TimerFac
     app
       .api_error_expires_at
       .map(|deadline| (deadline, crate::runtime::engine::TimerFact::ApiErrorExpired)),
+    app
+      .playback_resync_deadline()
+      .map(|deadline| (deadline, crate::runtime::engine::TimerFact::PlaybackResync)),
+    app.pending_seek_deadline().map(|deadline| {
+      (
+        deadline,
+        crate::runtime::engine::TimerFact::SeekThrottleElapsed,
+      )
+    }),
   ];
   if app.auth_state.connected && !app.auth_state.refresh_in_progress {
     if let Some(expiry) = app.auth_state.token_expiry {
@@ -483,13 +492,13 @@ async fn shutdown_changed(shutdown_rx: &mut Option<watch::Receiver<bool>>) -> bo
 /// Activity classes that decide the driver's wake cadence. The old loop ran
 /// `Driver::tick` every 250 ms unconditionally; this loop runs it *when
 /// something happens* plus a slow backstop for the few duties still sized in
-/// wall-clock time (API poll resync, watchdog, notice expiry — each becomes a
-/// dedicated timer in stage 3, shrinking the backstop further).
+/// wall-clock time. Playback resync and seek coalescing are named deadlines
+/// handled by the private scheduler, not this heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DriverWake {
   /// Playback state says audio is advancing; position/keepalive cadence.
   Playing,
-  /// Nothing playing but a session exists (poll resync, watchdog rearm).
+  /// Nothing playing but a session exists (watchdog rearm).
   Idle,
 }
 
@@ -499,8 +508,8 @@ impl DriverWake {
       // While playing the position advances under events from librespot;
       // this backstop just bounds worst-case stall if events starve.
       DriverWake::Playing => Duration::from_millis(250),
-      // Idle: only the Web-API resync poll (5 s default) and the watchdog
-      // need wall-clock attention between real events.
+      // Idle: only the watchdog and remaining backstop duties need attention
+      // between real events; playback resync is a named deadline.
       DriverWake::Idle => Duration::from_secs(2),
     }
   }
@@ -572,7 +581,7 @@ async fn driver_loop(
           cover_art_full_image_support: false,
         },
       );
-      // Tick-produced changes (poll resync, notice expiry) republish via the
+      // Tick-produced changes (notice expiry) republish via the
       // legacy bell; the bell proxy converts that into a spine event for the
       // fold. Typed streaming events bypass the bell entirely (ticket 14).
       app.change_notify.notify_one();
@@ -1099,6 +1108,13 @@ fn apply_timer_fact(app: &mut App, fact: crate::runtime::engine::TimerFact) {
     TimerFact::ApiErrorExpired => app.expire_api_error(),
     #[cfg(feature = "streaming")]
     TimerFact::NativeLoadWatchdog => app.handle_native_load_watchdog(),
+    TimerFact::PlaybackResync => app.poll_current_playback(),
+    TimerFact::SeekThrottleElapsed => {
+      #[cfg(feature = "streaming")]
+      app.flush_pending_native_seek();
+      app.flush_pending_api_seek();
+      app.flush_pending_source_seek();
+    }
   }
 }
 
@@ -3611,6 +3627,26 @@ mod tests {
     next.position_ms = Some(1);
     let next = publication.revise(next, &first);
     assert!(Arc::ptr_eq(&first_rows, &next.search_tracks));
+  }
+
+  #[test]
+  fn next_deadline_arms_playback_resync_and_seek_throttle() {
+    let mut app = App::default();
+    app.spotify_connected = true;
+    app.instant_since_last_current_playback_poll = Instant::now() - Duration::from_secs(1);
+    app.pending_api_seek = Some(1_000);
+    app.last_api_seek = Some(Instant::now() - Duration::from_millis(200));
+
+    assert_eq!(
+      next_deadline(&app).map(|(_, fact)| fact),
+      Some(crate::runtime::engine::TimerFact::PlaybackResync)
+    );
+
+    app.instant_since_last_current_playback_poll = Instant::now();
+    assert_eq!(
+      next_deadline(&app).map(|(_, fact)| fact),
+      Some(crate::runtime::engine::TimerFact::SeekThrottleElapsed)
+    );
   }
 
   #[tokio::test]

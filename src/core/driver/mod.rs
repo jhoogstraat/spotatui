@@ -244,10 +244,6 @@ impl Driver {
 
     app.update_on_tick(elapsed);
 
-    #[cfg(feature = "streaming")]
-    app.flush_pending_native_seek();
-    app.flush_pending_api_seek();
-    app.flush_pending_source_seek();
     app.flush_pending_volume();
     app.flush_state_save(false);
 

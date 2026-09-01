@@ -3,6 +3,11 @@ use super::*;
 /// Grace window after the last tick before playback-position reads go stale.
 const STALE_TICK_AFTER: Duration = Duration::from_secs(2);
 
+/// Remote playback has no native event stream, so retain the historical
+/// one-second poll cadence. Native playback keeps its configurable poll for
+/// device/context reconciliation while position events remain authoritative.
+const REMOTE_PLAYBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 // The window must cover at least two of the slowest allowed ticks, so one
 // missed frame can never read as stale. The tick rate is bounded on every
 // path (config load rejects out-of-range values, the settings screen clamps),
@@ -21,7 +26,7 @@ impl App {
     (self.last_tick_at.elapsed() <= STALE_TICK_AFTER).then_some(self.song_progress_ms)
   }
 
-  fn poll_current_playback(&mut self) {
+  pub(crate) fn poll_current_playback(&mut self) {
     // No Spotify session (free-source launch): the poll would hit the auth gate
     // and re-flash a "connect Spotify" status message every interval. Free
     // sources drive their own playback state, so skip the Spotify poll entirely.
@@ -55,6 +60,20 @@ impl App {
     }
   }
 
+  /// Deadline for the next playback poll. The private runtime scheduler uses
+  /// this instead of waking the driver on a fixed heartbeat.
+  pub(crate) fn playback_resync_deadline(&self) -> Option<Instant> {
+    if !self.spotify_connected || self.is_fetching_current_playback {
+      return None;
+    }
+    let interval = if self.is_streaming_active {
+      Duration::from_secs(self.user_config.behavior.playback_poll_seconds)
+    } else {
+      REMOTE_PLAYBACK_POLL_INTERVAL
+    };
+    Some(self.instant_since_last_current_playback_poll + interval)
+  }
+
   pub fn update_on_tick(&mut self, elapsed: Duration) {
     self.last_tick_at = Instant::now();
 
@@ -86,7 +105,6 @@ impl App {
     // would silently stop running during playback.
     self.expire_api_error();
 
-    self.poll_current_playback();
     let playing_now = self.user_config.behavior.keepawake_enabled
       && self
         .native_is_playing
@@ -260,5 +278,21 @@ mod tests {
 
     assert!(matches!(rx.try_recv(), Ok(IoEvent::GetCurrentPlayback)));
     assert!(app.is_fetching_current_playback);
+  }
+
+  #[test]
+  fn playback_resync_deadline_preserves_remote_and_native_cadence() {
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    let now = Instant::now();
+    app.instant_since_last_current_playback_poll = now;
+    assert!(app
+      .playback_resync_deadline()
+      .is_some_and(|deadline| deadline.duration_since(now) <= Duration::from_secs(1)));
+
+    app.is_streaming_active = true;
+    assert!(app
+      .playback_resync_deadline()
+      .is_some_and(|deadline| deadline.duration_since(now) >= Duration::from_secs(5)));
   }
 }

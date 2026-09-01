@@ -4,6 +4,10 @@ use super::*;
 /// This prevents the UI from jumping back to old positions while the seek completes
 pub const SEEK_POSITION_IGNORE_MS: u128 = 500;
 
+const NATIVE_SEEK_THROTTLE: Duration = Duration::from_millis(50);
+const API_SEEK_THROTTLE: Duration = Duration::from_millis(200);
+const SOURCE_SEEK_THROTTLE: Duration = Duration::from_millis(50);
+
 impl App {
   pub(super) fn apply_seek(&mut self, seek_ms: u32) {
     if let Some(CurrentPlaybackContext {
@@ -73,15 +77,14 @@ impl App {
         self.seek_ms = None;
 
         // Throttle actual seeks to avoid overwhelming librespot (max ~20/sec)
-        const SEEK_THROTTLE_MS: u128 = 50;
         let should_seek_now = self
           .last_native_seek
-          .is_none_or(|t| t.elapsed().as_millis() >= SEEK_THROTTLE_MS);
+          .is_none_or(|t| t.elapsed() >= NATIVE_SEEK_THROTTLE);
 
         if should_seek_now {
           self.execute_native_seek(new_progress);
         } else {
-          // Queue the seek - will be flushed by tick loop or next seek
+          // Queue the seek - the deadline scheduler flushes it.
           self.pending_native_seek = Some(new_progress);
         }
         return;
@@ -123,15 +126,14 @@ impl App {
       self.seek_ms = None;
 
       // Throttle actual seeks to avoid overwhelming librespot (max ~20/sec)
-      const SEEK_THROTTLE_MS: u128 = 50;
       let should_seek_now = self
         .last_native_seek
-        .is_none_or(|t| t.elapsed().as_millis() >= SEEK_THROTTLE_MS);
+        .is_none_or(|t| t.elapsed() >= NATIVE_SEEK_THROTTLE);
 
       if should_seek_now {
         self.execute_native_seek(new_progress);
       } else {
-        // Queue the seek - will be flushed by tick loop or next seek
+        // Queue the seek - the deadline scheduler flushes it.
         self.pending_native_seek = Some(new_progress);
       }
       return;
@@ -185,7 +187,7 @@ impl App {
         if should_seek_now {
           self.execute_native_seek(new_progress);
         } else {
-          // Queue the seek - will be flushed by tick loop or next seek
+          // Queue the seek - the deadline scheduler flushes it.
           self.pending_native_seek = Some(new_progress);
         }
         return;
@@ -202,15 +204,14 @@ impl App {
     self.song_progress_ms = position_ms as u128;
     self.seek_ms = None;
 
-    const SOURCE_SEEK_THROTTLE_MS: u128 = 50;
     let should_seek_now = self
       .last_source_seek
-      .is_none_or(|t| t.elapsed().as_millis() >= SOURCE_SEEK_THROTTLE_MS);
+      .is_none_or(|t| t.elapsed() >= SOURCE_SEEK_THROTTLE);
 
     if should_seek_now {
       self.execute_source_seek(position_ms);
     } else {
-      // Queue the seek - will be flushed by tick loop or next seek
+      // Queue the seek - the deadline scheduler flushes it.
       self.pending_source_seek = Some(position_ms);
     }
   }
@@ -222,18 +223,40 @@ impl App {
     self.dispatch(IoEvent::Seek(position_ms));
   }
 
-  /// Flush any pending decoded-source seek (called from tick loop)
+  /// Flush any pending decoded-source seek after its throttle deadline.
   pub fn flush_pending_source_seek(&mut self) {
     if let Some(position) = self.pending_source_seek {
-      const SOURCE_SEEK_THROTTLE_MS: u128 = 50;
       let should_flush = self
         .last_source_seek
-        .is_none_or(|t| t.elapsed().as_millis() >= SOURCE_SEEK_THROTTLE_MS);
+        .is_none_or(|t| t.elapsed() >= SOURCE_SEEK_THROTTLE);
 
       if should_flush {
         self.execute_source_seek(position);
       }
     }
+  }
+
+  /// Earliest deadline for any coalesced seek. The runtime scheduler emits one
+  /// named fact; the fold flushes whichever backend is ready.
+  pub(crate) fn pending_seek_deadline(&self) -> Option<Instant> {
+    [
+      self
+        .pending_api_seek
+        .and(self.last_api_seek)
+        .map(|last| last + API_SEEK_THROTTLE),
+      self
+        .pending_source_seek
+        .and(self.last_source_seek)
+        .map(|last| last + SOURCE_SEEK_THROTTLE),
+      #[cfg(feature = "streaming")]
+      self
+        .pending_native_seek
+        .and(self.last_native_seek)
+        .map(|last| last + NATIVE_SEEK_THROTTLE),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
   }
 
   /// Queue an API-based seek with throttling (for external device control)
@@ -250,10 +273,9 @@ impl App {
     self.instant_since_last_current_playback_poll = now;
 
     // Throttle API calls (max ~5/sec to respect rate limits)
-    const API_SEEK_THROTTLE_MS: u128 = 200;
     let should_seek_now = self
       .last_api_seek
-      .is_none_or(|t| t.elapsed().as_millis() >= API_SEEK_THROTTLE_MS);
+      .is_none_or(|t| t.elapsed() >= API_SEEK_THROTTLE);
 
     // Update last_api_seek for BOTH the ignore window AND throttling
     // This ensures the ignore window starts immediately on any seek request
@@ -262,7 +284,7 @@ impl App {
     if should_seek_now {
       self.execute_api_seek(position_ms);
     } else {
-      // Queue the seek - will be flushed by tick loop
+      // Queue the seek - the deadline scheduler flushes it.
       self.pending_api_seek = Some(position_ms);
     }
   }
@@ -273,13 +295,12 @@ impl App {
     self.apply_seek(position_ms);
   }
 
-  /// Flush any pending API seek (called from tick loop)
+  /// Flush any pending API seek after its throttle deadline.
   pub fn flush_pending_api_seek(&mut self) {
     if let Some(position) = self.pending_api_seek {
-      const API_SEEK_THROTTLE_MS: u128 = 200;
       let should_flush = self
         .last_api_seek
-        .is_none_or(|t| t.elapsed().as_millis() >= API_SEEK_THROTTLE_MS);
+        .is_none_or(|t| t.elapsed() >= API_SEEK_THROTTLE);
 
       if should_flush {
         self.execute_api_seek(position);
@@ -304,15 +325,14 @@ impl App {
     }
   }
 
-  /// Flush any pending native seek (called from tick loop)
+  /// Flush any pending native seek after its throttle deadline.
   #[cfg(feature = "streaming")]
   pub fn flush_pending_native_seek(&mut self) {
     if let Some(position) = self.pending_native_seek {
       // Only flush if enough time has passed since last seek
-      const SEEK_THROTTLE_MS: u128 = 50;
       let should_flush = self
         .last_native_seek
-        .is_none_or(|t| t.elapsed().as_millis() >= SEEK_THROTTLE_MS);
+        .is_none_or(|t| t.elapsed() >= NATIVE_SEEK_THROTTLE);
 
       if should_flush {
         self.execute_native_seek(position);

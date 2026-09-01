@@ -83,6 +83,10 @@ pub enum TimerFact {
   /// Check a native load/restore that has produced no transport confirmation.
   #[cfg(feature = "streaming")]
   NativeLoadWatchdog,
+  /// Reconcile playback state from Spotify for a remote playback device.
+  PlaybackResync,
+  /// Flush the latest coalesced seek after its throttle window.
+  SeekThrottleElapsed,
 }
 
 /// Fold-owned writes produced by the listening-history collector.
