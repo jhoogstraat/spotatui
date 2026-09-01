@@ -27,22 +27,22 @@ pub use crate::core::source::Source;
 /// is a successfully fetched empty list.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LibrarySnapshot {
-  pub liked_songs: Option<Vec<TrackInfo>>,
-  pub recently_played: Option<Vec<TrackInfo>>,
-  pub playlists: Option<Vec<PlaylistInfo>>,
+  pub liked_songs: Option<Arc<[TrackInfo]>>,
+  pub recently_played: Option<Arc<[TrackInfo]>>,
+  pub playlists: Option<Arc<[PlaylistInfo]>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchDetail {
   Artist {
-    tracks: Vec<TrackInfo>,
-    albums: Vec<AlbumInfo>,
+    tracks: Arc<[TrackInfo]>,
+    albums: Arc<[AlbumInfo]>,
   },
   Album {
-    tracks: Vec<TrackInfo>,
+    tracks: Arc<[TrackInfo]>,
   },
   Playlist {
-    tracks: Vec<TrackInfo>,
+    tracks: Arc<[TrackInfo]>,
   },
 }
 
@@ -62,11 +62,16 @@ pub struct Snapshot {
   /// The native queue's upcoming items, in order.
   pub queue_upcoming: Vec<TrackInfo>,
   /// Rows of the latest catalog search, grouped by Spotify content type.
-  pub search_tracks: Vec<TrackInfo>,
-  pub search_artists: Vec<ArtistInfo>,
-  pub search_albums: Vec<AlbumInfo>,
-  pub search_playlists: Vec<PlaylistInfo>,
+  pub search_tracks: Arc<[TrackInfo]>,
+  pub search_artists: Arc<[ArtistInfo]>,
+  pub search_albums: Arc<[AlbumInfo]>,
+  pub search_playlists: Arc<[PlaylistInfo]>,
   pub search_detail: Option<SearchDetail>,
+  /// Monotonic revisions for accepted catalog completions. These are engine
+  /// facts; adapters only translate them and never compare or cache rows.
+  pub search_revision: u64,
+  pub detail_revision: u64,
+  pub library_revision: u64,
   /// A catalog fetch is in flight.
   pub search_loading: bool,
   /// A Spotify session exists.
@@ -581,11 +586,14 @@ impl Default for Snapshot {
       position_ms: None,
       as_of: Instant::now(),
       queue_upcoming: Vec::new(),
-      search_tracks: Vec::new(),
-      search_artists: Vec::new(),
-      search_albums: Vec::new(),
-      search_playlists: Vec::new(),
+      search_tracks: Arc::from([]),
+      search_artists: Arc::from([]),
+      search_albums: Arc::from([]),
+      search_playlists: Arc::from([]),
       search_detail: None,
+      search_revision: 0,
+      detail_revision: 0,
+      library_revision: 0,
       search_loading: false,
       spotify_connected: false,
       notice: None,
@@ -627,11 +635,14 @@ pub(crate) async fn spawn_fold(
     position_ms: None,
     as_of: std::time::Instant::now(),
     queue_upcoming: Vec::new(),
-    search_tracks: Vec::new(),
-    search_artists: Vec::new(),
-    search_albums: Vec::new(),
-    search_playlists: Vec::new(),
+    search_tracks: Arc::from([]),
+    search_artists: Arc::from([]),
+    search_albums: Arc::from([]),
+    search_playlists: Arc::from([]),
     search_detail: None,
+    search_revision: 0,
+    detail_revision: 0,
+    library_revision: 0,
     search_loading: false,
     spotify_connected: false,
     notice: None,
@@ -664,11 +675,12 @@ pub(super) async fn fold_loop(
   mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
   folds: Option<crate::runtime::engine::FoldHandles>,
 ) {
+  let mut catalog = CatalogPublication::default();
   let (mut queries, mut acks) = match folds {
     Some(handles) => (Some(handles.queries), Some(handles.acks)),
     None => (None, None),
   };
-  publish(&app, &tx).await;
+  publish(&app, &tx, &mut catalog).await;
   loop {
     // Answer any producer query that arrived since the last event before
     // (possibly) blocking on the next one: the try_recv drain below clears a
@@ -693,7 +705,7 @@ pub(super) async fn fold_loop(
           apply_acked(&mut guard, event)
         };
         let _ = responder.send(ack);
-        publish(&app, &tx).await;
+        publish(&app, &tx, &mut catalog).await;
       }
     }
     // The select keeps queries and acks responsive while parked on events:
@@ -736,7 +748,7 @@ pub(super) async fn fold_loop(
               apply_acked(&mut guard, event)
             };
             let _ = responder.send(ack);
-            publish(&app, &tx).await;
+            publish(&app, &tx, &mut catalog).await;
           }
           // Ack channel closed: stop watching it.
           None => acks = None,
@@ -779,7 +791,7 @@ pub(super) async fn fold_loop(
       }
       EngineEvent::StateChanged(_) => {}
     }
-    publish(&app, &tx).await;
+    publish(&app, &tx, &mut catalog).await;
     if tx.is_closed() {
       break;
     }
@@ -787,9 +799,89 @@ pub(super) async fn fold_loop(
 }
 
 /// Rebuild the snapshot and equality-dedup the publication.
-async fn publish(app: &Arc<Mutex<App>>, tx: &watch::Sender<Snapshot>) {
+#[derive(Default)]
+struct CatalogPublication {
+  search_revision: u64,
+  detail_revision: u64,
+  library_revision: u64,
+}
+
+impl CatalogPublication {
+  fn revise(&mut self, mut next: Snapshot, previous: &Snapshot) -> Snapshot {
+    // `build_snapshot` receives mutable engine state, so it naturally
+    // creates fresh row containers. Keep the accepted immutable allocations
+    // when their source data is unchanged; only the changed surface is
+    // replaced and receives a new revision.
+    if previous.search_tracks == next.search_tracks {
+      next.search_tracks = Arc::clone(&previous.search_tracks);
+    }
+    if previous.search_artists == next.search_artists {
+      next.search_artists = Arc::clone(&previous.search_artists);
+    }
+    if previous.search_albums == next.search_albums {
+      next.search_albums = Arc::clone(&previous.search_albums);
+    }
+    if previous.search_playlists == next.search_playlists {
+      next.search_playlists = Arc::clone(&previous.search_playlists);
+    }
+    if previous.library.liked_songs == next.library.liked_songs {
+      next.library.liked_songs = previous.library.liked_songs.as_ref().map(Arc::clone);
+    }
+    if previous.library.recently_played == next.library.recently_played {
+      next.library.recently_played = previous.library.recently_played.as_ref().map(Arc::clone);
+    }
+    if previous.library.playlists == next.library.playlists {
+      next.library.playlists = previous.library.playlists.as_ref().map(Arc::clone);
+    }
+    if previous.search_detail == next.search_detail {
+      next.search_detail = previous.search_detail.clone();
+    }
+    let search_changed = {
+      let old = previous;
+      old.search_loading != next.search_loading
+        || old.search_tracks != next.search_tracks
+        || old.search_artists != next.search_artists
+        || old.search_albums != next.search_albums
+        || old.search_playlists != next.search_playlists
+    };
+    if search_changed
+      && !next.search_loading
+      && (!next.search_tracks.is_empty()
+        || !next.search_artists.is_empty()
+        || !next.search_albums.is_empty()
+        || !next.search_playlists.is_empty())
+    {
+      self.search_revision = self.search_revision.wrapping_add(1);
+    }
+    let detail_changed = previous.search_detail != next.search_detail;
+    if detail_changed && next.search_detail.is_some() {
+      self.detail_revision = self.detail_revision.wrapping_add(1);
+    }
+    let library_changed = previous.library != next.library;
+    if library_changed
+      && (!next.library.liked_songs.is_none()
+        || !next.library.recently_played.is_none()
+        || !next.library.playlists.is_none())
+    {
+      self.library_revision = self.library_revision.wrapping_add(1);
+    }
+    next.search_revision = self.search_revision;
+    next.detail_revision = self.detail_revision;
+    next.library_revision = self.library_revision;
+    next
+  }
+}
+
+async fn publish(
+  app: &Arc<Mutex<App>>,
+  tx: &watch::Sender<Snapshot>,
+  catalog: &mut CatalogPublication,
+) {
   let guard = app.lock().await;
-  let next = build_snapshot(&guard);
+  let next = {
+    let previous = tx.borrow();
+    catalog.revise(build_snapshot(&guard), &previous)
+  };
   drop(guard);
   tx.send_if_modified(|current| {
     if *current == next {
@@ -3300,21 +3392,21 @@ fn build_snapshot(app: &App) -> Snapshot {
   let search = crate::core::plugin_api::search_results_snapshot(app);
   let search_detail = match app.get_current_route().id {
     crate::core::app::RouteId::Artist => app.artist.as_ref().map(|artist| SearchDetail::Artist {
-      tracks: artist.top_tracks.clone(),
-      albums: artist.albums.items.clone(),
+      tracks: artist.top_tracks.clone().into(),
+      albums: artist.albums.items.clone().into(),
     }),
     crate::core::app::RouteId::AlbumTracks => app
       .selected_album_simplified
       .as_ref()
       .map(|album| SearchDetail::Album {
-        tracks: album.tracks.items.clone(),
+        tracks: album.tracks.items.clone().into(),
       })
       .or_else(|| {
         app
           .selected_album_full
           .as_ref()
           .map(|album| SearchDetail::Album {
-            tracks: album.album.tracks.clone(),
+            tracks: album.album.tracks.clone().into(),
           })
       }),
     crate::core::app::RouteId::TrackTable => {
@@ -3329,7 +3421,8 @@ fn build_snapshot(app: &App) -> Snapshot {
               crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
               crate::core::plugin_api::PlayableInfo::Episode(_) => None,
             })
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
         })
     }
     _ => None,
@@ -3339,24 +3432,27 @@ fn build_snapshot(app: &App) -> Snapshot {
     playback: crate::core::plugin_api::playback_state(app),
     library: LibrarySnapshot {
       liked_songs: (!app.library.saved_tracks.pages.is_empty())
-        .then(|| crate::core::plugin_api::saved_tracks_snapshot(app)),
+        .then(|| Arc::from(crate::core::plugin_api::saved_tracks_snapshot(app))),
       recently_played: app
         .recently_played
         .result
         .as_ref()
-        .map(|_| crate::core::plugin_api::recently_played_snapshot(app)),
+        .map(|_| Arc::from(crate::core::plugin_api::recently_played_snapshot(app))),
       playlists: app
         .playlists
         .as_ref()
-        .map(|_| crate::core::plugin_api::playlists_snapshot(app)),
+        .map(|_| Arc::from(crate::core::plugin_api::playlists_snapshot(app))),
     },
     position_ms: app.playback_position_ms().map(|p| p as u64),
     queue_upcoming: app.native_queue.clone(),
-    search_tracks: search.tracks,
-    search_artists: search.artists,
-    search_albums: search.albums,
-    search_playlists: search.playlists,
+    search_tracks: search.tracks.into(),
+    search_artists: search.artists.into(),
+    search_albums: search.albums.into(),
+    search_playlists: search.playlists.into(),
     search_detail,
+    search_revision: 0,
+    detail_revision: 0,
+    library_revision: 0,
     search_loading: app.search_loading,
     spotify_connected: app.spotify_connected,
     notice: app.status_message.clone(),
@@ -3428,6 +3524,33 @@ mod tests {
       next_deadline(&app).map(|(_, fact)| fact),
       Some(crate::runtime::engine::TimerFact::ApiErrorExpired)
     );
+  }
+
+  #[test]
+  fn catalog_rows_reuse_arc_across_non_catalog_publication() {
+    let mut publication = CatalogPublication::default();
+    let mut first = Snapshot::default();
+    first.search_tracks = Arc::from([TrackInfo {
+      uri: Some("spotify:track:one".into()),
+      name: "one".into(),
+      artists: vec![],
+      album: String::new(),
+      duration_ms: 1,
+      id: None,
+      album_id: None,
+      artist_refs: vec![],
+      is_playable: true,
+      is_local: false,
+      track_number: 0,
+      explicit: false,
+      image_url: None,
+    }]);
+    let first = publication.revise(first, &Snapshot::default());
+    let first_rows = Arc::clone(&first.search_tracks);
+    let mut next = first.clone();
+    next.position_ms = Some(1);
+    let next = publication.revise(next, &first);
+    assert!(Arc::ptr_eq(&first_rows, &next.search_tracks));
   }
 
   #[tokio::test]
