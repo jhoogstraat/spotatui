@@ -50,6 +50,9 @@ pub enum SearchDetail {
 pub struct Snapshot {
   /// Current playback state from `plugin_api::playback_state`.
   pub playback: Option<PlaybackState>,
+  /// Whether the active Playback Session is produced by this process's native
+  /// streaming backend rather than a remote Playback Device.
+  pub native_playback: bool,
   /// The user's Spotify library data fetched so far.
   pub library: LibrarySnapshot,
   /// Catalog request intent, folded with the action that initiated it.
@@ -460,6 +463,7 @@ impl Default for Snapshot {
   fn default() -> Self {
     Snapshot {
       playback: None,
+      native_playback: false,
       library: LibrarySnapshot::default(),
       search_query: None,
       library_target: None,
@@ -511,6 +515,7 @@ pub(crate) async fn spawn_fold(
   let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(0u64);
   let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Snapshot {
     playback: None,
+    native_playback: false,
     library: Default::default(),
     search_query: None,
     library_target: None,
@@ -1871,6 +1876,21 @@ fn current_playback_matches_native(
   ctx.device.name.eq_ignore_ascii_case(player.device_name()) && app.has_fresh_native_activity()
 }
 
+fn native_playback_active(app: &App) -> bool {
+  #[cfg(feature = "streaming")]
+  {
+    app
+      .streaming_player
+      .as_ref()
+      .is_some_and(|player| current_playback_matches_native(app, player))
+  }
+  #[cfg(not(feature = "streaming"))]
+  {
+    let _ = app;
+    false
+  }
+}
+
 pub(crate) fn answer_query(
   app: &mut App,
   query: crate::runtime::engine::FoldQuery,
@@ -3179,6 +3199,7 @@ fn build_snapshot(app: &App) -> Snapshot {
   Snapshot {
     as_of: Instant::now(),
     playback: crate::core::plugin_api::playback_state(app),
+    native_playback: native_playback_active(app),
     library: LibrarySnapshot {
       liked_songs: (!app.library.saved_tracks.pages.is_empty())
         .then(|| Arc::from(crate::core::plugin_api::saved_tracks_snapshot(app))),
