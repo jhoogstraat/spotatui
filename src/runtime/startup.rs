@@ -30,7 +30,9 @@ use rspotify::{model::user::PrivateUser, AuthCodePkceSpotify};
 use std::path::Path;
 #[cfg(feature = "streaming")]
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicU64, Arc};
+#[cfg(any(feature = "streaming", all(feature = "mpris", target_os = "linux")))]
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 // Used by the streaming OAuth timeout and by `restore_playback_session`'s
 // per-source position seeks.
 #[cfg(any(
@@ -615,9 +617,6 @@ pub(super) struct Services {
   pub spine_queries: crate::runtime::engine::QueryReceiver,
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub user_config: UserConfig,
-  /// Real-time position updates from the native player event handler;
-  /// `None` in builds where nothing produces one.
-  pub shared_position_for_ui: Option<Arc<AtomicU64>>,
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub discord_rpc_manager: DiscordRpcHandle,
   pub history_collector: crate::infra::history::HistoryCollectorHandle,
@@ -749,8 +748,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let shared_position = Arc::new(AtomicU64::new(0));
   #[cfg(feature = "streaming")]
   let shared_position_for_events = Arc::clone(&shared_position);
-  #[cfg(feature = "streaming")]
-  let shared_position_for_ui = Arc::clone(&shared_position);
 
   // Create shared atomic for playing state (lock-free for MPRIS toggle)
   #[cfg(any(feature = "streaming", all(feature = "mpris", target_os = "linux")))]
@@ -913,12 +910,14 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   if let Some(ref macos_media) = macos_media_manager {
     let macos_media_for_metadata = Arc::clone(macos_media);
     let app_for_macos_metadata = Arc::clone(&app);
+    let mut activity_rx = spine_for_events.subscribe_activity();
     tokio::spawn(async move {
       let mut last_metadata: Option<MacosMetadata> = None;
-      let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
       loop {
-        interval.tick().await;
+        if activity_rx.changed().await.is_err() {
+          break;
+        }
         if let Ok(app) = app_for_macos_metadata.try_lock() {
           update_macos_metadata(&macos_media_for_metadata, &mut last_metadata, &app);
         }
@@ -941,13 +940,15 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   if let Some(ref windows_media) = windows_media_manager {
     let windows_media_for_metadata = Arc::clone(windows_media);
     let app_for_windows_metadata = Arc::clone(&app);
+    let mut activity_rx = spine_for_events.subscribe_activity();
     tokio::spawn(async move {
       let mut last_metadata: Option<WindowsMetadata> = None;
       let mut last_playing: Option<bool> = None; // Track play state
-      let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
       loop {
-        interval.tick().await;
+        if activity_rx.changed().await.is_err() {
+          break;
+        }
         if let Ok(app) = app_for_windows_metadata.try_lock() {
           update_windows_metadata(&windows_media_for_metadata, &mut last_metadata, &app);
           let is_playing = if app.native_track_info.is_some() {
@@ -1123,18 +1124,12 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     start_tokio(sync_io_rx, &mut network).await;
   });
 
-  #[cfg(feature = "streaming")]
-  let shared_position_for_ui: Option<Arc<AtomicU64>> = Some(shared_position_for_ui);
-  #[cfg(not(feature = "streaming"))]
-  let shared_position_for_ui: Option<Arc<AtomicU64>> = None;
-
   Ok(Services {
     spine: spine_for_events.clone(),
     spine_rx,
     spine_queries,
     app,
     user_config,
-    shared_position_for_ui,
     discord_rpc_manager,
     history_collector,
   })

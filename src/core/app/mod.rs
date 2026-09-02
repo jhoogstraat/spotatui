@@ -29,10 +29,8 @@ use rspotify::{
 };
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
-// Bare `Arc` names the streaming player, the MPRIS manager, and the decoded
-// queue-slot accessors below — plus `change_notify`, which every build
-// publishes, so this import stays unconditional even on legs without any of
-// those features.
+// Bare `Arc` names the streaming player, the MPRIS manager, and decoded
+// queue-slot accessors below.
 #[allow(unused_imports)]
 use std::sync::Arc;
 use std::{
@@ -113,7 +111,6 @@ pub use playlists::*;
 pub use queue::*;
 pub use route::*;
 pub use scrollable_pages::*;
-pub use seek::*;
 pub use settings_schema::*;
 pub use status::*;
 
@@ -225,10 +222,6 @@ pub struct App {
   #[allow(dead_code)]
   pub small_search_limit: u32,
   pub song_progress_ms: u128,
-  /// When `update_on_tick` last ran. Every frontend must drive the tick (see
-  /// `core::driver`); `playback_position_ms` reports stale past 2s so one
-  /// that stops ticking shows a loud error instead of a frozen playbar.
-  pub last_tick_at: Instant,
   pub seek_ms: Option<u128>,
   /// Last time a native seek was actually sent to the player (for throttling)
   #[cfg(feature = "streaming")]
@@ -278,14 +271,11 @@ pub struct App {
   /// every dispatched event sets — embedders must not read global spinner
   /// churn (playback polls, refreshes) as "a search is running".
   pub search_loading: bool,
-  /// Change bell for frontends without a render loop of their own: poked
-  /// after every `apply`, every pump iteration, and every tick, so a
-  /// snapshot publisher can rebuild and diff-publish without polling.
-  /// `notify_one` (permit semantics) so pokes between publisher wakes are
-  /// never lost.
-  pub change_notify: Arc<tokio::sync::Notify>,
   io_tx: Option<Sender<IoEvent>>,
   pub is_fetching_current_playback: bool,
+  /// Active-only radio EOF latch used by the named playback-maintenance deadline.
+  #[cfg(feature = "internet-radio")]
+  pub(crate) radio_stream_started: bool,
   /// Expiry of the current Spotify access token, or `None` when there is no
   /// Spotify session (launched against a free source). The token-refresh poll
   /// in the driver skips refreshing while this is `None`.

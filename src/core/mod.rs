@@ -27,7 +27,6 @@ pub mod auth;
 pub mod banner;
 pub mod config;
 #[allow(dead_code)]
-pub mod driver;
 pub mod first_run;
 #[allow(dead_code)]
 pub mod format;

@@ -204,9 +204,6 @@ impl App {
         }
       }
     }
-    // Bell the snapshot publisher (if any): an applied action is a state
-    // change even when every arm dispatched rather than mutated directly.
-    self.change_notify.notify_one();
     ActionOutcome::Applied
   }
 }

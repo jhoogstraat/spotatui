@@ -234,8 +234,8 @@ impl App {
   }
 
   /// Cheap presence check for `current_persisted_session`: same decision
-  /// logic, no snapshot allocation. Lets the tick loop skip building the
-  /// snapshot (which clones the whole native queue) unless a save is due.
+  /// logic, no snapshot allocation. The deadline scheduler uses this to
+  /// avoid building persistence state until a save is due.
   pub fn has_persistable_session(&self) -> bool {
     self.has_persistable_playback()
       || !self.native_queue.is_empty()

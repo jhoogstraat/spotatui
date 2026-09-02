@@ -9,7 +9,6 @@
 //! `Network`, rspotify, and librespot types stay private.
 
 use anyhow::Result;
-use log::info;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{watch, Mutex};
@@ -136,7 +135,7 @@ impl Options {
   }
 }
 
-use super::engine::{Changed, EngineCommand, EngineEvent, Spine};
+use super::engine::{EngineCommand, EngineEvent, Spine};
 
 use crate::core::app::{
   ActiveBlock, AlbumTableContext, App, EpisodeTableContext, RouteId, ScrollableResultPages,
@@ -154,31 +153,23 @@ use crate::runtime::engine::{DeviceList, FoldAck, PlaylistRefreshPrevious};
 
 pub use super::engine::EngineCommand as FrontendEngineCommand;
 
-/// An embedded Spotatui runtime: shared service startup, the driver loop on
-/// its own thread, an event-spine-fed snapshot publisher, and the quit
-/// sequence. The engine emits [`EngineEvent`]s through its [`Spine`]; the
-/// publisher folds them into deduplicated immutable snapshots (ADR 0016
-/// stage 2). No bell rings without an event behind it.
+/// An embedded Spotatui runtime: shared service startup, an event-spine-fed
+/// snapshot publisher, and the quit sequence. The engine emits
+/// [`EngineEvent`]s through its [`Spine`]; the publisher folds them into
+/// deduplicated immutable snapshots (ADR 0016 stage 2).
 pub struct Runtime {
   rt: tokio::runtime::Runtime,
   app: Arc<Mutex<App>>,
   snapshot_tx: watch::Sender<Snapshot>,
   shutdown_tx: watch::Sender<bool>,
   spine: Spine,
-  /// Wake handle for the driver backstop loop. External producers that
-  /// mutate App-side pending state (e.g. a scripted volume ramp) can poke
-  /// this so flush duties run promptly instead of waiting out the backstop.
-  /// Currently only the shutdown path reads it, via `self.tick_wake` never
-  /// being poked externally — kept for ticket 16's producer rewiring.
-  #[allow(dead_code)]
-  tick_wake: Arc<tokio::sync::Notify>,
-  tick_done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+  history_collector: Option<crate::infra::history::HistoryCollectorHandle>,
 }
 
 impl Runtime {
   /// Boot the runtime synchronously. Runs the full shared bootstrap
   /// (config, state restore, Spotify authentication) plus every shared
-  /// service, then starts the tick loop and snapshot publisher on an owned
+  /// service, then starts the snapshot publisher on an owned
   /// Tokio runtime. Blocks while interactive onboarding prompts run.
   ///
   /// No console prompt other than `Onboarding` can fire in this mode: the
@@ -210,7 +201,7 @@ impl Runtime {
 
     let app = Arc::clone(&services.app);
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, _) = watch::channel(false);
     // The event spine is opened by `start_services` so every producer shares
     // one channel; this side receives events, the fold reduces them.
     let events_rx = services.spine_rx;
@@ -223,30 +214,16 @@ impl Runtime {
     // player events is preserved.
     let command_spine = services.spine.clone();
     let spine = command_spine.clone();
+    let fold_spine = command_spine.clone();
     // The fold task: consumes typed spine events, reduces them into App
     // (single writer of the streaming mirrors), rebuilds once, and
-    // equality-dedups the publication. Also wakes on the legacy change bell
-    // until every producer is migrated (tickets 15–17 delete it).
+    // equality-dedups the publication.
     {
       let app = Arc::clone(&app);
       let tx = snapshot_tx.clone();
       let deadline_tx = deadline_tx.clone();
       rt.spawn(async move {
-        fold_loop(app, tx, events_rx, folds, deadline_tx).await;
-      });
-    }
-    // Legacy-bell wake: `apply`, the pump, and remaining direct writers ring
-    // `change_notify`; a small proxy converts those pokes into spine events so
-    // the fold stays the only place that decides when to republish.
-    {
-      let app = Arc::clone(&app);
-      let spine = command_spine.clone();
-      rt.spawn(async move {
-        let notify = Arc::clone(&app.lock().await.change_notify);
-        loop {
-          notify.notified().await;
-          spine.emit(EngineEvent::changed(Changed::Session)).await;
-        }
+        fold_loop(app, tx, events_rx, folds, deadline_tx, fold_spine).await;
       });
     }
     // Deadlines are folded as named timer facts. The private change watch
@@ -265,48 +242,13 @@ impl Runtime {
       ));
     }
 
-    // The tick thread owns `Driver`, which is deliberately `!Send`. Run it on a dedicated OS thread with
-    // a current-thread reactor; everything it shares (`Arc<Mutex<App>>`, the
-    // shutdown watch, the tick-wake notify) is `Send`.
-    let (tick_done_tx, tick_done_rx) = tokio::sync::oneshot::channel::<()>();
-    let tick_wake = Arc::new(tokio::sync::Notify::new());
-    {
-      let app = Arc::clone(&app);
-      let shared_position = services.shared_position_for_ui;
-      let history_collector = services.history_collector;
-      let tick_wake = Arc::clone(&tick_wake);
-      let driver_spine = spine.clone();
-      std::thread::Builder::new()
-        .name("spotatui-frontend-tick".to_string())
-        .spawn(move || {
-          let tick_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("frontend tick runtime");
-          tick_rt.block_on(async move {
-            driver_loop(
-              app,
-              driver_spine,
-              shutdown_rx,
-              shared_position,
-              history_collector,
-              tick_wake,
-            )
-            .await;
-          });
-          let _ = tick_done_tx.send(());
-        })
-        .expect("spawn frontend tick thread");
-    }
-
     Ok(Runtime {
       rt,
       app,
       snapshot_tx,
       shutdown_tx,
       spine,
-      tick_wake,
-      tick_done_rx: Some(tick_done_rx),
+      history_collector: Some(services.history_collector),
     })
   }
 
@@ -350,16 +292,14 @@ impl Runtime {
   /// arrive later as notices in a published snapshot.
   pub fn apply(&self, action: EngineAction) -> ActionOutcome {
     self.rt.block_on(async {
-      let outcome = {
-        let mut app = self.app.lock().await;
-        app.apply(action)
-      };
-      // Event-spine wake: one StateChanged covers any mutation apply made.
-      self.spine.emit_now(EngineEvent::changed(Changed::Session));
-      // Legacy bell as well while internal producers still rely on it;
-      // later ADR 0016 stages remove it with the mega-mutex.
-      self.app.lock().await.change_notify.notify_one();
-      outcome
+      self
+        .spine
+        .emit_acked(EngineEvent::Session(
+          crate::runtime::engine::SessionFact::ApplyAction(action),
+        ))
+        .await
+        .and_then(|ack| ack.action_outcome)
+        .unwrap_or(ActionOutcome::Applied)
     })
   }
 
@@ -375,10 +315,18 @@ impl Runtime {
   pub fn shutdown(self) -> Result<()> {
     self.rt.block_on(async {
       let _ = self.shutdown_tx.send(true);
-      if let Some(done) = self.tick_done_rx {
-        // The tick thread runs the quit sequence (session persist, state
-        // flush, native pause) before it signals done.
-        let _ = done.await;
+      {
+        let mut app = self.app.lock().await;
+        app.flush_persisted_session_force();
+      }
+      let _ = self
+        .spine
+        .query(crate::runtime::engine::FoldQuery::FlushStateSave)
+        .await;
+      #[cfg(feature = "streaming")]
+      super::startup::pause_native_playback_before_exit(&self.app).await;
+      if let Some(history) = self.history_collector {
+        history.shutdown().await;
       }
     });
     drop(self.snapshot_tx);
@@ -406,6 +354,12 @@ fn next_deadline(app: &App) -> Option<(Instant, crate::runtime::engine::TimerFac
     app
       .playback_resync_deadline()
       .map(|deadline| (deadline, crate::runtime::engine::TimerFact::PlaybackResync)),
+    app.playback_maintenance_deadline().map(|deadline| {
+      (
+        deadline,
+        crate::runtime::engine::TimerFact::PlaybackMaintenance,
+      )
+    }),
     app.pending_seek_deadline().map(|deadline| {
       (
         deadline,
@@ -499,119 +453,6 @@ async fn shutdown_changed(shutdown_rx: &mut Option<watch::Receiver<bool>>) -> bo
   }
 }
 
-/// Activity classes that decide the driver's wake cadence. The old loop ran
-/// `Driver::tick` every 250 ms unconditionally; this loop runs it *when
-/// something happens* plus a slow backstop for the few duties still sized in
-/// wall-clock time. Playback resync and seek coalescing are named deadlines
-/// handled by the private scheduler, not this heartbeat.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum DriverWake {
-  /// Playback state says audio is advancing; position/keepalive cadence.
-  Playing,
-  /// Nothing playing but a session exists (watchdog rearm).
-  Idle,
-}
-
-impl DriverWake {
-  fn backstop(self) -> Duration {
-    match self {
-      // While playing the position advances under events from librespot;
-      // this backstop just bounds worst-case stall if events starve.
-      DriverWake::Playing => Duration::from_millis(250),
-      // Idle: only the watchdog and remaining backstop duties need attention
-      // between real events; playback resync is a named deadline.
-      DriverWake::Idle => Duration::from_secs(2),
-    }
-  }
-}
-
-async fn driver_loop(
-  app: Arc<Mutex<App>>,
-  spine: crate::runtime::engine::Spine,
-  mut shutdown_rx: watch::Receiver<bool>,
-  shared_position: Option<Arc<std::sync::atomic::AtomicU64>>,
-  history_collector: crate::infra::history::HistoryCollectorHandle,
-  tick_wake: Arc<tokio::sync::Notify>,
-) {
-  use crate::core::driver::{DiscordRpcHandle, MprisHandle};
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  let mpris_manager: MprisHandle = None;
-  #[cfg(not(all(feature = "mpris", target_os = "linux")))]
-  let mpris_manager: MprisHandle = None;
-  #[cfg(feature = "discord-rpc")]
-  let discord_rpc_manager: DiscordRpcHandle = None;
-  #[cfg(not(feature = "discord-rpc"))]
-  let discord_rpc_manager: DiscordRpcHandle = None;
-  let mut driver =
-    crate::core::driver::Driver::new(shared_position, mpris_manager, discord_rpc_manager);
-
-  // The startup dispatch fires at boot, not on a timer.
-  {
-    let mut app = app.lock().await;
-    driver.dispatch_startup(&mut app);
-    app.change_notify.notify_one();
-  }
-
-  let mut last_tick_at = Instant::now();
-  loop {
-    // Pick the backstop from live playback state; nothing wakes without an
-    // event or this (long) deadline.
-    let wake = {
-      let app = app.lock().await;
-      if app.playback_position_ms().is_some() && app.native_is_playing.unwrap_or(false) {
-        DriverWake::Playing
-      } else {
-        DriverWake::Idle
-      }
-    };
-    let backstop = tokio::time::sleep(wake.backstop());
-    tokio::pin!(backstop);
-    tokio::select! {
-      _ = &mut backstop => {}
-      _ = tick_wake.notified() => {}
-      changed = shutdown_rx.changed() => {
-        if changed.is_err() || *shutdown_rx.borrow() {
-          break;
-        }
-        continue;
-      }
-    }
-    let elapsed = last_tick_at.elapsed();
-    last_tick_at = Instant::now();
-    {
-      let mut app = app.lock().await;
-      driver.tick(
-        &mut app,
-        elapsed,
-        crate::core::driver::TickEnv {
-          now: Instant::now(),
-        },
-      );
-      // Tick-produced changes (notice expiry) republish via the
-      // legacy bell; the bell proxy converts that into a spine event for the
-      // fold. Typed streaming events bypass the bell entirely (ticket 14).
-      app.change_notify.notify_one();
-    }
-    if *shutdown_rx.borrow_and_update() {
-      break;
-    }
-  }
-
-  // The runner's quit sequence, minus terminal teardown.
-  {
-    let mut app = app.lock().await;
-    app.flush_persisted_session_force();
-  }
-  // Persistence scheduling is fold-owned; producers only request the flush.
-  let _ = spine
-    .query(crate::runtime::engine::FoldQuery::FlushStateSave)
-    .await;
-  #[cfg(feature = "streaming")]
-  super::startup::pause_native_playback_before_exit(&app).await;
-  history_collector.shutdown().await;
-  info!("frontend runtime shut down cleanly");
-}
-
 impl Default for Snapshot {
   fn default() -> Self {
     Snapshot {
@@ -646,8 +487,7 @@ impl Default for Snapshot {
 
 /// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
 /// writer of published state. Typed streaming events are reduced through the
-/// domain before the snapshot rebuild; coarse `StateChanged` pokes just
-/// trigger a rebuild. Session facts (ticket 16) replay the exact old handler
+/// domain before the snapshot rebuild. Session facts (ticket 16) replay the exact old handler
 /// code under the fold's lock; producer queries are answered here too, so no
 /// producer outside this task ever locks `App`.
 /// Open a spine, install it on `App`, and spawn the fold task (ticket 17).
@@ -691,6 +531,7 @@ pub(crate) async fn spawn_fold(
     events_rx,
     spine_queries,
     deadline_tx.clone(),
+    spine.clone(),
   ));
   tokio::spawn(deadline_scheduler(
     app.clone(),
@@ -712,6 +553,7 @@ pub(super) async fn fold_loop(
   mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
   folds: Option<crate::runtime::engine::FoldHandles>,
   deadline_tx: watch::Sender<u64>,
+  spine: crate::runtime::engine::Spine,
 ) {
   let mut catalog = CatalogPublication::default();
   let (mut queries, mut acks) = match folds {
@@ -746,6 +588,7 @@ pub(super) async fn fold_loop(
         let _ = responder.send(ack);
         signal_deadline(&deadline_tx);
         publish(&app, &tx, &mut catalog).await;
+        spine.signal_folded();
       }
     }
     // The select keeps queries and acks responsive while parked on events:
@@ -791,6 +634,7 @@ pub(super) async fn fold_loop(
             let _ = responder.send(ack);
             signal_deadline(&deadline_tx);
             publish(&app, &tx, &mut catalog).await;
+            spine.signal_folded();
           }
           // Ack channel closed: stop watching it.
           None => acks = None,
@@ -831,10 +675,10 @@ pub(super) async fn fold_loop(
         let mut app = app.lock().await;
         apply_timer_fact(&mut app, fact);
       }
-      EngineEvent::StateChanged(_) => {}
     }
     signal_deadline(&deadline_tx);
     publish(&app, &tx, &mut catalog).await;
+    spine.signal_folded();
     if tx.is_closed() {
       break;
     }
@@ -906,9 +750,9 @@ impl CatalogPublication {
     }
     let library_changed = previous.library != next.library;
     if library_changed
-      && (!next.library.liked_songs.is_none()
-        || !next.library.recently_played.is_none()
-        || !next.library.playlists.is_none())
+      && (next.library.liked_songs.is_some()
+        || next.library.recently_played.is_some()
+        || next.library.playlists.is_some())
     {
       self.library_revision = self.library_revision.wrapping_add(1);
     }
@@ -950,6 +794,7 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
           app.next_missing_saved_tracks_offset_continuous()
         },
         next_playlist_tracks_offset: None,
+        action_outcome: None,
       })
     }
     EngineEvent::Catalog(CatalogStateEvent::PlaylistTracksPageUpserted { .. }) => {
@@ -961,6 +806,14 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         } else {
           app.next_missing_playlist_tracks_offset_continuous()
         },
+        action_outcome: None,
+      })
+    }
+    EngineEvent::Session(crate::runtime::engine::SessionFact::ApplyAction(action)) => {
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: Some(app.apply(action.clone())),
       })
     }
     _ => {
@@ -975,6 +828,7 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
       Some(FoldAck {
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
+        action_outcome: None,
       })
     }
   }
@@ -1078,7 +932,6 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
     EngineEvent::Decoded(_) => {}
     EngineEvent::History(fact) => apply_history_fact(app, fact.clone()),
     EngineEvent::Timer(fact) => apply_timer_fact(app, *fact),
-    EngineEvent::StateChanged(_) => {}
   }
 }
 
@@ -1104,6 +957,7 @@ fn apply_timer_fact(app: &mut App, fact: crate::runtime::engine::TimerFact) {
     #[cfg(feature = "streaming")]
     TimerFact::NativeLoadWatchdog => app.handle_native_load_watchdog(),
     TimerFact::PlaybackResync => app.poll_current_playback(),
+    TimerFact::PlaybackMaintenance => app.run_playback_maintenance(),
     TimerFact::SeekThrottleElapsed => {
       #[cfg(feature = "streaming")]
       app.flush_pending_native_seek();
@@ -1318,9 +1172,7 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
       post_connect_fetches,
     } => {
       let changed = app.auth_state.transition(transition, new_expiry);
-      if changed {
-        app.change_notify.notify_one();
-      }
+      let _ = changed;
       // Legacy mirrors (deleted with App itself in ticket 18).
       app.spotify_token_expiry = app.auth_state.token_expiry;
       app.auth_refresh_in_progress = app.auth_state.refresh_in_progress;
@@ -3398,6 +3250,69 @@ mod tests {
     ));
   }
 
+  #[tokio::test]
+  async fn action_facts_are_folded_before_snapshot_publication() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    // Consume the initial publication so the next change is unambiguous.
+    snapshots.changed().await.unwrap();
+    let ack = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::ApplyAction(
+          crate::core::action::EngineAction::Notify("folded".into(), 5),
+        ),
+      ))
+      .await;
+    assert_eq!(
+      ack.and_then(|ack| ack.action_outcome),
+      Some(crate::core::action::ActionOutcome::Applied)
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
+      .await
+      .expect("action fact should publish")
+      .unwrap();
+    assert_eq!(snapshots.borrow().notice.as_deref(), Some("folded"));
+  }
+
+  #[tokio::test]
+  async fn activity_observers_wake_after_the_fact_is_folded() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+    let mut activity = spine.subscribe_activity();
+    spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::Status {
+          message: "ready".into(),
+          ttl_secs: 5,
+          is_error: false,
+        },
+      ))
+      .await;
+    activity.changed().await.unwrap();
+    let state = spine
+      .query(crate::runtime::engine::FoldQuery::HistoryState)
+      .await
+      .unwrap();
+    assert!(matches!(
+      state,
+      crate::runtime::engine::FoldAnswer::HistoryState(_)
+    ));
+    assert_eq!(app.lock().await.status_message.as_deref(), Some("ready"));
+  }
+
+  #[tokio::test]
+  async fn idle_fold_does_not_publish_without_an_event() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (_spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+    assert!(
+      tokio::time::timeout(std::time::Duration::from_millis(20), snapshots.changed())
+        .await
+        .is_err()
+    );
+  }
+
   #[test]
   fn next_deadline_returns_the_nearest_named_fact() {
     let mut app = App::default();
@@ -3457,6 +3372,7 @@ mod tests {
   fn next_deadline_arms_playback_resync_and_seek_throttle() {
     let mut app = App::default();
     app.spotify_connected = true;
+    app.native_is_playing = Some(true);
     app.instant_since_last_current_playback_poll = Instant::now() - Duration::from_secs(1);
     app.pending_api_seek = Some(1_000);
     app.last_api_seek = Some(Instant::now() - Duration::from_millis(200));

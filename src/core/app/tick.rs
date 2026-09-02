@@ -1,58 +1,59 @@
 use super::*;
 
-/// Grace window after the last tick before playback-position reads go stale.
-const STALE_TICK_AFTER: Duration = Duration::from_secs(2);
-
-/// Remote playback has no native event stream, so retain the historical
-/// one-second poll cadence. Native playback keeps its configurable poll for
-/// device/context reconciliation while position events remain authoritative.
 const REMOTE_PLAYBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PLAYBACK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(250);
 
-// The window must cover at least two of the slowest allowed ticks, so one
-// missed frame can never read as stale. The tick rate is bounded on every
-// path (config load rejects out-of-range values, the settings screen clamps),
-// and this assertion keeps the two constants coupled if either ever moves.
-const _: () = assert!(
-  STALE_TICK_AFTER.as_millis() >= 2 * crate::core::user_config::MAX_TICK_RATE_MILLISECONDS as u128
-);
+#[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+#[derive(Debug, PartialEq)]
+enum DecodedAdvance {
+  Dispatch { replay: bool },
+  SuspendToQueue,
+  Teardown,
+  None,
+}
+
+#[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+fn decoded_advance(
+  finished: bool,
+  advancing: bool,
+  has_next: bool,
+  queue_len: usize,
+  repeat: crate::infra::queue::RepeatMode,
+) -> DecodedAdvance {
+  use crate::infra::queue::{advance_decision, Decision};
+  match advance_decision(finished, advancing, has_next, queue_len, repeat) {
+    Decision::AdvanceContext => DecodedAdvance::Dispatch { replay: false },
+    Decision::RepeatTrack => DecodedAdvance::Dispatch { replay: true },
+    Decision::SuspendToQueue => DecodedAdvance::SuspendToQueue,
+    Decision::Teardown => DecodedAdvance::Teardown,
+    Decision::None => DecodedAdvance::None,
+  }
+}
 
 impl App {
-  /// Milliseconds into the current track, or `None` when no tick has run for
-  /// over [`STALE_TICK_AFTER`]. A frontend that stops driving
-  /// `core::driver::Driver::tick` (or never starts) would otherwise show a
-  /// silently frozen playbar; `None` is the loud version of that failure,
-  /// rendered as an explicit stall by the playbar.
+  /// The position base carried by the latest typed playback fact. The window
+  /// projects visible motion from the snapshot timestamp.
   pub fn playback_position_ms(&self) -> Option<u128> {
-    (self.last_tick_at.elapsed() <= STALE_TICK_AFTER).then_some(self.song_progress_ms)
+    Some(self.song_progress_ms)
   }
 
   pub(crate) fn poll_current_playback(&mut self) {
-    // No Spotify session (free-source launch): the poll would hit the auth gate
-    // and re-flash a "connect Spotify" status message every interval. Free
-    // sources drive their own playback state, so skip the Spotify poll entirely.
     if !self.spotify_connected {
       return;
     }
-
-    // Poll interval depends on playback mode:
-    // - Native streaming: configurable (default 5s; real-time events provide
-    //   updates between polls).
-    // - External players (spotifyd, etc.): 1 second (no events, need faster
-    //   polling for smooth playbar) — stays hardcoded, not a preference.
-    let poll_interval_ms: u128 = if self.is_streaming_active {
+    let interval_ms = if self.is_streaming_active {
       self.user_config.behavior.playback_poll_seconds as u128 * 1000
     } else {
       1_000
     };
-
-    let elapsed = self
-      .instant_since_last_current_playback_poll
-      .elapsed()
-      .as_millis();
-
-    if !self.is_fetching_current_playback && elapsed >= poll_interval_ms {
+    if !self.is_fetching_current_playback
+      && self
+        .instant_since_last_current_playback_poll
+        .elapsed()
+        .as_millis()
+        >= interval_ms
+    {
       self.is_fetching_current_playback = true;
-      // Trigger the seek if the user has set a new position
       match self.seek_ms {
         Some(seek_ms) => self.apply_seek(seek_ms as u32),
         None => self.dispatch(IoEvent::GetCurrentPlayback),
@@ -60,10 +61,13 @@ impl App {
     }
   }
 
-  /// Deadline for the next playback poll. The private runtime scheduler uses
-  /// this instead of waking the driver on a fixed heartbeat.
   pub(crate) fn playback_resync_deadline(&self) -> Option<Instant> {
-    if !self.spotify_connected || self.is_fetching_current_playback {
+    let playing = self.native_is_playing.unwrap_or(false)
+      || self
+        .current_playback_context
+        .as_ref()
+        .is_some_and(|context| context.is_playing);
+    if !self.spotify_connected || self.is_fetching_current_playback || !playing {
       return None;
     }
     let interval = if self.is_streaming_active {
@@ -74,93 +78,144 @@ impl App {
     Some(self.instant_since_last_current_playback_poll + interval)
   }
 
-  pub fn update_on_tick(&mut self, elapsed: Duration) {
-    self.last_tick_at = Instant::now();
-
-    if let Some(expires_at) = self.status_message_expires_at {
-      if Instant::now() >= expires_at {
-        self.status_message = None;
-        self.status_message_expires_at = None;
-        self.status_message_is_error = false;
-      }
-    }
-
-    // Must stay above the early returns further down this fn, or the backstop
-    // would silently stop running during playback.
-    self.expire_api_error();
-
-    let playing_now = self.user_config.behavior.keepawake_enabled
-      && self
-        .native_is_playing
-        .or_else(|| self.current_playback_context.as_ref().map(|c| c.is_playing))
-        .unwrap_or(false);
-    match (playing_now, self.keepawake.is_some()) {
-      (true, false) => {
-        self.keepawake = keepawake::Builder::default()
-          .idle(true)
-          .sleep(true)
-          .display(true)
-          .reason("Playing music")
-          .app_name("spotatui")
-          .create()
-          .ok();
-      }
-      (false, true) => self.keepawake = None,
-      _ => {}
-    }
-
-    if let Some(CurrentPlaybackContext {
-      item: Some(item),
-      progress,
-      is_playing,
-      ..
-    }) = &self.current_playback_context
+  /// Re-arm playback probes only while they have live work. This named
+  /// one-shot deadline replaces the global tick without publishing position.
+  pub(crate) fn playback_maintenance_deadline(&self) -> Option<Instant> {
+    #[allow(unused_mut)]
+    let mut active = self.pending_volume.is_some()
+      && !self.is_volume_change_in_flight
+      && self.last_dispatched_volume != self.pending_volume;
+    #[cfg(feature = "streaming")]
     {
-      // When native streaming is active, skip API-based progress calculation
-      // The native player's PositionChanged events update song_progress_ms directly
-      if self.is_streaming_active {
-        let ms_since_poll = self
-          .instant_since_last_current_playback_poll
-          .elapsed()
-          .as_millis();
-        if ms_since_poll < 2000 {
-          return; // Recent native update - don't overwrite
+      active |= self.is_streaming_active && self.native_is_playing.unwrap_or(false);
+    }
+    #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+    {
+      active |= self.queue_now_decoded_player().is_some();
+    }
+    #[cfg(feature = "local-files")]
+    {
+      active |= self.local_playback.is_some();
+    }
+    #[cfg(feature = "subsonic")]
+    {
+      active |= self.subsonic_playback.is_some();
+    }
+    #[cfg(feature = "youtube")]
+    {
+      active |= self.youtube_playback.is_some();
+    }
+    #[cfg(feature = "internet-radio")]
+    {
+      active |= self.radio_playback.is_some();
+    }
+    #[cfg(feature = "ai-dj")]
+    {
+      active |= crate::infra::network::dj::wants_top_up(
+        self.native_queue.len(),
+        &self.dj,
+        self.spotify_external_device_active(),
+      );
+    }
+    active.then(|| Instant::now() + PLAYBACK_MAINTENANCE_INTERVAL)
+  }
+
+  pub(crate) fn run_playback_maintenance(&mut self) {
+    #[cfg(feature = "streaming")]
+    if let Some(player) = self.streaming_player.clone() {
+      if let Some(error) = player.take_audio_backend_error() {
+        self.pause_native_playback();
+        self.set_status_message(format!("Audio backend failed: {error}"), 15);
+      }
+    }
+
+    self.flush_pending_volume();
+
+    #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+    {
+      use crate::infra::queue::QueueNowPlaying;
+      let advance = match self.queue_now.as_mut() {
+        Some(QueueNowPlaying::Decoded(decoded))
+          if decoded.player.is_finished() && !decoded.advancing =>
+        {
+          decoded.advancing = true;
+          true
         }
-        // No recent native update - fall through to API-based calculation as fallback
+        _ => false,
+      };
+      if advance {
+        self.dispatch(IoEvent::AdvanceNativeQueue);
       }
+    }
 
-      let ms_since_poll = self
-        .instant_since_last_current_playback_poll
-        .elapsed()
-        .as_millis();
+    #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+    macro_rules! maintain_decoded {
+      ($playback:ident, $tracks:ident) => {
+        if !self.queue_owns_playback() {
+          use crate::infra::queue::next_index;
+          let decision = self.$playback.as_ref().map(|session| {
+            decoded_advance(
+              session.player.is_finished(),
+              session.advancing,
+              next_index(session.index, session.$tracks.len()).is_some(),
+              self.native_queue.len(),
+              self.decoded_repeat,
+            )
+          });
+          match decision {
+            Some(DecodedAdvance::Dispatch { replay }) => {
+              if let Some(session) = self.$playback.as_mut() {
+                session.advancing = true;
+              }
+              self.dispatch(if replay {
+                IoEvent::ReplayCurrentTrack
+              } else {
+                IoEvent::NextTrack
+              });
+            }
+            Some(DecodedAdvance::SuspendToQueue) => {
+              self.suspend_active_decoded_context_for_skip(
+                crate::infra::queue::SuspendCause::AutoAdvance,
+              );
+              self.dispatch(IoEvent::AdvanceNativeQueue);
+            }
+            Some(DecodedAdvance::Teardown) => self.$playback = None,
+            Some(DecodedAdvance::None) | None => {}
+          }
+        }
+      };
+    }
+    #[cfg(feature = "local-files")]
+    maintain_decoded!(local_playback, queue);
+    #[cfg(feature = "subsonic")]
+    maintain_decoded!(subsonic_playback, tracks);
+    #[cfg(feature = "youtube")]
+    maintain_decoded!(youtube_playback, tracks);
 
-      // Skip position updates if we recently seeked (let UI show our target position)
-      let recently_seeked = self
-        .last_api_seek
-        .is_some_and(|t| t.elapsed().as_millis() < SEEK_POSITION_IGNORE_MS);
+    #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+    self.reconcile_decoded_shuffle();
 
-      if recently_seeked {
-        return; // Don't overwrite our seek target
+    #[cfg(feature = "internet-radio")]
+    match self.radio_playback.as_ref() {
+      Some(radio) if !radio.player.is_finished() => self.radio_stream_started = true,
+      Some(_) if self.radio_stream_started => {
+        self.radio_playback = None;
+        self.radio_stream_started = false;
+        self.set_status_message("Radio stream ended", 4);
       }
+      Some(_) => {}
+      None => self.radio_stream_started = false,
+    }
 
-      // Resync from fresh API data (within 300ms of poll) to correct drift
-      if ms_since_poll < 300 {
-        self.song_progress_ms = progress
-          .as_ref()
-          .map(|p| p.num_milliseconds() as u128)
-          .unwrap_or(0);
-      } else if *is_playing {
-        // Smooth incremental updates between API polls
-        let elapsed_ms = elapsed.as_millis();
-        let duration_ms = match item {
-          PlayableItem::Track(track) => track.duration.num_milliseconds() as u128,
-          PlayableItem::Episode(episode) => episode.duration.num_milliseconds() as u128,
-          _ => return,
-        };
-
-        self.song_progress_ms = (self.song_progress_ms + elapsed_ms).min(duration_ms);
-      }
-      // When paused, keep song_progress_ms unchanged
+    #[cfg(feature = "ai-dj")]
+    if crate::infra::network::dj::wants_top_up(
+      self.native_queue.len(),
+      &self.dj,
+      self.spotify_external_device_active(),
+    ) {
+      let turn_seq = self.dj.begin_turn(crate::infra::dj::TurnKind::Refill);
+      let generation = self.dj.generation;
+      self.dispatch_without_spinner(IoEvent::DjTopUp(generation, turn_seq));
     }
   }
 }
@@ -170,113 +225,36 @@ mod tests {
   use super::*;
 
   #[test]
-  fn poll_current_playback_skips_when_spotify_disconnected() {
-    let (tx, rx) = channel();
-    // No Spotify session (free-source launch): spotify_connected == false.
-    let mut app = App::new(tx, UserConfig::new(), None);
-    assert!(!app.spotify_connected);
-    // Force the poll interval to have elapsed so only the connection gate matters.
-    app.instant_since_last_current_playback_poll = Instant::now() - Duration::from_secs(10);
-
-    app.poll_current_playback();
-
-    // Nothing dispatched: no per-tick "connect Spotify" auth-spam for free sources.
-    assert!(rx.try_recv().is_err());
-    assert!(!app.is_fetching_current_playback);
+  fn idle_signed_in_engine_has_no_playback_deadline() {
+    let (tx, _rx) = channel();
+    let app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    assert!(app.playback_resync_deadline().is_none());
+    assert!(app.playback_maintenance_deadline().is_none());
   }
 
   #[test]
-  fn playback_position_goes_stale_without_ticks_and_recovers_on_one() {
+  fn pending_volume_arms_named_maintenance() {
     let (tx, _rx) = channel();
     let mut app = App::new(tx, UserConfig::new(), None);
-    app.song_progress_ms = 1234;
-    assert_eq!(app.playback_position_ms(), Some(1234));
-
-    // A frontend that stops ticking: the position must read as stale rather
-    // than freeze at its last value.
-    app.last_tick_at = Instant::now() - Duration::from_secs(3);
-    assert_eq!(app.playback_position_ms(), None);
-
-    app.update_on_tick(Duration::from_millis(500));
-    assert!(app.playback_position_ms().is_some());
+    app.pending_volume = Some(42);
+    assert!(app.playback_maintenance_deadline().is_some());
   }
 
+  #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
   #[test]
-  fn a_live_error_survives_a_tick() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), None);
-    app.handle_error(anyhow!("boom"));
-
-    app.update_on_tick(Duration::from_millis(500));
-
-    assert_eq!(app.api_error, "boom");
-    assert_eq!(app.get_current_route().id, RouteId::Error);
-  }
-
-  #[test]
-  fn an_expired_error_is_retired_by_the_tick_and_handed_to_the_status_bar() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), None);
-    app.handle_error(anyhow!("boom"));
-    app.api_error_expires_at = Some(Instant::now() - Duration::from_secs(1));
-
-    app.update_on_tick(Duration::from_millis(500));
-
-    assert!(app.api_error.is_empty());
-    assert!(app.api_error_expires_at.is_none());
-    assert_ne!(app.get_current_route().id, RouteId::Error);
-    assert_eq!(app.status_message.as_deref(), Some("boom"));
-    assert!(app.status_message_is_error);
-  }
-
-  // The load-bearing case for a frontend that never dismisses: a buried error
-  // frame must not survive the expiry, or it resurfaces later rendering an
-  // error page with nothing on it. It expires silently, because a toast about
-  // a minute-old failure on a screen the user already left is noise.
-  #[test]
-  fn expiring_an_error_removes_an_error_route_left_under_another_screen() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), None);
-    app.handle_error(anyhow!("boom"));
-    app.push_navigation_stack(RouteId::SelectedDevice, ActiveBlock::SelectDevice);
-    app.api_error_expires_at = Some(Instant::now() - Duration::from_secs(1));
-
-    app.update_on_tick(Duration::from_millis(500));
-
-    assert!(app.api_error.is_empty());
-    assert_eq!(app.get_current_route().id, RouteId::SelectedDevice);
-    assert!(app.status_message.is_none());
-
-    app.pop_navigation_stack();
-    assert_eq!(app.get_current_route().id, RouteId::Home);
-  }
-
-  #[test]
-  fn poll_current_playback_dispatches_when_spotify_connected() {
-    let (tx, rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
-    assert!(app.spotify_connected);
-    app.instant_since_last_current_playback_poll = Instant::now() - Duration::from_secs(10);
-
-    app.poll_current_playback();
-
-    assert!(matches!(rx.try_recv(), Ok(IoEvent::GetCurrentPlayback)));
-    assert!(app.is_fetching_current_playback);
-  }
-
-  #[test]
-  fn playback_resync_deadline_preserves_remote_and_native_cadence() {
-    let (tx, _rx) = channel();
-    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
-    let now = Instant::now();
-    app.instant_since_last_current_playback_poll = now;
-    assert!(app
-      .playback_resync_deadline()
-      .is_some_and(|deadline| deadline.duration_since(now) <= Duration::from_secs(1)));
-
-    app.is_streaming_active = true;
-    assert!(app
-      .playback_resync_deadline()
-      .is_some_and(|deadline| deadline.duration_since(now) >= Duration::from_secs(5)));
+  fn decoded_completion_policy_is_preserved() {
+    use crate::infra::queue::RepeatMode;
+    assert_eq!(
+      decoded_advance(true, false, true, 0, RepeatMode::Track),
+      DecodedAdvance::Dispatch { replay: true }
+    );
+    assert_eq!(
+      decoded_advance(true, false, false, 1, RepeatMode::Off),
+      DecodedAdvance::SuspendToQueue
+    );
+    assert_eq!(
+      decoded_advance(true, false, false, 0, RepeatMode::Off),
+      DecodedAdvance::Teardown
+    );
   }
 }

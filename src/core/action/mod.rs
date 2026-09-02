@@ -228,7 +228,7 @@ pub enum EngineAction {
 }
 
 /// What applying an [`Action`] produced, beyond the state change itself.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionOutcome {
   /// The action was applied (or routed); nothing further to report.
   Applied,

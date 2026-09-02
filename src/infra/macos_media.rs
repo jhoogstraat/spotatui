@@ -186,7 +186,9 @@ impl MacMediaManager {
       let info_center = unsafe { MPNowPlayingInfoCenter::defaultCenter() };
 
       // Interleave command processing with NSRunLoop ticks so macOS can deliver
-      // MPRemoteCommandCenter events to our handler blocks.
+      // MPRemoteCommandCenter events to our handler blocks. This pumps the OS
+      // callback loop only; it neither mutates engine state nor publishes a
+      // snapshot, so it is not a Playback Engine timer.
       let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

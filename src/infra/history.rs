@@ -374,8 +374,7 @@ pub fn spawn_history_collector(spine: crate::runtime::engine::Spine) -> HistoryC
   let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
   let task = tokio::spawn(async move {
     let mut collector = HistoryCollector::default();
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-    let mut last_auto_check = Instant::now();
+    let mut activity_rx = spine.subscribe_activity();
     let http_client = crate::infra::network::requests::shared_http_client().clone();
     let mut network_tasks = JoinSet::new();
 
@@ -437,7 +436,9 @@ pub fn spawn_history_collector(spine: crate::runtime::engine::Spine) -> HistoryC
 
     loop {
       tokio::select! {
-        _ = interval.tick() => {}
+        changed = activity_rx.changed() => {
+          if changed.is_err() { break; }
+        }
         _ = &mut shutdown_rx => break,
       }
       while let Some(result) = network_tasks.try_join_next() {
@@ -447,7 +448,8 @@ pub fn spawn_history_collector(spine: crate::runtime::engine::Spine) -> HistoryC
       }
 
       // One fold query captures playback, token, config, and route state for
-      // this tick. A closed fold preserves the old try-lock skip semantics.
+      // this event. Activity is signalled after folding, so this cannot race
+      // ahead of the fact whose state it observes.
       let state = match spine
         .query(crate::runtime::engine::FoldQuery::HistoryState)
         .await
@@ -455,10 +457,6 @@ pub fn spawn_history_collector(spine: crate::runtime::engine::Spine) -> HistoryC
         Ok(crate::runtime::engine::FoldAnswer::HistoryState(state)) => state,
         _ => continue,
       };
-      if last_auto_check.elapsed().as_secs() >= 3600 {
-        last_auto_check = Instant::now();
-        perform_auto_recap_check(&spine, Some(state.clone())).await;
-      }
       let snapshot = state.playback;
       let latest_token = state.sync_token;
 

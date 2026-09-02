@@ -24,7 +24,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::core::app::App;
 #[allow(unused_imports)]
@@ -43,10 +43,6 @@ use crate::core::streaming::StreamingStateEvent;
 pub enum EngineEvent {
   /// A named one-shot deadline fired by the private engine scheduler.
   Timer(TimerFact),
-  /// Something mutated observable session state: rebuild + republish if it
-  /// differs from what is live. Carries which surface changed so later stages
-  /// can shard the fold task without re-plumbing producers.
-  StateChanged(Changed),
   /// A typed streaming-state fact (ticket 14): the fold reduces these through
   /// `StreamingState::absorb` + `apply_streaming_state` instead of any
   /// producer touching shared playback fields.
@@ -85,6 +81,9 @@ pub enum TimerFact {
   NativeLoadWatchdog,
   /// Reconcile playback state from Spotify for a remote playback device.
   PlaybackResync,
+  /// Probe completion/coalescing while playback work is active. Re-armed as a
+  /// one-shot only while a decoded/native session or pending volume needs it.
+  PlaybackMaintenance,
   /// Flush the latest coalesced seek after its throttle window.
   SeekThrottleElapsed,
   /// Flush a debounced runtime-state patch.
@@ -898,24 +897,7 @@ impl std::fmt::Debug for SessionFact {
   }
 }
 
-/// Which state surface produced an event. Coarse on purpose: publication
-/// dedup decides whether anything actually sends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Changed {
-  Playback,
-  Queue,
-  Catalog,
-  Session,
-  Notice,
-  Audio,
-}
-
 impl EngineEvent {
-  /// Convenience constructor for whole-surface churn.
-  pub fn changed(which: Changed) -> Self {
-    EngineEvent::StateChanged(which)
-  }
-
   /// Emit-side result of a typed streaming fact: what the fold will absorb.
   /// Mirrors [`AbsorbOutcome`] so a producer can decide cheaply whether the
   /// event it just built is worth pushing (identical positions, duplicate
@@ -1892,12 +1874,14 @@ pub enum NativeShuffleToggleDecision {
 /// back what the producer used to read after its own write. Today: the next
 /// missing offset for both offset-keyed library caches (`None` when the
 /// event was dropped as stale or the cache is complete).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldAck {
   /// The next missing saved-tracks offset after the folded upsert.
   pub next_saved_tracks_offset: Option<u32>,
   /// The next missing playlist-tracks offset after the folded upsert.
   pub next_playlist_tracks_offset: Option<u32>,
+  /// Synchronous result of a folded external action.
+  pub action_outcome: Option<crate::core::action::ActionOutcome>,
 }
 
 /// Channel bounds: the engine never blocks the window on a full channel, but
@@ -1923,6 +1907,7 @@ pub struct Spine {
   events_tx: mpsc::Sender<EngineEvent>,
   queries_tx: mpsc::Sender<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
   acks_tx: mpsc::Sender<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>,
+  activity_tx: watch::Sender<u64>,
 }
 
 /// The query channel is closed: the fold task is gone (boot order or
@@ -1943,11 +1928,13 @@ impl Spine {
     let (events_tx, events_rx) = mpsc::channel(bounds.event_capacity);
     let (queries_tx, queries_rx) = mpsc::channel(bounds.event_capacity);
     let (acks_tx, acks_rx) = mpsc::channel(bounds.event_capacity);
+    let (activity_tx, _) = watch::channel(0u64);
     (
       Spine {
         events_tx,
         queries_tx,
         acks_tx,
+        activity_tx,
       },
       events_rx,
       QueryReceiver {
@@ -1976,6 +1963,22 @@ impl Spine {
     let (tx, rx) = oneshot::channel();
     self.acks_tx.send((event, tx)).await.ok()?;
     rx.await.ok().flatten()
+  }
+
+  /// Subscribe to producer activity without receiving or consuming events.
+  /// Observers use this as an event-driven wake source; no heartbeat is
+  /// generated while the engine is idle.
+  pub fn subscribe_activity(&self) -> watch::Receiver<u64> {
+    self.activity_tx.subscribe()
+  }
+
+  /// Notify observers only after the fold has applied an event. Keeping this
+  /// on the consumer side prevents observers from racing a queued fact and
+  /// reading the previous state.
+  pub(crate) fn signal_folded(&self) {
+    self
+      .activity_tx
+      .send_modify(|generation| *generation = generation.wrapping_add(1));
   }
 
   /// Ask the fold for the state a decision needs, awaiting the answer.
@@ -2083,10 +2086,15 @@ mod tests {
   #[tokio::test]
   async fn emit_preserves_unique_facts_under_backpressure() {
     let (spine, mut events, _) = Spine::open(SpineBounds { event_capacity: 1 });
-    spine.emit(EngineEvent::changed(Changed::Session)).await;
-
+    spine
+      .emit(EngineEvent::Session(SessionFact::Auth {
+        transition: crate::core::auth::AuthTransition::Connected,
+        new_expiry: None,
+        post_connect_fetches: Vec::new(),
+      }))
+      .await;
     let pending = spine.emit(EngineEvent::Session(SessionFact::Auth {
-      transition: crate::core::auth::AuthTransition::Connected,
+      transition: crate::core::auth::AuthTransition::Disconnected,
       new_expiry: None,
       post_connect_fetches: Vec::new(),
     }));
@@ -2099,7 +2107,7 @@ mod tests {
     );
     assert!(matches!(
       events.recv().await,
-      Some(EngineEvent::StateChanged(_))
+      Some(EngineEvent::Session(SessionFact::Auth { .. }))
     ));
     tokio::time::timeout(Duration::from_secs(2), &mut pending)
       .await
@@ -2108,5 +2116,16 @@ mod tests {
       events.recv().await,
       Some(EngineEvent::Session(SessionFact::Auth { .. }))
     ));
+  }
+
+  #[tokio::test]
+  async fn idle_spine_has_no_periodic_activity_wake() {
+    let (spine, _events, _) = Spine::open(Default::default());
+    let mut activity = spine.subscribe_activity();
+    assert!(
+      tokio::time::timeout(Duration::from_millis(20), activity.changed())
+        .await
+        .is_err()
+    );
   }
 }

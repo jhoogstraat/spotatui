@@ -1055,6 +1055,8 @@ mod tests {
   #[tokio::test]
   async fn advance_skips_unavailable_source_without_panicking() {
     let app = test_app();
+    let (_spine, mut snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
     app
       .lock()
       .await
@@ -1062,6 +1064,10 @@ mod tests {
       .push(track("subsonic:track:1", "Unplayable"));
 
     assert!(route_queue_event(&app, &IoEvent::AdvanceNativeQueue).await);
+    tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
+      .await
+      .expect("fold should publish the unavailable-source notice")
+      .unwrap();
 
     let guard = app.lock().await;
     assert!(guard.native_queue.is_empty(), "the item is consumed");

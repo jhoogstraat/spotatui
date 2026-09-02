@@ -364,8 +364,9 @@ async fn handle_player_events(
   let mut audibly_playing = shared_is_playing.load(Ordering::Relaxed);
   let mut last_position = shared_position.load(Ordering::Relaxed);
   let mut last_progress_at = Instant::now();
-  let mut watchdog = tokio::time::interval(Duration::from_secs(1));
-  watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+  // Recovery is a one-shot deadline, re-armed after each check. It never
+  // creates a background heartbeat while the native session is healthy.
+  let mut watchdog = Box::pin(tokio::time::sleep(Duration::from_secs(1)));
   let playback_transition_generation = Arc::new(AtomicU64::new(0));
 
   loop {
@@ -428,7 +429,10 @@ async fn handle_player_events(
         }
         continue;
       }
-      _ = watchdog.tick(), if progress_watchdog_armed => {
+      _ = &mut watchdog, if progress_watchdog_armed => {
+        watchdog
+          .as_mut()
+          .reset(tokio::time::Instant::now() + Duration::from_secs(1));
         let position = shared_position.load(Ordering::Relaxed);
         if position != last_position {
           last_position = position;

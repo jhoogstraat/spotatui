@@ -187,6 +187,7 @@ pub async fn run_saved_tracks_prefetch(
   }
 }
 
+#[allow(clippy::never_loop)]
 pub async fn prefetch_playlist_tracks_page_task(
   spine: &crate::runtime::engine::Spine,
   spotify: AuthCodePkceSpotify,
