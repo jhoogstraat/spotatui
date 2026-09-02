@@ -15,14 +15,14 @@ impl App {
   /// track). Spotify tracks on an external Connect device keep today's Web-API
   /// queue behavior (there is no native sink to play them through); everything
   /// else is pushed onto [`Self::native_queue`].
-  pub fn add_track_to_native_queue(&mut self, track: TrackInfo) {
+  pub fn add_track_to_native_queue(&mut self, track: TrackInfo) -> bool {
     let Some(uri) = track.uri.clone() else {
       self.set_status_message("Cannot queue: track has no URI", 3);
-      return;
+      return false;
     };
     if uri.starts_with("radio:") {
       self.set_status_message("Radio stations can't be queued", 3);
-      return;
+      return false;
     }
     // A Spotify track controlled on an external device has no native sink to
     // play through, so fall back to the Spotify Web-API queue.
@@ -32,7 +32,7 @@ impl App {
     ) && self.spotify_external_device_active()
     {
       self.dispatch(IoEvent::AddItemToQueue(uri));
-      return;
+      return true;
     }
     let name = track.name.clone();
     self.native_queue.push(track);
@@ -45,6 +45,7 @@ impl App {
       self.dispatch(IoEvent::GetQueue);
     }
     self.emit_queue_mutated();
+    true
   }
 
   /// Remove the upcoming native-queue item at `index`. Out-of-range is a

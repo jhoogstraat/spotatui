@@ -1412,7 +1412,7 @@ mod tests {
     network.spine = Some(spine);
     network.handle_network_event(IoEvent::GetUser).await;
 
-    while let Ok(event) = events_rx.try_recv() {
+    while let Ok(crate::runtime::engine::SpineMessage::Event(event)) = events_rx.try_recv() {
       if let crate::runtime::engine::EngineEvent::Session(fact) = event {
         let mut guard = app.lock().await;
         crate::runtime::frontend::apply_session_fact(&mut guard, fact);
@@ -1445,7 +1445,7 @@ mod tests {
       .await;
 
     // Fold half: reduce what the gate emitted.
-    while let Ok(event) = events_rx.try_recv() {
+    while let Ok(crate::runtime::engine::SpineMessage::Event(event)) = events_rx.try_recv() {
       if let crate::runtime::engine::EngineEvent::Session(fact) = event {
         let mut guard = app.lock().await;
         crate::runtime::frontend::apply_session_fact(&mut guard, fact);

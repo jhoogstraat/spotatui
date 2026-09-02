@@ -3366,7 +3366,7 @@ mod tests {
 
     network.resume_spotify_context(None, None).await;
 
-    while let Ok(event) = events_rx.try_recv() {
+    while let Ok(crate::runtime::engine::SpineMessage::Event(event)) = events_rx.try_recv() {
       if let crate::runtime::engine::EngineEvent::Session(fact) = event {
         let mut guard = app.lock().await;
         crate::runtime::frontend::apply_session_fact(&mut guard, fact);

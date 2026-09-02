@@ -562,16 +562,13 @@ pub(crate) async fn spawn_fold(
 pub(super) async fn fold_loop(
   app: Arc<Mutex<App>>,
   tx: watch::Sender<Snapshot>,
-  mut events_rx: tokio::sync::mpsc::Receiver<EngineEvent>,
+  mut events_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::SpineMessage>,
   folds: Option<crate::runtime::engine::FoldHandles>,
   deadline_tx: watch::Sender<u64>,
   spine: crate::runtime::engine::Spine,
 ) {
   let mut catalog = CatalogPublication::default();
-  let (mut queries, mut acks) = match folds {
-    Some(handles) => (Some(handles.queries), Some(handles.acks)),
-    None => (None, None),
-  };
+  let mut queries = folds.map(|handles| handles.queries);
   publish(&app, &tx, &mut catalog).await;
   loop {
     // Answer any producer query that arrived since the last event before
@@ -588,22 +585,7 @@ pub(super) async fn fold_loop(
         signal_deadline(&deadline_tx);
       }
     }
-    // Apply any acked event the same way: fold it, then complete the
-    // responder with the post-fold facts (stream order is queue order, so
-    // the answer reflects every event queued before it).
-    if let Some(acks) = acks.as_mut() {
-      while let Ok((event, responder)) = acks.rx.try_recv() {
-        let ack = {
-          let mut guard = app.lock().await;
-          apply_acked(&mut guard, event)
-        };
-        let _ = responder.send(ack);
-        signal_deadline(&deadline_tx);
-        publish(&app, &tx, &mut catalog).await;
-        spine.signal_folded();
-      }
-    }
-    // The select keeps queries and acks responsive while parked on events:
+    // The select keeps queries and the ordered event spine responsive while parked:
     // producers on quiet surfaces (CLI mode, DJ turn loop, MCP tools) block
     // on answers, so the fold must not wait for an unrelated event first.
     let event = tokio::select! {
@@ -631,66 +613,59 @@ pub(super) async fn fold_loop(
         }
         continue;
       }
-      acked = async {
-        match acks.as_mut() {
-          Some(acks) => acks.rx.recv().await,
-          None => std::future::pending().await,
-        }
-      } => {
-        match acked {
-          Some((event, responder)) => {
-            let ack = {
-              let mut guard = app.lock().await;
-              apply_acked(&mut guard, event)
-            };
-            let _ = responder.send(ack);
-            signal_deadline(&deadline_tx);
-            publish(&app, &tx, &mut catalog).await;
-            spine.signal_folded();
-          }
-          // Ack channel closed: stop watching it.
-          None => acks = None,
-        }
-        continue;
-      }
       _ = tx.closed() => break,
     };
-    match event {
-      EngineEvent::Streaming(streaming) => {
-        #[cfg(feature = "streaming")]
-        {
-          let mut app = app.lock().await;
-          app.apply_streaming_state(streaming);
+    let ack_responder = match event {
+      crate::runtime::engine::SpineMessage::Ack { event, responder } => {
+        let ack = {
+          let mut guard = app.lock().await;
+          apply_acked(&mut guard, event)
+        };
+        Some((responder, ack))
+      }
+      crate::runtime::engine::SpineMessage::Event(event) => {
+        match event {
+          EngineEvent::Streaming(streaming) => {
+            #[cfg(feature = "streaming")]
+            {
+              let mut app = app.lock().await;
+              app.apply_streaming_state(streaming);
+            }
+            #[cfg(not(feature = "streaming"))]
+            {
+              let _ = streaming;
+            }
+          }
+          EngineEvent::Catalog(catalog) => {
+            let mut app = app.lock().await;
+            crate::core::apply_catalog_state(&mut app, &catalog);
+          }
+          EngineEvent::Session(fact) => {
+            let mut app = app.lock().await;
+            apply_session_fact(&mut app, fact);
+          }
+          EngineEvent::Decoded(fact) => {
+            let mut app = app.lock().await;
+            apply_decoded_source_fact(&mut app, fact);
+          }
+          EngineEvent::History(fact) => {
+            let mut app = app.lock().await;
+            apply_history_fact(&mut app, fact);
+          }
+          EngineEvent::Timer(fact) => {
+            let mut app = app.lock().await;
+            apply_timer_fact(&mut app, fact);
+          }
         }
-        #[cfg(not(feature = "streaming"))]
-        {
-          let _ = streaming;
-        }
+        None
       }
-      EngineEvent::Catalog(catalog) => {
-        let mut app = app.lock().await;
-        crate::core::apply_catalog_state(&mut app, &catalog);
-      }
-      EngineEvent::Session(fact) => {
-        let mut app = app.lock().await;
-        apply_session_fact(&mut app, fact);
-      }
-      EngineEvent::Decoded(fact) => {
-        let mut app = app.lock().await;
-        apply_decoded_source_fact(&mut app, fact);
-      }
-      EngineEvent::History(fact) => {
-        let mut app = app.lock().await;
-        apply_history_fact(&mut app, fact);
-      }
-      EngineEvent::Timer(fact) => {
-        let mut app = app.lock().await;
-        apply_timer_fact(&mut app, fact);
-      }
-    }
+    };
     signal_deadline(&deadline_tx);
     publish(&app, &tx, &mut catalog).await;
     spine.signal_folded();
+    if let Some((responder, ack)) = ack_responder {
+      let _ = responder.send(ack);
+    }
     if tx.is_closed() {
       break;
     }
@@ -3302,6 +3277,9 @@ mod tests {
       ack.and_then(|ack| ack.action_outcome),
       Some(crate::core::action::ActionOutcome::Applied)
     );
+    // The responder is released only after the common publication path, so
+    // callers can read the folded snapshot immediately after acknowledgement.
+    assert_eq!(snapshots.borrow().notice.as_deref(), Some("folded"));
     tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
       .await
       .expect("action fact should publish")
@@ -3493,7 +3471,9 @@ mod tests {
         .await
         .expect("deadline should fire")
         .expect("spine should remain open"),
-      crate::runtime::engine::EngineEvent::Timer(crate::runtime::engine::TimerFact::NoticeExpired)
+      crate::runtime::engine::SpineMessage::Event(crate::runtime::engine::EngineEvent::Timer(
+        crate::runtime::engine::TimerFact::NoticeExpired
+      ))
     ));
   }
 
@@ -3528,7 +3508,9 @@ mod tests {
         .await
         .expect("auth deadline should fire")
         .expect("spine should remain open"),
-      crate::runtime::engine::EngineEvent::Timer(crate::runtime::engine::TimerFact::AuthRefreshDue)
+      crate::runtime::engine::SpineMessage::Event(crate::runtime::engine::EngineEvent::Timer(
+        crate::runtime::engine::TimerFact::AuthRefreshDue
+      ))
     ));
   }
 

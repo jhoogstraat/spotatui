@@ -64,7 +64,11 @@ impl App {
         self.dispatch(IoEvent::TransferPlaybackToDevice(device_id, persist));
       }
       EngineAction::AddToQueue(uri) => self.dispatch(IoEvent::AddItemToQueue(uri)),
-      EngineAction::EnqueueNative(track) => self.add_track_to_native_queue(track),
+      EngineAction::EnqueueNative(track) => {
+        return ActionOutcome::Queued {
+          accepted: usize::from(self.add_track_to_native_queue(track)),
+        };
+      }
       EngineAction::RemoveNativeQueued(index) => self.remove_native_queued(index),
       EngineAction::MoveNativeQueued { index, up } => self.move_native_queued(index, up),
       EngineAction::ClearNativeQueue => self.clear_native_queue(),

@@ -1904,10 +1904,20 @@ impl Default for SpineBounds {
 /// consumes. Cheap to clone (`mpsc::Sender`).
 #[derive(Debug, Clone)]
 pub struct Spine {
-  events_tx: mpsc::Sender<EngineEvent>,
+  events_tx: mpsc::Sender<SpineMessage>,
   queries_tx: mpsc::Sender<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
-  acks_tx: mpsc::Sender<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>,
   activity_tx: watch::Sender<u64>,
+}
+
+/// One FIFO envelope consumed by the fold. Acked commands share this queue
+/// with ordinary facts, so an acknowledgement can never overtake an earlier
+/// worker completion.
+pub(crate) enum SpineMessage {
+  Event(EngineEvent),
+  Ack {
+    event: EngineEvent,
+    responder: AckSender,
+  },
 }
 
 /// The query channel is closed: the fold task is gone (boot order or
@@ -1924,34 +1934,31 @@ impl std::fmt::Display for SpineClosed {
 impl std::error::Error for SpineClosed {}
 
 impl Spine {
-  pub fn open(bounds: SpineBounds) -> (Spine, mpsc::Receiver<EngineEvent>, QueryReceiver) {
+  pub(crate) fn open(bounds: SpineBounds) -> (Spine, mpsc::Receiver<SpineMessage>, QueryReceiver) {
     let (events_tx, events_rx) = mpsc::channel(bounds.event_capacity);
     let (queries_tx, queries_rx) = mpsc::channel(bounds.event_capacity);
-    let (acks_tx, acks_rx) = mpsc::channel(bounds.event_capacity);
     let (activity_tx, _) = watch::channel(0u64);
     (
       Spine {
         events_tx,
         queries_tx,
-        acks_tx,
         activity_tx,
       },
       events_rx,
       QueryReceiver {
         queries_rx: Mutex::new(Some(queries_rx)),
-        acks_rx: Mutex::new(Some(acks_rx)),
       },
     )
   }
 
   /// Push an event, waiting for bounded capacity so unique facts are not lost.
   pub async fn emit(&self, event: EngineEvent) {
-    let _ = self.events_tx.send(event).await;
+    let _ = self.events_tx.send(SpineMessage::Event(event)).await;
   }
   /// Synchronous fire-and-forget for contexts holding no async reactor
   /// (blocking threads, drop paths). Same lossy-on-overflow contract.
   pub fn emit_now(&self, event: EngineEvent) {
-    let _ = self.events_tx.try_send(event);
+    let _ = self.events_tx.try_send(SpineMessage::Event(event));
   }
 
   /// Emit one event and wait until the fold has applied it, receiving the
@@ -1961,7 +1968,14 @@ impl Spine {
   /// before this one — stream order is preserved, no lock needed.
   pub async fn emit_acked(&self, event: EngineEvent) -> Option<FoldAck> {
     let (tx, rx) = oneshot::channel();
-    self.acks_tx.send((event, tx)).await.ok()?;
+    self
+      .events_tx
+      .send(SpineMessage::Ack {
+        event,
+        responder: tx,
+      })
+      .await
+      .ok()?;
     rx.await.ok().flatten()
   }
 
@@ -2006,7 +2020,6 @@ type AckSender = oneshot::Sender<Option<FoldAck>>;
 
 pub struct QueryReceiver {
   queries_rx: Mutex<Option<mpsc::Receiver<(FoldQuery, QuerySender)>>>,
-  acks_rx: Mutex<Option<mpsc::Receiver<(EngineEvent, AckSender)>>>,
 }
 
 impl QueryReceiver {
@@ -2020,18 +2033,13 @@ impl QueryReceiver {
       .await
       .take()
       .map(|rx| FoldQueries { rx });
-    let acks = self.acks_rx.lock().await.take().map(|rx| FoldAcks { rx });
-    Some(FoldHandles {
-      queries: queries?,
-      acks: acks?,
-    })
+    Some(FoldHandles { queries: queries? })
   }
 }
 
 /// The fold's receive halves, taken once at boot by the fold task.
 pub struct FoldHandles {
   pub queries: FoldQueries,
-  pub acks: FoldAcks,
 }
 
 /// Drain helper: `recv().await` / `try_recv()` on the taken receiver.
@@ -2039,11 +2047,6 @@ pub struct FoldQueries {
   pub(crate) rx: mpsc::Receiver<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
 }
 
-/// The acked-emit receive half: pairs an event with the responder the fold
-/// completes after applying it.
-pub struct FoldAcks {
-  pub(crate) rx: mpsc::Receiver<(EngineEvent, oneshot::Sender<Option<FoldAck>>)>,
-}
 impl FoldQueries {
   pub async fn recv(
     &mut self,
@@ -2107,14 +2110,18 @@ mod tests {
     );
     assert!(matches!(
       events.recv().await,
-      Some(EngineEvent::Session(SessionFact::Auth { .. }))
+      Some(SpineMessage::Event(EngineEvent::Session(
+        SessionFact::Auth { .. }
+      )))
     ));
     tokio::time::timeout(Duration::from_secs(2), &mut pending)
       .await
       .expect("event should send after capacity is available");
     assert!(matches!(
       events.recv().await,
-      Some(EngineEvent::Session(SessionFact::Auth { .. }))
+      Some(SpineMessage::Event(EngineEvent::Session(
+        SessionFact::Auth { .. }
+      )))
     ));
   }
 
@@ -2127,5 +2134,37 @@ mod tests {
         .await
         .is_err()
     );
+  }
+
+  #[tokio::test]
+  async fn acked_events_share_fifo_with_worker_events() {
+    let (spine, mut events, _) = Spine::open(Default::default());
+    let first = EngineEvent::Session(SessionFact::Status {
+      message: "worker-first".into(),
+      ttl_secs: 1,
+      is_error: false,
+    });
+    spine.emit_now(first);
+    let ack_task = tokio::spawn({
+      let spine = spine.clone();
+      async move {
+        spine
+          .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+            crate::core::action::EngineAction::Notify("command-second".into(), 1),
+          )))
+          .await
+      }
+    });
+
+    assert!(
+      matches!(events.recv().await, Some(SpineMessage::Event(EngineEvent::Session(
+      SessionFact::Status { message, .. }
+    ))) if message == "worker-first")
+    );
+    let Some(SpineMessage::Ack { responder, .. }) = events.recv().await else {
+      panic!("acked event should follow the worker event");
+    };
+    let _ = responder.send(None);
+    assert!(ack_task.await.unwrap().is_none());
   }
 }

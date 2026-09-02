@@ -611,7 +611,7 @@ pub(super) struct Services {
   /// (player events, recovery teardown, catalog dispatchers) shares one
   /// channel; the frontend's fold task takes the receiving half.
   pub spine: crate::runtime::engine::Spine,
-  pub spine_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::EngineEvent>,
+  pub spine_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::SpineMessage>,
   /// The fold-query receive half: the fold task answers producer reads here
   /// (ticket 16), replacing every lock-then-read outside the fold.
   pub spine_queries: crate::runtime::engine::QueryReceiver,

@@ -10,7 +10,7 @@
 use std::sync::mpsc::{channel, Receiver};
 use std::time::SystemTime;
 
-use super::{EngineAction, NavTarget, RepeatSetting};
+use super::{ActionOutcome, EngineAction, NavTarget, RepeatSetting};
 use crate::core::app::{App, RouteId, UserInfo};
 use crate::core::user_config::UserConfig;
 use crate::infra::network::IoEvent;
@@ -465,10 +465,13 @@ fn queue_track(uri: &str, name: &str) -> crate::core::plugin_api::TrackInfo {
 fn enqueue_native_pushes_onto_the_native_queue() {
   let (mut app, _rx) = app_with_channel();
 
-  app.apply(EngineAction::EnqueueNative(queue_track(
-    "subsonic:track:a",
-    "A",
-  )));
+  assert_eq!(
+    app.apply(EngineAction::EnqueueNative(queue_track(
+      "subsonic:track:a",
+      "A",
+    ))),
+    ActionOutcome::Queued { accepted: 1 }
+  );
 
   assert_eq!(app.native_queue.len(), 1);
   assert_eq!(app.native_queue[0].name, "A");
