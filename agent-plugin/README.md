@@ -10,10 +10,6 @@ installs a DJ skill alongside it, in two formats at once:
   does not read the Agent Plugins format yet, so the same identity and the same
   server registration are mirrored in its own layout.
 
-> Not to be confused with spotatui's **Lua plugins**, which are in-app scripts that
-> react to playback events and draw UI. Those are documented in
-> [`PLUGINS.md`](../PLUGINS.md).
-
 ## What is inside
 
 ```text

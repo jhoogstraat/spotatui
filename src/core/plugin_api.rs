@@ -1,8 +1,8 @@
 //! Plugin-facing domain facade.
 //!
 //! Serde-serializable snapshots with string IDs/URIs only. rspotify types must never leak
-//! through this boundary — that is the compatibility contract for the future scripting API
-//! and multi-source refactor. All conversions from rspotify types happen in the mapping
+//! through this boundary — that is the compatibility contract for external frontends
+//! and the multi-source refactor. All conversions from rspotify types happen in the mapping
 //! functions below; callers receive only the plain structs defined here.
 
 #![allow(dead_code)]
@@ -14,30 +14,13 @@ use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: u32 = 6;
 
-/// A popup dialog produced by a plugin.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PluginPopup {
-  pub title: String,
-  pub lines: Vec<PopupLine>,
-}
-
-/// A single line in a [`PluginPopup`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PopupLine {
-  pub text: String,
-  pub fg: Option<crate::core::theme::Color>,
-  pub bold: bool,
-  pub italic: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackInfo {
   pub uri: Option<String>,
   pub name: String,
-  /// Display artist names. Mirrors `artist_refs[*].name`; retained for the
-  /// `api_version = 4` scripting contract (plugins read `track.artists`).
+  /// Display artist names. Mirrors `artist_refs[*].name`.
   pub artists: Vec<String>,
-  /// Display album name. Retained for the scripting contract.
+  /// Display album name.
   pub album: String,
   pub duration_ms: u64,
   // --- Fields below are additive (post-Phase-0). They only ever ADD keys to the
@@ -240,79 +223,8 @@ pub struct SearchResults {
   pub shows: Vec<ShowInfo>,
 }
 
-/// Retained content of a plugin custom screen. Screens are retained-mode by
-/// design: draw runs with `&App` only (the engine is unreachable there), so
-/// plugins publish content via effects and the renderer just reads it.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct PluginScreenContent {
-  pub title: String,
-  pub widgets: Vec<PluginWidget>,
-}
-
-/// A size along one axis: an absolute cell count, or a percentage of the parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PluginLength {
-  Cells(u16),
-  /// 1..=100 (validated at the API layer).
-  Percent(u16),
-}
-
-/// A widget in a [`PluginScreenContent`].
-///
-/// `width`/`height` are per-axis size hints; only the one matching the parent
-/// container's axis is used (the top level is an implicit vertical stack).
-/// `None` means "share the remaining space evenly".
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PluginWidget {
-  pub kind: PluginWidgetKind,
-  pub width: Option<PluginLength>,
-  pub height: Option<PluginLength>,
-}
-
-impl PluginWidget {
-  /// A widget with no size hints on either axis.
-  pub fn new(kind: PluginWidgetKind) -> Self {
-    Self {
-      kind,
-      width: None,
-      height: None,
-    }
-  }
-}
-
-/// The content of a [`PluginWidget`]. `Row`/`Column` are pure layout containers:
-/// they draw no border and no title, they only split their area.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum PluginWidgetKind {
-  Paragraph {
-    lines: Vec<PopupLine>,
-    /// Whether `PageUp`/`PageDown` scrolling applies to this paragraph.
-    /// Defaults to `true`, matching the `api_version = 5` behavior where every
-    /// paragraph on a screen scrolled in lockstep.
-    scroll: bool,
-  },
-  List {
-    title: Option<String>,
-    items: Vec<PopupLine>,
-    /// 0-based index of the highlighted item.
-    selected: Option<usize>,
-  },
-  Gauge {
-    /// 0.0..=1.0 (clamped at the API layer).
-    ratio: f64,
-    label: Option<String>,
-  },
-  Row {
-    children: Vec<PluginWidget>,
-  },
-  Column {
-    children: Vec<PluginWidget>,
-  },
-}
-
-/// A queue item as exposed to plugins. [`PlayableInfo`]'s externally-tagged
-/// serde shape (`{ Track = {...} }`) is hostile to Lua, so queue items are
-/// flattened into an explicit `kind` plus at most one populated payload field.
+/// A source-neutral queue item. Queue items are flattened into an explicit
+/// `kind` plus at most one populated payload field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueueItemSnapshot {
   /// `"track"` or `"episode"`.
@@ -573,47 +485,6 @@ pub fn device_list(app: &App) -> Vec<DeviceInfo> {
         .collect()
     })
     .unwrap_or_default()
-}
-
-/// Stable plugin-facing name of a route. Exhaustive on purpose (no `_` arm):
-/// adding a `RouteId` without naming it here is a compile error, keeping the
-/// scripting contract in sync.
-pub fn route_name(route: &crate::core::app::Route) -> String {
-  use crate::core::app::RouteId;
-  match &route.id {
-    RouteId::Analysis => "analysis",
-    RouteId::AlbumTracks => "album_tracks",
-    RouteId::AlbumList => "album_list",
-    RouteId::Artist => "artist",
-    RouteId::MiniPlayer => "miniplayer",
-    RouteId::Error => "error",
-    RouteId::Home => "home",
-    RouteId::RecentlyPlayed => "recently_played",
-    RouteId::Search => "search",
-    RouteId::SelectedDevice => "devices",
-    RouteId::TrackTable => "track_table",
-    RouteId::Discover => "discover",
-    RouteId::Artists => "artists",
-    RouteId::Podcasts => "podcasts",
-    RouteId::PodcastEpisodes => "podcast_episodes",
-    RouteId::Recommendations => "recommendations",
-    RouteId::Dialog => "dialog",
-    RouteId::AnnouncementPrompt => "announcement",
-    RouteId::RecapPrompt => "recap_prompt",
-    RouteId::CommunityPinPrompt => "community_pin_prompt",
-    RouteId::ExitPrompt => "exit_prompt",
-    RouteId::Settings => "settings",
-    RouteId::HelpMenu => "help",
-    RouteId::Queue => "queue",
-    RouteId::CreatePlaylist => "create_playlist",
-    RouteId::Friends => "friends",
-    RouteId::LocalBrowser => "local_browser",
-    RouteId::Stats => "stats",
-    #[cfg(feature = "ai-dj")]
-    RouteId::AiDj => "ai_dj",
-    RouteId::PluginScreen(name) => return format!("plugin:{name}"),
-  }
-  .to_string()
 }
 
 // ---------------------------------------------------------------------------

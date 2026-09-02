@@ -30,9 +30,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::plugin_api::{PluginPopup, PluginScreenContent, TrackInfo};
+use crate::core::plugin_api::TrackInfo;
 use crate::core::source::Source;
-use crate::core::theme::{Color, ThemeField};
 
 mod apply;
 #[cfg(test)]
@@ -82,9 +81,7 @@ pub enum EngineAction {
   ToggleShuffle,
   /// Cycle repeat off, then context, then track, matching the repeat key.
   CycleRepeat,
-  /// Set repeat to an absolute mode. Mirrors the historic Lua `set_repeat`:
-  /// this is the Web API path only; an ownership-aware absolute setter does
-  /// not exist yet.
+  /// Set repeat to an absolute mode through the Web API path.
   SetRepeat(RepeatSetting),
   /// Play an explicit list of playable URIs, optionally from an offset into
   /// that list.
@@ -137,10 +134,8 @@ pub enum EngineAction {
   /// already pending.
   BeginSpotifyLogin,
   /// Run a search against the Spotify catalog; the user country is resolved
-  /// at apply time. Deliberately source-blind: existing producers (Lua
-  /// `spotatui.search`) contracted the Web API search, so browsing scope
-  /// does not reroute it. The terminal search box uses
-  /// [`EngineAction::SearchActiveSource`] instead.
+  /// at apply time. Deliberately source-blind; use
+  /// [`EngineAction::SearchActiveSource`] for browse-scope routing.
   Search(String),
   /// Run a search against the active browse source's catalog; falls back to
   /// the Spotify catalog when the active source has no own search (the
@@ -218,19 +213,6 @@ pub enum EngineAction {
   /// selected period on the Stats screen when that screen is current, 30
   /// days anywhere else.
   GenerateRecap,
-  SetPlaybarSegment {
-    plugin: String,
-    text: Option<String>,
-  },
-  ShowPopup(PluginPopup),
-  ClosePopup,
-  SetTheme(Vec<(ThemeField, Color)>),
-  SetScreenContent {
-    name: String,
-    content: PluginScreenContent,
-  },
-  ShowScreen(String),
-  CloseScreen(String),
   /// Seed the track-radio recommendations flow from one track. The full
   /// snapshot rides along because the results table prepends it as the
   /// context row.
@@ -273,24 +255,20 @@ pub enum NavTarget {
   Devices,
   Help,
   RecentlyPlayed,
-  Analysis,
   MiniPlayer,
 }
 
 impl NavTarget {
-  /// Every target, in the order the Lua API has always advertised them.
-  pub const ALL: [NavTarget; 8] = [
+  pub const ALL: [NavTarget; 7] = [
     NavTarget::Home,
     NavTarget::Queue,
     NavTarget::Settings,
     NavTarget::Devices,
     NavTarget::Help,
     NavTarget::RecentlyPlayed,
-    NavTarget::Analysis,
     NavTarget::MiniPlayer,
   ];
 
-  /// The name used by `spotatui.navigate(name)`.
   pub fn name(self) -> &'static str {
     match self {
       NavTarget::Home => "home",
@@ -299,7 +277,6 @@ impl NavTarget {
       NavTarget::Devices => "devices",
       NavTarget::Help => "help",
       NavTarget::RecentlyPlayed => "recently_played",
-      NavTarget::Analysis => "analysis",
       NavTarget::MiniPlayer => "miniplayer",
     }
   }
@@ -339,9 +316,6 @@ pub enum OpenTarget {
 }
 
 /// Library sidebar sections reachable through [`EngineAction::OpenLibrary`].
-/// Deliberately NOT advertised through the Lua `navigate()` API (unlike
-/// [`NavTarget`]): adding rows there would expand the published plugin
-/// surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LibraryTarget {
   Discover,

@@ -175,30 +175,6 @@ impl App {
       EngineAction::JumpToArtist => self.jump_to_artist_album(),
       EngineAction::JumpToContext => self.jump_to_context(),
       EngineAction::GenerateRecap => self.generate_recap(),
-      EngineAction::SetPlaybarSegment { plugin, text } => match text {
-        Some(t) => {
-          self.plugin_playbar_segments.insert(plugin, t);
-        }
-        None => {
-          self.plugin_playbar_segments.remove(&plugin);
-        }
-      },
-      EngineAction::ShowPopup(popup) => self.show_plugin_popup(popup),
-      EngineAction::ClosePopup => self.close_plugin_popup(),
-      EngineAction::SetTheme(pairs) => {
-        for (field, color) in pairs {
-          self.user_config.theme.set(field, color);
-        }
-      }
-      EngineAction::SetScreenContent { name, content } => {
-        self.plugin_screens.insert(name, content);
-      }
-      EngineAction::ShowScreen(name) => self.open_plugin_screen(name),
-      EngineAction::CloseScreen(name) => {
-        if self.get_current_route().id == RouteId::PluginScreen(name) {
-          self.pop_navigation_stack();
-        }
-      }
       EngineAction::QueueTracks(tracks) => {
         #[cfg(feature = "dj-core")]
         {
@@ -258,7 +234,6 @@ fn apply_navigate(app: &mut App, target: NavTarget) {
     // The network handler pushes the route once the data arrives, exactly like
     // the keybinding.
     NavTarget::RecentlyPlayed => app.dispatch(IoEvent::GetRecentlyPlayed),
-    NavTarget::Analysis => app.get_audio_analysis(),
     NavTarget::MiniPlayer => {
       if app.get_current_route().id == RouteId::MiniPlayer {
         app.pop_navigation_stack();

@@ -135,7 +135,6 @@ pub struct KeyBindingsString {
   submit: Option<String>,
   copy_song_url: Option<String>,
   copy_album_url: Option<String>,
-  audio_analysis: Option<String>,
   miniplayer_view: Option<String>,
   add_item_to_queue: Option<String>,
   show_queue: Option<String>,
@@ -193,7 +192,6 @@ pub struct KeyBindings {
   pub submit: Key,
   pub copy_song_url: Key,
   pub copy_album_url: Key,
-  pub audio_analysis: Key,
   pub miniplayer_view: Key,
   pub add_item_to_queue: Key,
   pub show_queue: Key,
@@ -596,7 +594,6 @@ pub struct UserConfigString {
   keybindings: Option<KeyBindingsString>,
   behavior: Option<BehaviorConfigString>,
   theme: Option<UserTheme>,
-  plugin_commands: Option<HashMap<String, String>>,
   format: Option<FormatConfigString>,
   tables: Option<TablesConfigString>,
 }
@@ -650,8 +647,6 @@ pub struct UserConfig {
   pub custom_theme: Theme,
   pub behavior: BehaviorConfig,
   pub path_to_config: Option<UserConfigPaths>,
-  /// Keybindings for plugin commands: key -> command name.
-  pub plugin_command_keys: HashMap<Key, String>,
   /// Parsed format templates (Phase 4).
   pub format: FormatConfig,
   /// Resolved per-table column layouts (Phase 5).
@@ -724,7 +719,6 @@ impl UserConfig {
         submit: Key::Enter,
         copy_song_url: Key::Char('c'),
         copy_album_url: Key::Char('C'),
-        audio_analysis: Key::Char('v'),
         miniplayer_view: Key::Char('T'),
         add_item_to_queue: Key::Char('z'),
         show_queue: Key::Char('Q'),
@@ -740,7 +734,6 @@ impl UserConfig {
         like_track: Key::Char('F'),
         generate_recap: Key::Char('R'),
       },
-      plugin_command_keys: HashMap::new(),
       behavior: BehaviorConfig {
         seek_milliseconds: 5 * 1000,
         volume_increment: 10,
@@ -940,7 +933,6 @@ impl UserConfig {
     to_keys!(submit);
     to_keys!(copy_song_url);
     to_keys!(copy_album_url);
-    to_keys!(audio_analysis);
     to_keys!(miniplayer_view);
     to_keys!(add_item_to_queue);
     to_keys!(show_queue);
@@ -1507,87 +1499,6 @@ impl UserConfig {
     Ok(())
   }
 
-  fn named_action_keys(&self) -> Vec<Key> {
-    let k = &self.keys;
-    vec![
-      k.back,
-      k.move_up,
-      k.move_down,
-      k.move_left,
-      k.move_right,
-      k.next_page,
-      k.previous_page,
-      k.jump_to_start,
-      k.jump_to_end,
-      k.jump_to_album,
-      #[cfg(feature = "ai-dj")]
-      k.dj_open,
-      #[cfg(feature = "ai-dj")]
-      k.dj_toggle_auto_queue,
-      #[cfg(feature = "ai-dj")]
-      k.dj_vibe_shift,
-      #[cfg(feature = "ai-dj")]
-      k.dj_toggle_fresh_only,
-      #[cfg(feature = "ai-dj")]
-      k.dj_pick_model,
-      k.jump_to_artist_album,
-      k.jump_to_context,
-      k.manage_devices,
-      k.decrease_volume,
-      k.increase_volume,
-      k.toggle_playback,
-      k.seek_backwards,
-      k.seek_forwards,
-      k.next_track,
-      k.previous_track,
-      k.force_previous_track,
-      k.help,
-      k.shuffle,
-      k.repeat,
-      k.search,
-      k.submit,
-      k.copy_song_url,
-      k.copy_album_url,
-      k.audio_analysis,
-      k.miniplayer_view,
-      k.add_item_to_queue,
-      k.show_queue,
-      k.remove_from_queue,
-      k.open_settings,
-      k.save_settings,
-      k.like_track,
-      k.generate_recap,
-    ]
-  }
-
-  pub fn load_plugin_commands(&mut self, entries: HashMap<String, String>) {
-    let named_keys = self.named_action_keys();
-    let mut result: HashMap<Key, String> = HashMap::new();
-    for (cmd_name, key_str) in entries {
-      let key = match parse_key(key_str.clone()) {
-        Ok(k) => k,
-        Err(e) => {
-          log::warn!(
-            "[config] plugin_commands: skipping '{cmd_name}': invalid key '{key_str}': {e}"
-          );
-          continue;
-        }
-      };
-      if let Err(e) = check_reserved_keys(key) {
-        log::warn!("[config] plugin_commands: skipping '{cmd_name}': {e}");
-        continue;
-      }
-      if named_keys.contains(&key) {
-        log::warn!(
-          "[config] plugin_commands: skipping '{cmd_name}': key '{key_str}' collides with a named action"
-        );
-        continue;
-      }
-      result.insert(key, cmd_name);
-    }
-    self.plugin_command_keys = result;
-  }
-
   pub fn load_config(&mut self) -> Result<()> {
     let paths = match &self.path_to_config {
       Some(path) => path,
@@ -1620,9 +1531,6 @@ impl UserConfig {
         self.load_theme(theme)?;
       }
       self.resolve_banner_gradient(explicit_banner_gradient);
-      if let Some(plugin_commands) = config_yml.plugin_commands {
-        self.load_plugin_commands(plugin_commands);
-      }
       if let Some(format) = config_yml.format {
         self.load_formatconfig(format);
       }
@@ -1873,7 +1781,6 @@ impl UserConfig {
       submit: Some(key_to_config_string(self.keys.submit)),
       copy_song_url: Some(key_to_config_string(self.keys.copy_song_url)),
       copy_album_url: Some(key_to_config_string(self.keys.copy_album_url)),
-      audio_analysis: Some(key_to_config_string(self.keys.audio_analysis)),
       miniplayer_view: Some(key_to_config_string(self.keys.miniplayer_view)),
       add_item_to_queue: Some(key_to_config_string(self.keys.add_item_to_queue)),
       show_queue: Some(key_to_config_string(self.keys.show_queue)),
@@ -1919,7 +1826,6 @@ impl UserConfig {
           keybindings: Some(build_keybindings()),
           behavior: Some(build_behavior()),
           theme: Some(build_theme()),
-          plugin_commands: None,
           format: None,
           tables: None,
         }
@@ -1929,7 +1835,6 @@ impl UserConfig {
         keybindings: Some(build_keybindings()),
         behavior: Some(build_behavior()),
         theme: Some(build_theme()),
-        plugin_commands: None,
         format: None,
         tables: None,
       }
@@ -2426,19 +2331,12 @@ volume_increment: 5
     assert_eq!(config.behavior.dj_agent_command, vec!["claude", ""]);
   }
 
-  /// The reopen binding is really registered, not just declared.
-  ///
-  /// Several sites have to agree for a binding to work and a miss in any of them
-  /// fails silently. This covers the three that are reachable without a config file
-  /// on disk: the shipped default, the rebind path, and the named-action list that
-  /// stops a plugin shadowing it.
+  /// The reopen binding is registered and can be rebound.
   #[cfg(feature = "ai-dj")]
   #[test]
   fn the_dj_model_picker_binding_round_trips_and_is_reserved() {
     use super::{KeyBindingsString, UserConfig};
     use crate::core::input::Key;
-    use std::collections::HashMap;
-
     let mut config = UserConfig::new();
     assert_eq!(config.keys.dj_pick_model, Key::Ctrl('g'));
 
@@ -2449,13 +2347,6 @@ volume_increment: 5
       })
       .unwrap();
     assert_eq!(config.keys.dj_pick_model, Key::Ctrl('x'));
-
-    // Named actions are off limits to Lua `plugin_commands`, or a plugin silently
-    // steals the binding.
-    let mut entries = HashMap::new();
-    entries.insert("steal_it".to_string(), "ctrl-x".to_string());
-    config.load_plugin_commands(entries);
-    assert!(config.plugin_command_keys.is_empty());
   }
 
   /// The exact YAML an existing install carries: every `dj_*` key present, every
@@ -2598,80 +2489,6 @@ dj_api_key: null
       Some("arg"),
       "the canonical form is stored, not what the user typed"
     );
-  }
-
-  #[test]
-  fn plugin_commands_valid_entry_lands_in_plugin_command_keys() {
-    use super::UserConfig;
-    use crate::core::input::Key;
-    use std::collections::HashMap;
-
-    let mut config = UserConfig::new();
-    let mut entries = HashMap::new();
-    // Ctrl+K rather than Ctrl+G: with `ai-dj` built in, Ctrl+G is `dj_pick_model`
-    // and `load_plugin_commands` correctly refuses to shadow a named action, so the
-    // old fixture would only have passed in the slim build.
-    entries.insert("custom_command".to_string(), "ctrl-k".to_string());
-    config.load_plugin_commands(entries);
-    assert_eq!(
-      config.plugin_command_keys.get(&Key::Ctrl('k')),
-      Some(&"custom_command".to_string())
-    );
-  }
-
-  #[test]
-  fn plugin_commands_reserved_key_is_skipped() {
-    use super::UserConfig;
-    use crate::core::input::Key;
-    use std::collections::HashMap;
-
-    let mut config = UserConfig::new();
-    let mut entries = HashMap::new();
-    // Enter is a reserved key
-    entries.insert("submit_action".to_string(), "enter".to_string());
-    config.load_plugin_commands(entries);
-    assert!(!config.plugin_command_keys.contains_key(&Key::Enter));
-  }
-
-  #[test]
-  fn plugin_commands_named_action_collision_is_skipped() {
-    use super::UserConfig;
-    use crate::core::input::Key;
-    use std::collections::HashMap;
-
-    let mut config = UserConfig::new();
-    // 'q' is the default 'back' key
-    let mut entries = HashMap::new();
-    entries.insert("my_cmd".to_string(), "q".to_string());
-    config.load_plugin_commands(entries);
-    assert!(!config.plugin_command_keys.contains_key(&Key::Char('q')));
-  }
-
-  #[test]
-  fn plugin_commands_remove_from_queue_collision_is_skipped() {
-    use super::UserConfig;
-    use crate::core::input::Key;
-    use std::collections::HashMap;
-
-    let mut config = UserConfig::new();
-    // 'x' is the default 'remove_from_queue' key; it was missing from the
-    // named-action collision list, so a plugin could shadow it silently.
-    let mut entries = HashMap::new();
-    entries.insert("my_cmd".to_string(), "x".to_string());
-    config.load_plugin_commands(entries);
-    assert!(!config.plugin_command_keys.contains_key(&Key::Char('x')));
-  }
-
-  #[test]
-  fn plugin_commands_invalid_key_string_is_skipped() {
-    use super::UserConfig;
-    use std::collections::HashMap;
-
-    let mut config = UserConfig::new();
-    let mut entries = HashMap::new();
-    entries.insert("my_cmd".to_string(), "not-a-real-key".to_string());
-    config.load_plugin_commands(entries);
-    assert!(config.plugin_command_keys.is_empty());
   }
 
   #[test]

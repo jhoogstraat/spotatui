@@ -4,7 +4,7 @@
 </h1>
 <p align="center">
   A terminal music player written in Rust, powered by <a href="https://github.com/ratatui-org/ratatui">Ratatui</a><br>
-  Native Spotify streaming, synced lyrics, a real-time audio visualizer, local file,<br> Subsonic/Navidrome, Internet Radio, and YouTube sources. Spotify is optional.
+  Native Spotify streaming, local file, Subsonic/Navidrome, Internet Radio, and YouTube sources. Spotify is optional.
 </p>
 
 [![Crates.io](https://img.shields.io/crates/v/spotatui.svg)](https://crates.io/crates/spotatui)
@@ -39,7 +39,6 @@
   - [Discord Rich Presence](#discord-rich-presence)
   - [Anonymous Song Counter](#anonymous-song-counter)
   - [GitHub Profile Widget](#github-profile-widget)
-- [Plugins](#plugins)
 - [Performance](#performance)
 - [Playback Requirements](#playback-requirements)
   - [Deprecated Spotify API Features](#deprecated-spotify-api-features)
@@ -70,10 +69,7 @@ A community-maintained, actively developed fork of [spotify-tui](https://github.
 
 - **Multiple sources — Spotify optional.** Play from Spotify, [Local Files](#local-files), a [Subsonic/Navidrome](#subsonic--navidrome) server, [Internet Radio](#internet-radio), or [YouTube](#youtube). The free sources need no Spotify account; press `d` to switch between them at any time.
 - **[Native streaming](#native-streaming).** Play Spotify audio directly, no official app or spotifyd required — spotatui appears as its own Spotify Connect device (Premium required).
-- **Synced lyrics.** Line-by-line lyrics that follow playback.
-- **Real-time audio visualizer.** A system-wide FFT visualizer (press `v`) that reacts to whatever is playing.
 - **Cross-source play queue.** Press `z` on any track to queue it — the queue plays across every source before your current context resumes.
-- **[Lua plugins](#plugins).** Extend spotatui with event hooks, commands, keybindings, popups, and theming.
 - **Listening history & recap.** spotatui keeps a local play history and can generate a shareable HTML recap (`spotatui history recap`).
 - **Full CLI.** Most of what the UI does is scriptable — playback, search, playlists, shell completions. Run `spotatui --help`.
 - **Lightweight.** ~78 MB RAM while streaming, versus a full Electron client. See [Performance](#performance).
@@ -138,16 +134,6 @@ If you use alsa:
    ```nix
     hardware.alsa.enable = true;
    ```
-Or if you use pipewire:
-   ```nix
-    services.pipewire = {
-        enable = true;
-        alsa.enable = true;
-        #your other settings
-    };
-   ```
-
-
 Or download pre-built binaries from [GitHub Releases](https://github.com/LargeModGames/spotatui/releases/latest).
 
 > **Which build has which sources?** The prebuilt Linux and Windows binaries (the one-line installer, GitHub Releases, and `cargo binstall`) include the extra music sources — Local Files, Subsonic, Internet Radio, and YouTube. macOS builds and a plain `cargo install --locked spotatui` do not; enable them with `--features local-files,subsonic,internet-radio,youtube`.
@@ -193,7 +179,7 @@ Started with a free source and want Spotify too? Press `d`, select **Spotify**, 
 
 ## Music Sources
 
-spotatui is a general music player, not just a Spotify client. Press `d` to open the **Source & Device** picker; the sidebar and search re-scope to the active source. Playback for these sources runs through spotatui's own audio engine, so volume control and the visualizer work exactly as they do for Spotify — and none of them need Spotify Premium.
+spotatui is a general music player, not just a Spotify client. Press `d` to open the **Source & Device** picker; the sidebar and search re-scope to the active source. Playback for these sources runs through spotatui's own audio engine, and none of them need Spotify Premium.
 
 | Source | What it does | Needs |
 |---|---|---|
@@ -251,7 +237,7 @@ spotatui can pick music for you, from your own listening history. Two ways in:
 
 That file is written as instructions *for the agent*, and `spotatui mcp status` gives it a safe, checkable probe of every step. Full guide: [`docs/mcp-setup.md`](docs/mcp-setup.md).
 
-Clients that support agent plugins can do the whole registration in one step, and get a DJ skill along with the server: in Claude Code, `/plugin marketplace add LargeModGames/spotatui` then `/plugin install spotatui@spotatui`; clients that read the new [Agent Plugins](https://agent-plugins.org) format load [`agent-plugin/`](agent-plugin/README.md) from this repo. (These are *agent* plugins, for AI clients — spotatui's in-app Lua plugins live in [`PLUGINS.md`](PLUGINS.md).)
+Clients that support agent plugins can do the whole registration in one step, and get a DJ skill along with the server: in Claude Code, `/plugin marketplace add LargeModGames/spotatui` then `/plugin install spotatui@spotatui`; clients that read the new [Agent Plugins](https://agent-plugins.org) format load [`agent-plugin/`](agent-plugin/README.md) from this repo.
 
 **Or use the DJ built into the TUI** (`--features ai-dj`) — press `Ctrl-j` for a DJ screen with a chat prompt, `Ctrl-t` for continuous auto-queue, `Ctrl-y` to shift the vibe, `Ctrl-o` for "only tracks I don't already have", `Ctrl-g` to choose which AI and model it uses. It drives the same tools as the MCP server, so it can search, check your queue and queue tracks, and it will ask what you actually want before it plays anything rather than queueing on every message. Its brain is a locally installed agent CLI (`claude`, `codex`, `agy`, `copilot`, `opencode`, no key), an API key, or a local model via Ollama / LM Studio; it asks which one on your first visit, since the agent CLIs spend the coding subscription you already pay for. Full guide: [`docs/ai-dj.md`](docs/ai-dj.md).
 
@@ -307,20 +293,7 @@ Show what you're listening to as a live card on your GitHub profile. Create an a
 [![Now playing on spotatui](https://spotatui.com/widget/your-username.svg)](https://spotatui.com)
 ```
 
-The card shows cover art, title, artist, a progress bar, and an animated equalizer while playing; internet radio gets a LIVE badge. Append `?theme=light` for the light variant. Only your current track is public, and only after you opt in.
-
-## Plugins
-
-spotatui runs user-written Lua plugins. They react to playback events, add commands and key bindings, draw popups and playbar segments, restyle the theme, and make async HTTP requests. Install one published as a git repository (requires `git`):
-
-```bash
-spotatui plugin add owner/repo
-spotatui plugin list
-spotatui plugin update
-spotatui plugin remove <name>
-```
-
-See [`PLUGINS.md`](PLUGINS.md) for the ecosystem overview, [`examples/plugins/`](examples/plugins) for runnable examples, and [`docs/scripting.md`](docs/scripting.md) for the full API reference.
+The card shows title, artist, a progress bar, while playing; internet radio gets a LIVE badge. Append `?theme=light` for the light variant. Only your current track is public, and only after you opt in.
 
 ## Performance
 
@@ -329,8 +302,6 @@ spotatui is extremely lightweight compared to the official Electron client.
 | Mode                            | RAM Usage |
 | :------------------------------ | :-------- |
 | **Native Streaming (Base)**     | ~78 MB    |
-| **With Synced Lyrics**          | ~78 MB    |
-| **With System-Wide Visualizer** | ~80 MB    |
 
 *Tested on Arch Linux (Hyprland).*
 
@@ -352,18 +323,6 @@ As of November 2024, Spotify removed access to certain API endpoints for new app
 
 - **Related Artists** — the "Related Artists" section on an artist page.
 - **Recommendations** — seed-based recommendations. The **AI DJ** does not depend on this endpoint: it has a model do the recommending and only uses Spotify to look the tracks up, so it works regardless of when your app was created.
-- **Audio Analysis** — spotatui no longer depends on it. The **audio visualizer** (press `v`) now uses **local real-time FFT analysis** of your system audio, so it works regardless of your app's creation date:
-
-  | Platform    | Status               | Notes                                    |
-  | ----------- | -------------------- | ---------------------------------------- |
-  | **Windows** | Works out of the box | Uses WASAPI loopback                     |
-  | **Linux**   | Works out of the box | Uses PipeWire/PulseAudio monitor devices |
-  | **macOS**   | Requires setup       | Needs a virtual audio device (see below) |
-
-  > **macOS:** macOS doesn't natively expose system audio loopback. Install a virtual audio device like [BlackHole](https://github.com/ExistentialAudio/BlackHole) (free) or [Loopback](https://rogueamoeba.com/loopback/) (paid), route system audio through it, and set it as your default input device.
-  >
-  > **Note:** The visualizer is **system-wide** — it captures all audio on your system, so it also reacts to YouTube videos, games, and any other source.
-
 For more information, see [Spotify's announcement about API changes](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api).
 
 ## Using with [spotifyd](https://github.com/Spotifyd/spotifyd)
@@ -424,20 +383,6 @@ You may be asked to re-authenticate with Spotify the first time.
 1. [Install OpenSSL](https://docs.rs/openssl/0.10.25/openssl/#automatic)
 1. [Install Rust](https://www.rust-lang.org/tools/install)
 1. [Install `xorg-dev`](https://github.com/aweinstock314/rust-clipboard#prerequisites) (required for clipboard support)
-1. **Linux only:** Install PipeWire development libraries (required for audio visualization)
-   ```bash
-   # Debian/Ubuntu
-   sudo apt-get install libpipewire-0.3-dev libspa-0.2-dev
-
-   # Arch Linux
-   sudo pacman -S pipewire
-
-   # Fedora
-   sudo dnf install pipewire-devel
-
-   # NixOS
-   nix develop github:LargeModGames/spotatui
-   ```
 1. Clone or fork this repo and `cd` to it
 1. And then `cargo run`
 

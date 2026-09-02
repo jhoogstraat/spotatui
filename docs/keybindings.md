@@ -33,7 +33,6 @@ one query can be walked across tabs.
 | `C`         | Copy album URL            |
 | `Ctrl-r`    | Toggle repeat mode        |
 | `Ctrl-s`    | Toggle shuffle            |
-| `v`         | Audio visualization       |
 | `z`         | Add to queue              |
 | `Q`         | Show queue                |
 | `F`         | Like / save track         |

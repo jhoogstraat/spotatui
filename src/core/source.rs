@@ -229,7 +229,7 @@ pub trait PlaylistWriter {
 }
 
 /// Optional capability: produce a playable audio stream for a URI and route it
-/// into the shared rodio sink (so the visualizer and volume control work
+/// into the shared rodio sink (so volume control works
 /// uniformly across sources).
 ///
 /// The concrete stream/handle return type is defined in the local-files slice

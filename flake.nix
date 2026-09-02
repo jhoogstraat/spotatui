@@ -32,7 +32,6 @@
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             alsa-lib
             dbus
-            pipewire
           ]
           # Build inputs for nix-darwin
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [

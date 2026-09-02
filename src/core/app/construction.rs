@@ -199,12 +199,6 @@ impl Default for App {
       dj: crate::infra::dj::DjState::default(),
       create_playlist_tracks: Vec::new(),
       create_playlist_search_results: Vec::new(),
-      pending_plugin_commands: Vec::new(),
-      plugin_data_generations: PluginDataGenerations::default(),
-      plugin_screens: std::collections::BTreeMap::new(),
-      pending_plugin_screen_keys: Vec::new(),
-      plugin_playbar_segments: std::collections::BTreeMap::new(),
-      plugin_popup: None,
       log_path: crate::core::paths::app_log_path().display().to_string(),
     }
   }

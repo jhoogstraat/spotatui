@@ -9,7 +9,6 @@
   "excludeFolders": [
     "src",
     "target",
-    "worker-relay",
     "snap",
     "graphify-out",
     "spotatui.wiki",
@@ -25,9 +24,8 @@
     "how_to_release.md"
   ],
   "rules": [
-    "spotatui is a terminal application, not a library. A plain `cargo run` builds the Spotify-only default; use `cargo run --features all-sources` to enable the Local, Subsonic, Radio, and YouTube sources.",
-    "Native streaming (librespot) and audio visualization are part of the default features; the slim CI build uses `--no-default-features --features telemetry`.",
-    "Keybindings and most behavior are user-configurable via the YAML config; see docs/configuration.md and examples/config.example.yml.",
-    "The Lua scripting/plugin API is documented in docs/scripting.md with runnable examples under examples/plugins/."
+    "spotatui provides the in-process Playback Engine embedded by rust-player; use `cargo run --features all-sources` to exercise Local, Subsonic, Radio, and YouTube sources.",
+    "Native streaming (librespot) is part of the default features; the slim CI build uses `--no-default-features --features telemetry`.",
+    "Runtime behavior is user-configurable via the YAML config; see docs/configuration.md and examples/config.example.yml."
   ]
 }

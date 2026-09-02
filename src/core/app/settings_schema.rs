@@ -695,12 +695,6 @@ impl App {
           value: SettingValue::Key(key_to_string(&self.user_config.keys.copy_album_url)),
         },
         SettingItem {
-          id: "keys.audio_analysis".to_string(),
-          name: "Audio Analysis".to_string(),
-          description: "Open audio analysis view".to_string(),
-          value: SettingValue::Key(key_to_string(&self.user_config.keys.audio_analysis)),
-        },
-        SettingItem {
           id: "keys.miniplayer_view".to_string(),
           name: "Miniplayer View".to_string(),
           description: "Toggle full-screen playbar view".to_string(),
@@ -823,8 +817,7 @@ impl App {
   }
 
   /// Enter the Settings screen on a fresh, unfiltered view of the current
-  /// category. Every front door (keybinding, sidebar click, Lua `navigate`)
-  /// goes through here so none of them can carry a stale filter in.
+  /// category. Every front door goes through here so none can carry a stale filter in.
   pub fn open_settings_screen(&mut self) {
     self.load_settings_for_category();
     self.push_navigation_stack(RouteId::Settings, ActiveBlock::Settings);

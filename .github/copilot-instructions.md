@@ -358,7 +358,7 @@ never config:
 - Sensitive writes go through `core::auth::write_private_file_atomic`;
   `config.yml` can carry plaintext secrets, so never log the serialized config.
 - `UserConfig::save_config()` regenerates only `behavior`/`theme`/`keybindings`;
-  `plugin_commands`, `format`, and `tables` are passed through from disk.
+  `format` and `tables` are passed through from disk.
 - Adding a `behavior.*` setting = edits in `core/user_config.rs`
   (`BehaviorConfigString`, `BehaviorConfig`, `UserConfig::new`,
   `load_behaviorconfig`, `save_config`) **plus** matching arms in

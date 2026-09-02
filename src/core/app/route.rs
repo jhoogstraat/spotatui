@@ -39,7 +39,6 @@ pub enum DialogContext {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ActiveBlock {
-  Analysis,
   PlayBar,
   AlbumTracks,
   AlbumList,
@@ -76,9 +75,6 @@ pub enum ActiveBlock {
   /// The AI DJ screen's prompt + transcript.
   #[cfg(feature = "ai-dj")]
   AiDj,
-  /// A custom screen retained for future frontends.
-  #[allow(dead_code)]
-  PluginScreen,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -90,7 +86,6 @@ pub enum InputContext {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum RouteId {
-  Analysis,
   AlbumTracks,
   AlbumList,
   Artist,
@@ -124,9 +119,6 @@ pub enum RouteId {
   Stats,
   #[cfg(feature = "ai-dj")]
   AiDj,
-  /// A custom screen, keyed by its registered name.
-  #[allow(dead_code)]
-  PluginScreen(String),
 }
 
 impl RouteId {
@@ -300,17 +292,6 @@ impl App {
     if let Some(hovered_block) = hovered_block {
       current_route.hovered_block = hovered_block;
     }
-  }
-
-  /// Toggle the audio analysis visualization view
-  /// This now uses local FFT analysis instead of the deprecated Spotify API
-  pub fn get_audio_analysis(&mut self) {
-    info!("entering audio analysis view");
-    if self.get_current_route().id != RouteId::Analysis {
-      // Enter visualization mode
-      self.push_navigation_stack(RouteId::Analysis, ActiveBlock::Analysis);
-    }
-    // Spectrum data will be updated by the audio capture system on each tick
   }
 
   /// Open the album page of the item that is playing now (episodes open

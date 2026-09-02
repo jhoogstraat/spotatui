@@ -12,7 +12,6 @@ use std::time::SystemTime;
 
 use super::{EngineAction, NavTarget, RepeatSetting};
 use crate::core::app::{App, RouteId, UserInfo};
-use crate::core::theme::{Color, Theme, ThemeField};
 use crate::core::user_config::UserConfig;
 use crate::infra::network::IoEvent;
 
@@ -819,15 +818,6 @@ fn navigate_recently_played_only_dispatches() {
 }
 
 #[test]
-fn navigate_analysis_pushes_the_analysis_route() {
-  let (mut app, _rx) = app_with_channel();
-
-  app.apply(EngineAction::Navigate(NavTarget::Analysis));
-
-  assert_eq!(app.get_current_route().id, RouteId::Analysis);
-}
-
-#[test]
 fn navigate_miniplayer_toggles() {
   let (mut app, _rx) = app_with_channel();
 
@@ -849,175 +839,12 @@ fn back_pops_the_navigation_stack() {
   assert_eq!(app.get_current_route().id, RouteId::Home);
 }
 
-// --- plugin surfaces ---
-
-#[test]
-fn set_playbar_segment_inserts_and_removes() {
-  let (mut app, _rx) = app_with_channel();
-
-  app.apply(EngineAction::SetPlaybarSegment {
-    plugin: "clock".to_string(),
-    text: Some("12:00".to_string()),
-  });
-  assert_eq!(
-    app.plugin_playbar_segments.get("clock").map(String::as_str),
-    Some("12:00")
-  );
-
-  app.apply(EngineAction::SetPlaybarSegment {
-    plugin: "clock".to_string(),
-    text: None,
-  });
-  assert!(!app.plugin_playbar_segments.contains_key("clock"));
-}
-
-#[test]
-fn show_popup_sets_the_popup() {
-  // The paired scroll reset is pinned by `core/app/plugins.rs` tests, which
-  // can seed the scroll field first.
-  use crate::core::plugin_api::{PluginPopup, PopupLine};
-  let (mut app, _rx) = app_with_channel();
-
-  app.apply(EngineAction::ShowPopup(PluginPopup {
-    title: "Hi".to_string(),
-    lines: vec![PopupLine {
-      text: "line".to_string(),
-      fg: None,
-      bold: false,
-      italic: false,
-    }],
-  }));
-
-  assert_eq!(
-    app.plugin_popup.as_ref().map(|p| p.title.as_str()),
-    Some("Hi")
-  );
-}
-
-#[test]
-fn close_popup_clears_the_popup() {
-  // The paired scroll reset is pinned by `core/app/plugins.rs` tests, which
-  // can seed the scroll field first.
-  let (mut app, _rx) = app_with_channel();
-  app.show_plugin_popup(crate::core::plugin_api::PluginPopup {
-    title: "Hi".to_string(),
-    lines: Vec::new(),
-  });
-
-  app.apply(EngineAction::ClosePopup);
-
-  assert!(app.plugin_popup.is_none());
-}
-
-/// Reverse accessor for the loop test below, exhaustive over `ThemeField`
-/// (the `Theme`-field direction is guarded by the full destructuring inside
-/// `Theme::set`).
-fn theme_color(theme: &Theme, field: ThemeField) -> Color {
-  match field {
-    ThemeField::Active => theme.active,
-    ThemeField::Banner => theme.banner,
-    ThemeField::ErrorBorder => theme.error_border,
-    ThemeField::ErrorText => theme.error_text,
-    ThemeField::Hint => theme.hint,
-    ThemeField::Hovered => theme.hovered,
-    ThemeField::Inactive => theme.inactive,
-    ThemeField::PlaybarBackground => theme.playbar_background,
-    ThemeField::PlaybarProgress => theme.playbar_progress,
-    ThemeField::PlaybarProgressText => theme.playbar_progress_text,
-    ThemeField::PlaybarText => theme.playbar_text,
-    ThemeField::Selected => theme.selected,
-    ThemeField::Text => theme.text,
-    ThemeField::Background => theme.background,
-    ThemeField::Header => theme.header,
-    ThemeField::AnalysisBar => theme.analysis_bar,
-    ThemeField::AnalysisBarText => theme.analysis_bar_text,
-  }
-}
-
-#[test]
-fn set_theme_writes_every_field() {
-  let sentinel = Color::Rgb(1, 2, 3);
-  for field in ThemeField::ALL {
-    let (mut app, _rx) = app_with_channel();
-    assert_ne!(
-      theme_color(&app.user_config.theme, field),
-      sentinel,
-      "sentinel must differ from the default for {}",
-      field.name()
-    );
-
-    app.apply(EngineAction::SetTheme(vec![(field, sentinel)]));
-
-    assert_eq!(
-      theme_color(&app.user_config.theme, field),
-      sentinel,
-      "field {} was not written",
-      field.name()
-    );
-  }
-}
-
-#[test]
-fn theme_field_names_round_trip() {
-  for field in ThemeField::ALL {
-    assert_eq!(ThemeField::from_name(field.name()), Some(field));
-  }
-  assert_eq!(ThemeField::from_name("not_a_field"), None);
-}
-
 #[test]
 fn nav_target_names_round_trip() {
   for target in NavTarget::ALL {
     assert_eq!(NavTarget::from_name(target.name()), Some(target));
   }
   assert_eq!(NavTarget::from_name("nowhere"), None);
-}
-
-#[test]
-fn set_screen_content_inserts() {
-  use crate::core::plugin_api::PluginScreenContent;
-  let (mut app, _rx) = app_with_channel();
-
-  app.apply(EngineAction::SetScreenContent {
-    name: "stats".to_string(),
-    content: PluginScreenContent {
-      title: "Stats".to_string(),
-      widgets: Vec::new(),
-    },
-  });
-
-  assert!(app.plugin_screens.contains_key("stats"));
-}
-
-#[test]
-fn show_screen_pushes_the_plugin_route_and_close_pops() {
-  let (mut app, _rx) = app_with_channel();
-
-  app.apply(EngineAction::ShowScreen("stats".to_string()));
-  assert_eq!(
-    app.get_current_route().id,
-    RouteId::PluginScreen("stats".to_string())
-  );
-
-  // Showing the already-current screen must not stack a second frame. The
-  // scroll reset is pinned by `core/app/plugins.rs` tests.
-  app.apply(EngineAction::ShowScreen("stats".to_string()));
-
-  app.apply(EngineAction::CloseScreen("stats".to_string()));
-  assert_eq!(app.get_current_route().id, RouteId::Home);
-}
-
-#[test]
-fn close_screen_only_pops_when_current() {
-  let (mut app, _rx) = app_with_channel();
-  app.apply(EngineAction::ShowScreen("stats".to_string()));
-
-  app.apply(EngineAction::CloseScreen("other".to_string()));
-
-  assert_eq!(
-    app.get_current_route().id,
-    RouteId::PluginScreen("stats".to_string())
-  );
 }
 
 // --- DJ ---
@@ -1491,8 +1318,7 @@ fn search_stays_on_the_spotify_catalog_when_browsing_other_sources() {
 
   app.apply(EngineAction::Search("daft punk".to_string()));
 
-  // Lua spotatui.search contracted the Web API search; browsing scope does
-  // not reroute it (only SearchActiveSource does).
+  // Browsing scope does not reroute the explicit Web API search.
   assert!(matches!(
     rx.try_recv(),
     Ok(IoEvent::GetSearchResults(q, None)) if q == "daft punk"

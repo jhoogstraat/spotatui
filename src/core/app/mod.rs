@@ -83,7 +83,6 @@ mod playback_routing;
 mod playlist_folders;
 mod playlist_pages;
 mod playlists;
-mod plugins;
 mod queue;
 mod queue_suspend;
 mod route;
@@ -111,7 +110,6 @@ pub(crate) use native_shuffle::base62_id_of;
 
 pub use playlist_folders::*;
 pub use playlists::*;
-pub use plugins::*;
 pub use queue::*;
 pub use route::*;
 pub use scrollable_pages::*;
@@ -511,13 +509,6 @@ pub struct App {
   // Create Playlist form state
   pub create_playlist_tracks: Vec<TrackInfo>,
   pub create_playlist_search_results: Vec<TrackInfo>,
-  pub pending_plugin_commands: Vec<String>,
-  pub plugin_data_generations: PluginDataGenerations,
-  pub plugin_screens:
-    std::collections::BTreeMap<String, crate::core::plugin_api::PluginScreenContent>,
-  pub pending_plugin_screen_keys: Vec<(String, String)>,
-  pub plugin_playbar_segments: std::collections::BTreeMap<String, String>,
-  pub plugin_popup: Option<crate::core::plugin_api::PluginPopup>,
   /// Where this run's log file is being written, resolved once here so draw
   /// code can show it without doing the environment lookup every frame.
   pub log_path: String,

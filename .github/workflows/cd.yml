@@ -31,27 +31,27 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_prefix: linux-x86_64 # most Linux distros
             binary_postfix: ""
-            audio_features: "audio-viz,mpris,local-files,subsonic,internet-radio,youtube"
+            audio_features: "mpris,local-files,subsonic,internet-radio,youtube"
           - os: ubuntu-24.04-arm # free native ARM64 runner for public repos
             target: aarch64-unknown-linux-gnu
             artifact_prefix: linux-aarch64 # Raspberry Pi 4/5, ARM servers, Asahi Linux
             binary_postfix: ""
-            audio_features: "audio-viz,mpris,local-files,subsonic,internet-radio,youtube"
+            audio_features: "mpris,local-files,subsonic,internet-radio,youtube"
           - os: macos-15-intel # Intel runner for x86_64 (available until Aug 2027)
             target: x86_64-apple-darwin
             artifact_prefix: macos-x86_64
             binary_postfix: ""
-            audio_features: "audio-viz-cpal,portaudio-backend,macos-media"
+            audio_features: "portaudio-backend,macos-media"
           - os: macos-latest # Apple Silicon runner for aarch64
             target: aarch64-apple-darwin
             artifact_prefix: macos-aarch64
             binary_postfix: ""
-            audio_features: "audio-viz-cpal,portaudio-backend,macos-media"
+            audio_features: "portaudio-backend,macos-media"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_prefix: windows-x86_64
             binary_postfix: ".exe"
-            audio_features: "audio-viz-cpal,windows-media,local-files,subsonic,internet-radio,youtube"
+            audio_features: "windows-media,local-files,subsonic,internet-radio,youtube"
 
     steps:
       - name: Checkout sources
@@ -66,7 +66,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y -qq pkg-config libssl-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libpipewire-0.3-dev libspa-0.2-dev libasound2-dev
+          sudo apt-get install -y -qq pkg-config libssl-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev
 
       - name: Install cargo-deb
         if: runner.os == 'Linux'
@@ -79,9 +79,9 @@ jobs:
       - name: Build release binary
         run: |
           if [ -z "${{ matrix.audio_features }}" ]; then
-            cargo build --release --target ${{ matrix.target }} --no-default-features --features telemetry,streaming,discord-rpc,cover-art,self-update,scripting,mcp-server,ai-dj
+            cargo build --release --target ${{ matrix.target }} --no-default-features --features telemetry,streaming,discord-rpc,self-update,mcp-server,ai-dj
           else
-            cargo build --release --target ${{ matrix.target }} --no-default-features --features telemetry,streaming,discord-rpc,cover-art,self-update,scripting,mcp-server,ai-dj,${{ matrix.audio_features }}
+            cargo build --release --target ${{ matrix.target }} --no-default-features --features telemetry,streaming,discord-rpc,self-update,mcp-server,ai-dj,${{ matrix.audio_features }}
           fi
         shell: bash
 

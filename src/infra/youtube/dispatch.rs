@@ -39,7 +39,7 @@ use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
 use crate::infra::queue::{advance_index, replay_file};
 use crate::runtime::engine::{
-  DecodedSourceAnswer as Answer, DecodedSourceQuery as Query, FoldAnswer, FoldQuery, Spine,
+  DecodedSourceAnswer as Answer, DecodedSourceQuery as Query, FoldAnswer, FoldQuery,
 };
 
 /// Skip direction within the YouTube queue.

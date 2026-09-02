@@ -37,7 +37,7 @@ impl App {
 
   /// Set volume to an absolute percentage (0-100). Routes through the same
   /// native-streaming fast path and API coalescing logic as the keyboard
-  /// volume keys, so Lua actions behave identically to keypresses.
+  /// volume keys, so all action producers behave identically to keypresses.
   #[allow(dead_code)]
   pub fn set_volume_percent(&mut self, volume: u8) {
     let next_volume = volume.min(100);

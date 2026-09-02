@@ -24,7 +24,6 @@ use anyhow::anyhow;
 use rspotify::model::{
   album::SimplifiedAlbum,
   enums::{Country, RepeatState},
-  idtypes::{EpisodeId, PlayableId, TrackId},
 };
 // `parse_response_code` / `request_token` for the in-TUI login live on this trait.
 use rspotify::clients::OAuthClient;

@@ -9,7 +9,7 @@ You can also point spotatui at a specific config file with `--config <path>`.
 
 All fields are optional; omitted values use the built-in defaults. A complete, commented example lives in [`examples/config.example.yml`](../examples/config.example.yml).
 
-Simple values (numbers, toggles, icons, positions) can also be changed live in the in-app **Settings** screen (see the hint in the top-right of the UI). Press the search key (`/` by default) there to fuzzy-filter the rows by name or by their key in this file, so you can reach a setting without scrolling for it. Structured config — `format:` templates, `tables:` columns, and `playbar_control_labels` — is file-only. Edit the file while the app is closed: saving from the Settings screen rewrites the `behavior`, `theme`, and `keybindings` sections, but your `format:`, `tables:`, and `plugin_commands:` sections survive in-app saves untouched.
+Simple values (numbers, toggles, icons, positions) can also be changed live in the in-app **Settings** screen (see the hint in the top-right of the UI). Press the search key (`/` by default) there to fuzzy-filter the rows by name or by their key in this file. Structured config — `format:` templates, `tables:` columns, and `playbar_control_labels` — is file-only.
 
 Machine-managed runtime state lives separately in `$XDG_STATE_HOME/spotatui/state.yml` when `XDG_STATE_HOME` is set to an absolute path, or `${HOME}/.local/state/spotatui/state.yml` when it is unset or not absolute. This includes volume, shuffle, active source, seen announcements, resized pane dimensions, and saved radio stations. The Spotify OAuth token cache and local listening history also live under the app state directory. Native streaming credentials and audio cache live under `$XDG_CACHE_HOME/spotatui/streaming_cache` when `XDG_CACHE_HOME` is set to an absolute path, or `${HOME}/.cache/spotatui/streaming_cache` when it is unset or not absolute. `sync_token` remains user config and is stored in `config.yml`.
 
@@ -243,9 +243,9 @@ Valid ids and default order per table:
 
 The ▶ now-playing marker attaches to the `title` column, or to the first column if you remove `title`. Sort keyboard shortcuts are unaffected by column layout.
 
-## Keybindings, theme, and plugins
+## Keybindings and theme
 
-The `keybindings:` section rebinds ~40 named actions (`back: q`, `next_track: n`, modifier syntax like `ctrl-s` / `alt-,`), and `theme:` sets a preset plus 16 individual color slots (`"R, G, B"` or named colors) — both are easiest to edit from the in-app Settings screen, which writes them back to this file. `behavior.banner_gradient: false` draws the home-screen banner in the theme's banner color instead of the animated RGB gradient. The Terminal (ANSI) preset defaults this to `false` so the banner follows the terminal palette live (pywal etc.); every other preset defaults to `true`. An explicit `banner_gradient:` value in the config wins over the preset default. `plugin_commands:` maps extra keys to Lua plugin commands. See [`examples/config.example.yml`](../examples/config.example.yml).
+The `keybindings:` section rebinds named actions (`back: q`, `next_track: n`, modifier syntax like `ctrl-s` / `alt-,`), and `theme:` sets a preset plus individual color slots (`"R, G, B"` or named colors). See [`examples/config.example.yml`](../examples/config.example.yml).
 
 ## AI DJ and the MCP server
 

@@ -10,7 +10,6 @@
 
 use anyhow::Result;
 use log::info;
-use rspotify::model::idtypes::Id as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{watch, Mutex};
@@ -266,8 +265,7 @@ impl Runtime {
       ));
     }
 
-    // The tick thread owns `Driver`, which is deliberately `!Send` (the Lua
-    // Runtime state is thread-local. Run it on a dedicated OS thread with
+    // The tick thread owns `Driver`, which is deliberately `!Send`. Run it on a dedicated OS thread with
     // a current-thread reactor; everything it shares (`Arc<Mutex<App>>`, the
     // shutdown watch, the tick-wake notify) is `Send`.
     let (tick_done_tx, tick_done_rx) = tokio::sync::oneshot::channel::<()>();

@@ -21,7 +21,6 @@
     openssl
     alsa-lib
     dbus
-    pipewire
   ];
 
   postFixup = ''
@@ -30,7 +29,6 @@
       pkgs.openssl
       pkgs.alsa-lib
       pkgs.dbus
-      pkgs.pipewire
     ]}" \
     $out/bin/spotatui
   '';

@@ -53,7 +53,6 @@ Love customization? Add a new theme preset! Check out `ThemePreset` in `src/core
 2. Install platform dependencies from [Development](README.md#development):
    - OpenSSL
    - `xorg-dev` (Linux; clipboard support)
-   - PipeWire dev libraries (Linux; audio visualization)
    - `portaudio` via Homebrew (macOS)
 3. Clone your fork and create a topic branch from `main`
 

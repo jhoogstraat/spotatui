@@ -68,7 +68,6 @@ This table shows what is possible with the Spotify API, what is implemented, and
 | shuffle | ✅ | Toggle shuffle | Yes |
 | **Other** |
 | recommendations | ⚠️ | Get recommendations — **403 for any app registered after 2024-11-27** ([announcement](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api)). spotatui users register their own client ID, so this is effectively dead for new users; the AI DJ deliberately does not use it and has the model do the recommending instead | Yes |
-| audio_analysis | ❌ | Get audio analysis (visualization now uses local FFT, not this endpoint) | Yes |
 | featured_playlists | ❌ | Get featured playlists | Yes |
 | new_releases | ❌ | Get new releases | Yes |
 | categories | ❌ | Get categories | Yes |
