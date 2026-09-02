@@ -73,23 +73,26 @@ impl App {
         let country = self.get_user_country();
         self.dispatch(IoEvent::GetSearchResults(query, country));
       }
-      EngineAction::SearchActiveSource(query) => match self.active_source {
-        crate::core::source::Source::Subsonic => {
-          self.dispatch(IoEvent::GetSubsonicSearchResults(query));
+      EngineAction::SearchActiveSource(query) => {
+        self.catalog_query = Some(query.clone());
+        match self.active_source {
+          crate::core::source::Source::Subsonic => {
+            self.dispatch(IoEvent::GetSubsonicSearchResults(query));
+          }
+          crate::core::source::Source::Radio => {
+            self.dispatch(IoEvent::GetRadioSearchResults(query));
+          }
+          crate::core::source::Source::YouTube => {
+            self.dispatch(IoEvent::GetYouTubeSearchResults(query));
+          }
+          // Spotify and Local both land on the Web API search, exactly like
+          // the search input's if-chain (which has no Local branch).
+          crate::core::source::Source::Spotify | crate::core::source::Source::Local => {
+            let country = self.get_user_country();
+            self.dispatch(IoEvent::GetSearchResults(query, country));
+          }
         }
-        crate::core::source::Source::Radio => {
-          self.dispatch(IoEvent::GetRadioSearchResults(query));
-        }
-        crate::core::source::Source::YouTube => {
-          self.dispatch(IoEvent::GetYouTubeSearchResults(query));
-        }
-        // Spotify and Local both land on the Web API search, exactly like
-        // the search input's if-chain (which has no Local branch).
-        crate::core::source::Source::Spotify | crate::core::source::Source::Local => {
-          let country = self.get_user_country();
-          self.dispatch(IoEvent::GetSearchResults(query, country));
-        }
-      },
+      }
       EngineAction::SearchPlaylistTracks { playlist_id, query } => {
         self.pending_playlist_track_search = Some(query.clone());
         self.set_status_message(format!("Searching playlist for \"{query}\"..."), 60);
@@ -167,7 +170,10 @@ impl App {
           self.dispatch(IoEvent::GetAlbumForTrack(track_id));
         }
       },
-      EngineAction::OpenLibrary(target) => self.open_library_section(target),
+      EngineAction::OpenLibrary(target) => {
+        self.catalog_library_target = Some(target);
+        self.open_library_section(target);
+      }
       EngineAction::SelectSource(source) => self.set_active_source(source),
       EngineAction::OpenAddTrackDialog => self.begin_add_track_to_playlist_flow_from_selection(),
       EngineAction::OpenRemoveTrackDialog => self.begin_remove_track_from_playlist_flow(),

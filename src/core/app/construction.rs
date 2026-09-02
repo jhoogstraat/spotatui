@@ -3,6 +3,8 @@ use super::*;
 impl Default for App {
   fn default() -> Self {
     App {
+      catalog_query: None,
+      catalog_library_target: None,
       album_table_context: AlbumTableContext::Full,
       discover_top_tracks: vec![],
       discover_artists_mix: vec![],

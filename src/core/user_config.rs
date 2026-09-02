@@ -2127,17 +2127,6 @@ mod tests {
   }
 
   #[test]
-  fn test_reserved_key() {
-    use super::check_reserved_keys;
-    use crate::core::input::Key;
-
-    assert!(
-      check_reserved_keys(Key::Enter).is_err(),
-      "Enter key should be reserved"
-    );
-  }
-
-  #[test]
   fn test_startup_behavior_deserialization() {
     use super::{BehaviorConfigString, StartupBehavior};
 
@@ -2805,15 +2794,6 @@ impl StartupBehavior {
   pub fn options() -> &'static [&'static str] {
     &["Continue", "Play", "Pause"]
   }
-
-  #[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted settings screen.
-  pub fn from_name(name: &str) -> Self {
-    match name {
-      "Play" => StartupBehavior::Play,
-      "Pause" => StartupBehavior::Pause,
-      _ => StartupBehavior::Continue,
-    }
-  }
 }
 
 fn parse_key(key: String) -> Result<Key> {
@@ -2890,42 +2870,6 @@ fn parse_key(key: String) -> Result<Key> {
       }
     }
   }
-}
-
-/// Public version of parse_key for use in app.rs
-#[allow(dead_code)] // TEMPORARY (ticket 02): caller was the deleted keybinding UI.
-pub fn parse_key_public(key: String) -> Result<Key> {
-  parse_key(key)
-}
-
-fn check_reserved_keys(key: Key) -> Result<()> {
-  let reserved = [
-    Key::Char('H'),
-    Key::Char('M'),
-    Key::Char('L'),
-    Key::Up,
-    Key::Down,
-    Key::Left,
-    Key::Right,
-    Key::Backspace,
-    Key::Enter,
-  ];
-  for item in reserved.iter() {
-    if key == *item {
-      // TODO: Add pretty print for key
-      return Err(anyhow!(
-        "The key {:?} is reserved and cannot be remapped",
-        key
-      ));
-    }
-  }
-  Ok(())
-}
-
-/// Public version of check_reserved_keys for use in handlers
-#[allow(dead_code)] // TEMPORARY (ticket 01): handler consumers were TUI-only.
-pub fn check_reserved_keys_public(key: Key) -> Result<()> {
-  check_reserved_keys(key)
 }
 
 #[derive(Clone)]

@@ -160,6 +160,7 @@ impl App {
   pub fn open_library_section(&mut self, target: crate::core::action::LibraryTarget) {
     use crate::core::action::LibraryTarget;
     match target {
+      LibraryTarget::Playlists => {}
       LibraryTarget::Discover => {
         self.push_navigation_stack(RouteId::Discover, ActiveBlock::Discover);
       }

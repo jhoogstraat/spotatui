@@ -115,6 +115,9 @@ pub use settings_schema::*;
 pub use status::*;
 
 pub struct App {
+  /// Catalog request intent folded from the public action vocabulary.
+  pub(crate) catalog_query: Option<String>,
+  pub(crate) catalog_library_target: Option<crate::core::action::LibraryTarget>,
   /// What the user actually wants the volume to be. We keep this around until
   /// Spotify's API comes back with the same value — otherwise a slow poll
   /// response can flash the old volume back on screen.

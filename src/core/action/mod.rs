@@ -318,6 +318,7 @@ pub enum OpenTarget {
 /// Library sidebar sections reachable through [`EngineAction::OpenLibrary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LibraryTarget {
+  Playlists,
   Discover,
   RecentlyPlayed,
   Stats,
@@ -334,7 +335,8 @@ pub enum LibraryTarget {
 impl LibraryTarget {
   /// Every target, in the stable subset order of `library_options()`
   /// (feature-gated rows are appended there and matched by name).
-  pub const ALL: [LibraryTarget; 9] = [
+  pub const ALL: [LibraryTarget; 10] = [
+    LibraryTarget::Playlists,
     LibraryTarget::Discover,
     LibraryTarget::RecentlyPlayed,
     LibraryTarget::Stats,
@@ -349,6 +351,7 @@ impl LibraryTarget {
   /// The exact `library_options()` sidebar label for this target.
   pub fn name(self) -> &'static str {
     match self {
+      LibraryTarget::Playlists => "Playlists",
       LibraryTarget::Discover => "Discover",
       LibraryTarget::RecentlyPlayed => "Recently Played",
       LibraryTarget::Stats => "Stats",

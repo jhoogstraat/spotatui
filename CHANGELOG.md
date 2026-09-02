@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The maintained application fork now serves as an embedded, event-driven playback engine for the GPUI player. Terminal UI, Lua plugins, Party mode, visualization, and their presentation-only settings have been removed; playback timing now uses named one-shot deadlines and publishes deduplicated immutable snapshots.
+
 ### Added
 
 - **Fuzzy filter for the Settings screen**: Press the search key (`/` by default) in Settings to filter the rows instead of scrolling for one. The query is a fuzzy subsequence, so its characters only have to appear in order: `volinc` finds **Volume Increment** and `skms` finds **Seek Duration (ms)**. Rows match on their name and on their `config.yml` key, and are ranked best-first with the matched characters highlighted, so every row the filter leaves shows why it is there. `Enter` applies the filter, `Esc` clears it before it means "leave Settings", and the filter survives `←`/`→` so one query can be walked across tabs. It reuses the Help menu's filter input, so the editing keys (`Ctrl+W`, `Ctrl+U`, `Backspace`) are the same on both screens ([#469](https://github.com/LargeModGames/spotatui/issues/469)).

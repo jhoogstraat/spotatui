@@ -52,6 +52,9 @@ pub struct Snapshot {
   pub playback: Option<PlaybackState>,
   /// The user's Spotify library data fetched so far.
   pub library: LibrarySnapshot,
+  /// Catalog request intent, folded with the action that initiated it.
+  pub search_query: Option<String>,
+  pub library_target: Option<LibraryTarget>,
   /// Authoritative position at publish time (`None` while stale).
   pub position_ms: Option<u64>,
   /// When this snapshot was folded from engine state; a frontend projects
@@ -458,6 +461,8 @@ impl Default for Snapshot {
     Snapshot {
       playback: None,
       library: LibrarySnapshot::default(),
+      search_query: None,
+      library_target: None,
       position_ms: None,
       as_of: Instant::now(),
       queue_upcoming: Vec::new(),
@@ -507,6 +512,8 @@ pub(crate) async fn spawn_fold(
   let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Snapshot {
     playback: None,
     library: Default::default(),
+    search_query: None,
+    library_target: None,
     position_ms: None,
     as_of: std::time::Instant::now(),
     queue_upcoming: Vec::new(),
@@ -769,15 +776,20 @@ async fn publish(
   catalog: &mut CatalogPublication,
 ) {
   let guard = app.lock().await;
-  let next = {
+  let mut next = {
     let previous = tx.borrow();
     catalog.revise(build_snapshot(&guard), &previous)
   };
   drop(guard);
   tx.send_if_modified(|current| {
+    // `as_of` describes an accepted publication, not engine content. Ignore
+    // its freshly sampled value while deciding whether content changed.
+    let published_at = next.as_of;
+    next.as_of = current.as_of;
     if *current == next {
       false
     } else {
+      next.as_of = published_at;
       *current = next;
       true
     }
@@ -3180,6 +3192,8 @@ fn build_snapshot(app: &App) -> Snapshot {
         .as_ref()
         .map(|_| Arc::from(crate::core::plugin_api::playlists_snapshot(app))),
     },
+    search_query: app.catalog_query.clone(),
+    library_target: app.catalog_library_target,
     position_ms: app.playback_position_ms().map(|p| p as u64),
     queue_upcoming: app.native_queue.clone(),
     search_tracks: search.tracks.into(),
@@ -3272,6 +3286,49 @@ mod tests {
       .expect("action fact should publish")
       .unwrap();
     assert_eq!(snapshots.borrow().notice.as_deref(), Some("folded"));
+  }
+
+  #[tokio::test]
+  async fn identical_visible_state_does_not_publish_a_fresh_timestamp() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+    let fact = || {
+      crate::runtime::engine::EngineEvent::Session(crate::runtime::engine::SessionFact::Status {
+        message: "same".into(),
+        ttl_secs: 5,
+        is_error: false,
+      })
+    };
+    spine.emit(fact()).await;
+    snapshots.changed().await.unwrap();
+    spine.emit(fact()).await;
+    assert!(
+      tokio::time::timeout(std::time::Duration::from_millis(20), snapshots.changed())
+        .await
+        .is_err()
+    );
+  }
+
+  #[tokio::test]
+  async fn catalog_request_intent_is_folded_into_the_snapshot() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+    spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::ApplyAction(
+          crate::core::action::EngineAction::OpenLibrary(
+            crate::core::action::LibraryTarget::Playlists,
+          ),
+        ),
+      ))
+      .await;
+    snapshots.changed().await.unwrap();
+    assert_eq!(
+      snapshots.borrow().library_target,
+      Some(crate::core::action::LibraryTarget::Playlists)
+    );
   }
 
   #[tokio::test]
