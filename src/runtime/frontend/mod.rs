@@ -601,7 +601,6 @@ async fn driver_loop(
   {
     let mut app = app.lock().await;
     app.flush_persisted_session_force();
-    driver.on_quit(&mut app);
   }
   // Persistence scheduling is fold-owned; producers only request the flush.
   let _ = spine
