@@ -936,6 +936,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     if let Some(event_rx) = mpris.take_event_rx() {
       let mpris_for_seek = Arc::clone(mpris);
       let app_for_mpris = Arc::clone(&app);
+      let spine_for_mpris = ctx.spine.clone();
       tokio::spawn(async move {
         handle_mpris_events(
           event_rx,
@@ -943,6 +944,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
           shared_position_for_mpris,
           mpris_for_seek,
           app_for_mpris,
+          spine_for_mpris,
         )
         .await;
       });
@@ -1429,6 +1431,7 @@ async fn handle_mpris_events(
   shared_position: Arc<AtomicU64>,
   mpris_manager: Arc<mpris::MprisManager>,
   app: Arc<Mutex<App>>,
+  spine: Spine,
 ) {
   use mpris::MprisEvent;
   #[cfg(feature = "streaming")]
@@ -1484,9 +1487,9 @@ async fn handle_mpris_events(
             .unwrap_or(false)
         });
         if is_playing {
-          app_lock.dispatch(IoEvent::PausePlayback);
+          emit_control(&spine, IoEvent::PausePlayback).await;
         } else {
-          app_lock.dispatch(IoEvent::StartPlayback(None, None, None));
+          emit_control(&spine, IoEvent::StartPlayback(None, None, None)).await;
         }
       }
       MprisEvent::Play => {
@@ -1497,7 +1500,7 @@ async fn handle_mpris_events(
           continue;
         }
         let mut app_lock = app.lock().await;
-        app_lock.dispatch(IoEvent::StartPlayback(None, None, None));
+        emit_control(&spine, IoEvent::StartPlayback(None, None, None)).await;
       }
       MprisEvent::Pause => {
         #[cfg(feature = "streaming")]
@@ -1507,7 +1510,7 @@ async fn handle_mpris_events(
           continue;
         }
         let mut app_lock = app.lock().await;
-        app_lock.dispatch(IoEvent::PausePlayback);
+        emit_control(&spine, IoEvent::PausePlayback).await;
       }
       MprisEvent::Next => {
         #[cfg(feature = "streaming")]
@@ -1517,7 +1520,7 @@ async fn handle_mpris_events(
           continue;
         }
         let mut app_lock = app.lock().await;
-        app_lock.dispatch(IoEvent::NextTrack);
+        emit_control(&spine, IoEvent::NextTrack).await;
       }
       MprisEvent::Previous => {
         #[cfg(feature = "streaming")]
@@ -1527,7 +1530,7 @@ async fn handle_mpris_events(
           continue;
         }
         let mut app_lock = app.lock().await;
-        app_lock.dispatch(IoEvent::PreviousTrack);
+        emit_control(&spine, IoEvent::PreviousTrack).await;
       }
       MprisEvent::Stop => {
         #[cfg(feature = "streaming")]
@@ -1537,7 +1540,7 @@ async fn handle_mpris_events(
           continue;
         }
         let mut app_lock = app.lock().await;
-        app_lock.dispatch(IoEvent::PausePlayback);
+          emit_control(&spine, IoEvent::PausePlayback).await;
       }
       MprisEvent::Seek(offset_micros) => {
         // MPRIS sends relative offset in microseconds (can be negative for rewind)
@@ -1561,7 +1564,7 @@ async fn handle_mpris_events(
         let offset_ms = offset_micros / 1000;
         let new_position_ms = (current_ms + offset_ms).max(0) as u32;
         app_lock.song_progress_ms = new_position_ms as u128;
-        app_lock.dispatch(IoEvent::Seek(new_position_ms));
+        emit_control(&spine, IoEvent::Seek(new_position_ms)).await;
         drop(app_lock);
         mpris_manager.emit_seeked(new_position_ms as u64);
       }
@@ -1582,7 +1585,7 @@ async fn handle_mpris_events(
         // Fallback: dispatch Seek IoEvent
         let mut app_lock = app.lock().await;
         app_lock.song_progress_ms = new_position_ms as u128;
-        app_lock.dispatch(IoEvent::Seek(new_position_ms));
+        emit_control(&spine, IoEvent::Seek(new_position_ms)).await;
         drop(app_lock);
         mpris_manager.emit_seeked(new_position_ms as u64);
       }
@@ -1615,7 +1618,7 @@ async fn handle_mpris_events(
         app_lock.schedule_state_save(crate::core::state::PersistedRuntimeState::shuffle_enabled(
           shuffle,
         ));
-        app_lock.dispatch(IoEvent::Shuffle(shuffle));
+        emit_control(&spine, IoEvent::Shuffle(shuffle)).await;
       }
       MprisEvent::SetLoopStatus(loop_status) => {
         use mpris::LoopStatusEvent;
@@ -1646,7 +1649,7 @@ async fn handle_mpris_events(
         if let Some(ref mut ctx) = app_lock.current_playback_context {
           ctx.repeat_state = repeat_state;
         }
-        app_lock.dispatch(IoEvent::Repeat(repeat_state));
+        emit_control(&spine, IoEvent::Repeat(repeat_state)).await;
       }
       MprisEvent::SetVolume(volume_percent) => {
         let mut app_lock = app.lock().await;
