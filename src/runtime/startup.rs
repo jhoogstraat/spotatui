@@ -18,6 +18,7 @@ use crate::infra::mpris;
 #[cfg(feature = "streaming")]
 use crate::infra::network::requests::spotify_get_typed_compat_for_with_refresh;
 use crate::infra::network::{IoEvent, Network};
+use crate::runtime::engine::{EngineEvent, SessionFact, Spine};
 #[cfg(feature = "streaming")]
 use crate::infra::player;
 use anyhow::Result;
@@ -43,6 +44,14 @@ use std::sync::Arc;
 ))]
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Queue an OS-originated control through the fold's ordered event spine.
+/// Integrations do not mutate `App` or bypass producer ordering.
+async fn emit_control(spine: &Spine, event: IoEvent) {
+  spine
+    .emit(EngineEvent::Session(SessionFact::DispatchIo(vec![event])))
+    .await;
+}
 
 #[cfg(feature = "discord-rpc")]
 type DiscordRpcHandle = Option<discord_rpc::DiscordRpcManager>;
