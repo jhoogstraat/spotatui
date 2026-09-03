@@ -22,16 +22,19 @@
 
 use super::executor::AppExecutor;
 use super::server;
-use crate::core::app::App;
 use crate::infra::network::IoEvent;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+#[cfg(test)]
+use crate::core::app::App;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
+use tokio::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 const HANDSHAKE_FILE: &str = "mcp.json";
 /// Overrides the handshake file location so a test does not write into the
@@ -142,7 +145,6 @@ fn generate_token() -> Result<String> {
 /// gets its own task and its own [`server::Session`], so the per-connection era
 /// latch cannot leak between two different agents talking to us at once.
 pub async fn spawn_listener(
-  app: Arc<Mutex<App>>,
   io_tx: Sender<IoEvent>,
   spine: crate::runtime::engine::Spine,
 ) -> Result<u16> {
@@ -179,12 +181,11 @@ pub async fn spawn_listener(
         log::warn!("MCP: refusing non-loopback connection from {peer}");
         continue;
       }
-      let app = Arc::clone(&app);
       let io_tx = io_tx.clone();
       let spine = spine.clone();
       let token = token.clone();
       tokio::spawn(async move {
-        if let Err(e) = serve_connection(stream, app, io_tx, spine, token, HANDSHAKE_TIMEOUT).await
+        if let Err(e) = serve_connection(stream, io_tx, spine, token, HANDSHAKE_TIMEOUT).await
         {
           log::debug!("MCP: connection ended: {e}");
         }
@@ -201,7 +202,6 @@ pub async fn spawn_listener(
 /// testable without manipulating the clock.
 async fn serve_connection(
   stream: TcpStream,
-  app: Arc<Mutex<App>>,
   io_tx: Sender<IoEvent>,
   spine: crate::runtime::engine::Spine,
   expected_token: String,
@@ -392,7 +392,7 @@ mod tests {
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let app = Arc::new(Mutex::new(App::default()));
     let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
-    let port = spawn_listener(app, io_tx, spine)
+    let port = spawn_listener(io_tx, spine)
       .await
       .expect("listener should bind");
 

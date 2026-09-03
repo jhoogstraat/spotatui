@@ -775,7 +775,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     if enabled {
       match io_tx {
         Some(io_tx) => {
-          match crate::infra::mcp::spawn_listener(Arc::clone(&app), io_tx, ctx.spine.clone()).await
+          match crate::infra::mcp::spawn_listener(io_tx, ctx.spine.clone()).await
           {
             Ok(port) => {
               let mut app_mut = app.lock().await;
