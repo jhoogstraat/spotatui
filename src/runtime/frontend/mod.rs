@@ -794,6 +794,25 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
       })
     }
     EngineEvent::Catalog(CatalogStateEvent::PlaylistTracksPageUpserted { .. }) => {
@@ -808,6 +827,25 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
       })
     }
     EngineEvent::Session(crate::runtime::engine::SessionFact::ApplyAction(action)) => {
@@ -817,6 +855,198 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: Some(app.apply(action.clone())),
         #[cfg(feature = "streaming")]
         native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
+      })
+    }
+    #[cfg(feature = "streaming")]
+    EngineEvent::Decoded(crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
+      track,
+    }) => {
+      let popped = if app.native_queue.first() == Some(track) {
+        Some(app.native_queue.remove(0))
+      } else {
+        None
+      };
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: None,
+        native: None,
+        queue_track: popped,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
+      })
+    }
+    #[cfg(any(feature = "subsonic", feature = "youtube"))]
+    EngineEvent::Decoded(crate::runtime::engine::DecodedSourceFact::QueueFetchClaimed {
+      fetch_id,
+    }) => {
+      let claim = app.queue_now.as_ref().and_then(|slot| match slot {
+        crate::infra::queue::QueueNowPlaying::Decoded(decoded) if decoded.fetch_id == *fetch_id => {
+          Some(crate::runtime::engine::QueueFetchClaim {
+            player: std::sync::Arc::clone(&decoded.player),
+            volume: app.runtime_state.volume_percent,
+            lease: std::sync::Arc::clone(&decoded.lease),
+          })
+        }
+        _ => None,
+      });
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: None,
+        #[cfg(feature = "streaming")]
+        native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        queue_fetch_claim: claim,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
+      })
+    }
+    #[cfg(any(
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube",
+      feature = "internet-radio"
+    ))]
+    EngineEvent::Decoded(crate::runtime::engine::DecodedSourceFact::ClaimBackendPlayers {
+      keep,
+    }) => {
+      let claim = crate::runtime::engine::ClaimedBackendPlayers {
+        #[cfg(feature = "streaming")]
+        streaming: app.streaming_player.clone(),
+        #[cfg(feature = "local-files")]
+        local: app
+          .local_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+        #[cfg(feature = "subsonic")]
+        subsonic: app
+          .subsonic_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+        #[cfg(feature = "internet-radio")]
+        radio: app
+          .radio_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+        #[cfg(feature = "youtube")]
+        youtube: app
+          .youtube_playback
+          .as_ref()
+          .map(|s| std::sync::Arc::clone(&s.player)),
+      };
+      #[cfg(feature = "local-files")]
+      if *keep != Some(crate::core::source::Source::Local) {
+        app.local_playback.take();
+      }
+      #[cfg(feature = "subsonic")]
+      if *keep != Some(crate::core::source::Source::Subsonic) {
+        app.subsonic_playback.take();
+      }
+      #[cfg(feature = "internet-radio")]
+      if *keep != Some(crate::core::source::Source::Radio) {
+        app.radio_playback.take();
+      }
+      #[cfg(feature = "youtube")]
+      if *keep != Some(crate::core::source::Source::YouTube) {
+        app.youtube_playback.take();
+      }
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: None,
+        #[cfg(feature = "streaming")]
+        native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        backend_players: Some(claim),
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
+      })
+    }
+    #[cfg(any(
+      feature = "streaming",
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube",
+      feature = "internet-radio"
+    ))]
+    EngineEvent::Decoded(crate::runtime::engine::DecodedSourceFact::QueueTakeSuspended) => {
+      let suspended = app.queue_suspended.take();
+      Some(FoldAck {
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: None,
+        #[cfg(feature = "streaming")]
+        native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        queue_suspended: Some(suspended),
       })
     }
     _ => {
@@ -834,6 +1064,24 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
             next_playlist_tracks_offset: None,
             action_outcome: None,
             native: Some(native),
+            queue_track: None,
+            #[cfg(any(
+              feature = "local-files",
+              feature = "subsonic",
+              feature = "youtube",
+              feature = "internet-radio"
+            ))]
+            backend_players: None,
+            #[cfg(any(feature = "subsonic", feature = "youtube"))]
+            queue_fetch_claim: None,
+            #[cfg(any(
+              feature = "streaming",
+              feature = "local-files",
+              feature = "subsonic",
+              feature = "youtube",
+              feature = "internet-radio"
+            ))]
+            queue_suspended: None,
           });
         }
         _ => fold_one(app, &event),
@@ -844,6 +1092,25 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
       })
     }
   }
@@ -1021,7 +1288,183 @@ pub(crate) fn apply_decoded_source_fact(
   fact: crate::runtime::engine::DecodedSourceFact,
 ) {
   use crate::runtime::engine::DecodedSourceFact;
+
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  fn revoke_decoded_slot(app: &mut App) {
+    if let Some(crate::infra::queue::QueueNowPlaying::Decoded(decoded)) = app.queue_now.as_ref() {
+      decoded.lease.revoke();
+    }
+  }
+
+  #[cfg(feature = "streaming")]
+  fn pop_native_queue(
+    app: &mut App,
+    expected: &crate::core::plugin_api::TrackInfo,
+  ) -> Option<crate::core::plugin_api::TrackInfo> {
+    if app.native_queue.first() == Some(expected) {
+      Some(app.native_queue.remove(0))
+    } else {
+      None
+    }
+  }
+
   match fact {
+    #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+    DecodedSourceFact::QueuePendingDecoded {
+      player,
+      track,
+      fetch_id,
+    } => {
+      #[cfg(any(feature = "subsonic", feature = "youtube"))]
+      revoke_decoded_slot(app);
+      #[cfg(feature = "streaming")]
+      if app.queue_now_is_spotify() {
+        app.invalidate_spotify_queue_slot();
+      } else if let Some(lease) = app.queue_slot_lease.take() {
+        lease.revoke();
+        app.queue_slot_generation = app.queue_slot_generation.wrapping_add(1);
+      }
+      app.queue_now = Some(crate::infra::queue::QueueNowPlaying::Decoded(
+        crate::infra::queue::DecodedQueuePlayback {
+          player,
+          track,
+          advancing: true,
+          fetch_id,
+          #[cfg(any(feature = "subsonic", feature = "youtube"))]
+          lease: std::sync::Arc::new(crate::runtime::engine::QueueFetchLease::new()),
+          #[cfg(any(feature = "subsonic", feature = "youtube"))]
+          tempfile: None,
+        },
+      ));
+    }
+    #[cfg(feature = "local-files")]
+    DecodedSourceFact::QueueDecodedLocalReady { fetch_id } => {
+      let name = app.queue_now.as_ref().and_then(|slot| match slot {
+        crate::infra::queue::QueueNowPlaying::Decoded(decoded) if decoded.fetch_id == fetch_id => {
+          Some(decoded.track.name.clone())
+        }
+        _ => None,
+      });
+      if let Some(crate::infra::queue::QueueNowPlaying::Decoded(decoded)) = app.queue_now.as_mut() {
+        if decoded.fetch_id == fetch_id {
+          decoded.advancing = false;
+        }
+      }
+      if let Some(name) = name {
+        app.set_status_message(format!("\u{266a} {name} (queue)"), 4);
+      }
+    }
+    #[cfg(feature = "streaming")]
+    DecodedSourceFact::QueueSpotifyPublished(track) => {
+      #[cfg(any(feature = "subsonic", feature = "youtube"))]
+      revoke_decoded_slot(app);
+      #[cfg(feature = "streaming")]
+      if let Some(lease) = app.queue_slot_lease.take() {
+        lease.revoke();
+      }
+      app.queue_slot_generation = app.queue_slot_generation.wrapping_add(1);
+      app.queue_slot_lease = Some(std::sync::Arc::new(
+        crate::runtime::engine::QueueFetchLease::new(),
+      ));
+      app.queue_now = Some(crate::infra::queue::QueueNowPlaying::Spotify { track });
+      app.spotify_queue_guard_reloads = 0;
+      app.queue_slot_desired_playing = true;
+    }
+    #[cfg(feature = "streaming")]
+    DecodedSourceFact::QueueSpotifyCleared => {
+      app.invalidate_spotify_queue_slot();
+    }
+    #[cfg(feature = "streaming")]
+    DecodedSourceFact::QueueTransportIntent {
+      generation,
+      is_playing,
+    } => {
+      if app.queue_slot_generation == generation && app.queue_now_is_spotify() {
+        app.queue_slot_desired_playing = is_playing;
+        app.set_native_playback_intent(is_playing);
+      }
+    }
+    #[cfg(feature = "streaming")]
+    DecodedSourceFact::QueueSpotifyPausedRestored { generation } => {
+      if app.queue_slot_generation == generation
+        && app.queue_now_is_spotify()
+        && !app.queue_slot_desired_playing
+      {
+        app.native_is_playing = Some(false);
+      }
+    }
+    #[cfg(feature = "streaming")]
+    DecodedSourceFact::QueueNativeTrackPopped { track } => {
+      let _ = pop_native_queue(app, &track);
+    }
+    #[cfg(any(
+      feature = "streaming",
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube"
+    ))]
+    DecodedSourceFact::QueuePlaybackCleared => {
+      app.queue_suspended = None;
+      #[cfg(feature = "streaming")]
+      {
+        let had_spotify = app.queue_now_is_spotify();
+        app.invalidate_spotify_queue_slot();
+        if !had_spotify && app.queue_now.is_some() {
+          app.queue_slot_generation = app.queue_slot_generation.wrapping_add(1);
+        }
+      }
+      if let Some(slot) = app.queue_now.take() {
+        #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+        if let crate::infra::queue::QueueNowPlaying::Decoded(decoded) = slot {
+          #[cfg(any(feature = "subsonic", feature = "youtube"))]
+          decoded.lease.revoke();
+          decoded.player.stop();
+        }
+        #[cfg(not(any(feature = "local-files", feature = "subsonic", feature = "youtube")))]
+        let _ = slot;
+      }
+    }
+    #[cfg(any(
+      feature = "streaming",
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube"
+    ))]
+    DecodedSourceFact::QueueSlotCleared => {
+      #[cfg(feature = "streaming")]
+      {
+        let had_spotify = app.queue_now_is_spotify();
+        app.invalidate_spotify_queue_slot();
+        if !had_spotify && app.queue_now.is_some() {
+          app.queue_slot_generation = app.queue_slot_generation.wrapping_add(1);
+        }
+      }
+      if let Some(slot) = app.queue_now.take() {
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        if let crate::infra::queue::QueueNowPlaying::Decoded(decoded) = &slot {
+          decoded.lease.revoke();
+        }
+        #[cfg(not(any(feature = "subsonic", feature = "youtube")))]
+        let _ = slot;
+      }
+    }
+    #[cfg(any(
+      feature = "streaming",
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube",
+      feature = "internet-radio"
+    ))]
+    DecodedSourceFact::QueueTakeSuspended => {}
+    #[cfg(any(feature = "subsonic", feature = "youtube"))]
+    DecodedSourceFact::QueueFetchClaimed { .. } => {}
+    #[cfg(any(
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube",
+      feature = "internet-radio"
+    ))]
+    DecodedSourceFact::ClaimBackendPlayers { .. } => {}
     #[cfg(feature = "local-files")]
     DecodedSourceFact::LocalPlaylists(items) => app.local_playlists = items,
     #[cfg(feature = "local-files")]
@@ -1155,6 +1598,55 @@ pub(crate) fn apply_decoded_source_fact(
         s.player.stop();
       }
     }
+    #[cfg(feature = "internet-radio")]
+    DecodedSourceFact::RadioResume(station) => {
+      if let Some(uri) = station.uri.clone() {
+        app.track_table.tracks = vec![station];
+        app.dispatch(crate::infra::network::IoEvent::StartPlayback(
+          Some(uri),
+          None,
+          None,
+        ));
+      }
+    }
+    #[cfg(any(feature = "subsonic", feature = "youtube"))]
+    DecodedSourceFact::QueueFetchCompleted { fetch_id, result } => {
+      use crate::infra::queue::QueueNowPlaying;
+      // The slot may have been skipped, torn down, or replaced while the
+      // worker was downloading. Only the matching generation may publish.
+      let Some(QueueNowPlaying::Decoded(decoded)) = app.queue_now.as_mut() else {
+        return;
+      };
+      if decoded.fetch_id != fetch_id {
+        return;
+      }
+      match result {
+        crate::runtime::engine::QueueFetchResult::Success(tempfile) => {
+          decoded.tempfile = Some(tempfile);
+          decoded.advancing = false;
+          let name = decoded.track.name.clone();
+          let _ = decoded;
+          app.set_status_message(format!("\u{266a} {name} (queue)"), 4);
+        }
+        crate::runtime::engine::QueueFetchResult::Empty => {
+          let name = decoded.track.name.clone();
+          let _ = decoded;
+          app.set_status_message(format!("Cannot play {name}: audio is empty"), 4);
+          app.dispatch(crate::infra::network::IoEvent::AdvanceNativeQueue);
+        }
+        crate::runtime::engine::QueueFetchResult::Failure(message) => {
+          let _ = decoded;
+          app.set_status_message(message, 4);
+          app.dispatch(crate::infra::network::IoEvent::AdvanceNativeQueue);
+        }
+        crate::runtime::engine::QueueFetchResult::Cancelled
+        | crate::runtime::engine::QueueFetchResult::Superseded => {
+          decoded.advancing = false;
+          let _ = decoded;
+          app.dispatch(crate::infra::network::IoEvent::AdvanceNativeQueue);
+        }
+      }
+    }
     #[cfg(feature = "youtube")]
     DecodedSourceFact::YouTubePlaylists(items) => app.youtube_playlists = items,
     #[cfg(feature = "youtube")]
@@ -1169,6 +1661,34 @@ pub(crate) fn apply_decoded_source_fact(
     DecodedSourceFact::YouTubePlaybackCleared => {
       if let Some(s) = app.youtube_playback.take() {
         s.player.stop();
+      }
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeStatus { message, ttl_secs } => {
+      app.set_status_message(message, ttl_secs);
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeAdvancing(value) => {
+      if let Some(session) = app.youtube_playback.as_mut() {
+        session.advancing = value;
+      }
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeIndex { target, tempfile } => {
+      let display = app.youtube_playback.as_mut().and_then(|session| {
+        session.index = target;
+        session.advancing = false;
+        session.tempfile = tempfile;
+        session.tracks.get(target).map(|track| track.name.clone())
+      });
+      if let Some(display) = display {
+        app.set_status_message(format!("\u{266a} {display}"), 4);
+      }
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeReplaySucceeded => {
+      if let Some(session) = app.youtube_playback.as_mut() {
+        session.advancing = false;
       }
     }
     DecodedSourceFact::Volume(volume) => {
@@ -2085,7 +2605,7 @@ fn apply_native_fact(
       if !restore_playback {
         app.pending_start_playback = None;
         if app.queue_now_is_spotify() {
-          app.queue_now = None;
+          app.invalidate_spotify_queue_slot();
           app.spotify_queue_guard_reloads = 0;
         }
       }
@@ -2386,6 +2906,10 @@ pub(crate) fn answer_query(
     }
     FoldQuery::QueueDepth => FoldAnswer::U64(app.native_queue.len() as u64),
     FoldQuery::QueueTracks => FoldAnswer::QueueTracks(app.native_queue.clone()),
+    #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+    FoldQuery::QueueDecodedPlayer => {
+      FoldAnswer::QueueDecodedPlayer(app.queue_now_decoded_player().map(std::sync::Arc::clone))
+    }
     #[cfg(feature = "dj-core")]
     FoldQuery::DjGeneration => FoldAnswer::U64(app.dj.generation),
     FoldQuery::AnnouncementSources { seen_ids } => FoldAnswer::AnnouncementSources {
@@ -2990,6 +3514,67 @@ fn answer_decoded_query(
     Q::Volume => FoldAnswer::Decoded(crate::runtime::engine::DecodedSourceAnswer::Volume(
       app.runtime_state.volume_percent,
     )),
+    #[cfg(feature = "youtube")]
+    Q::YouTubeConfig => FoldAnswer::Decoded(A::YouTubeConfig(
+      app.user_config.behavior.ytdlp_path.clone(),
+    )),
+    #[cfg(feature = "youtube")]
+    Q::YouTubePlayer => FoldAnswer::Decoded(A::YouTubePlayer(
+      app
+        .youtube_playback
+        .as_ref()
+        .map(|s| std::sync::Arc::clone(&s.player)),
+    )),
+    #[cfg(feature = "youtube")]
+    Q::YouTubeTracks(uris) => {
+      let search = app
+        .search_results
+        .tracks
+        .as_ref()
+        .map(|p| p.items.as_slice());
+      FoldAnswer::Decoded(A::YouTubeTracks(
+        crate::infra::youtube::dispatch::snapshot_tracks(&app.track_table.tracks, search, &uris),
+      ))
+    }
+    #[cfg(feature = "youtube")]
+    Q::YouTubeShuffle => FoldAnswer::Decoded(A::YouTubeShuffle(app.decoded_shuffle)),
+    #[cfg(feature = "youtube")]
+    Q::YouTubeRepeat(state) => {
+      FoldAnswer::Decoded(A::YouTubeRepeat(app.set_decoded_repeat_from_state(state)))
+    }
+    #[cfg(feature = "youtube")]
+    Q::YouTubeSkip { forward } => FoldAnswer::Decoded(A::YouTubeSkip(
+      app.youtube_playback.as_ref().and_then(|session| {
+        crate::infra::queue::advance_index(
+          session.index,
+          session.tracks.len(),
+          app.decoded_repeat,
+          forward,
+        )
+      }),
+    )),
+    #[cfg(feature = "youtube")]
+    Q::YouTubeReplay => FoldAnswer::Decoded(A::YouTubeReplay(app.youtube_playback.as_ref().map(
+      |session| {
+        (
+          std::sync::Arc::clone(&session.player),
+          session.tempfile.path().to_path_buf(),
+        )
+      },
+    ))),
+    #[cfg(feature = "youtube")]
+    Q::YouTubePlayIndex(target) => FoldAnswer::Decoded(A::YouTubePlayIndex(
+      app.youtube_playback.as_ref().and_then(|session| {
+        let track = session.tracks.get(target)?;
+        let id = crate::infra::youtube::video_id_from_uri(track.uri.as_deref()?).ok()?;
+        Some((
+          std::sync::Arc::clone(&session.player),
+          std::sync::Arc::clone(&session.source),
+          id.to_string(),
+          track.name.clone(),
+        ))
+      }),
+    )),
     #[cfg(feature = "local-files")]
     Q::LocalConfig => FoldAnswer::Decoded(A::LocalConfig(
       app.user_config.behavior.local_music_path.clone(),
@@ -3009,8 +3594,7 @@ fn answer_decoded_query(
     }),
     #[cfg(feature = "local-files")]
     Q::LocalReplay => {
-      FoldAnswer::Decoded(A::LocalReplay(app.local_playback.as_mut().and_then(|s| {
-        s.advancing = true;
+      FoldAnswer::Decoded(A::LocalReplay(app.local_playback.as_ref().and_then(|s| {
         s.queue
           .get(s.index)
           .and_then(|uri| crate::infra::local::file_uri_to_path(uri).ok())
@@ -3021,8 +3605,7 @@ fn answer_decoded_query(
     Q::LocalShuffle => FoldAnswer::Decoded(A::LocalShuffle(app.decoded_shuffle)),
     #[cfg(feature = "local-files")]
     Q::LocalSkip { forward } => FoldAnswer::Decoded(A::LocalSkip(
-      app.local_playback.as_mut().and_then(|local| {
-        local.advancing = true;
+      app.local_playback.as_ref().and_then(|local| {
         crate::infra::queue::advance_index(
           local.index,
           local.queue.len(),
@@ -3033,11 +3616,11 @@ fn answer_decoded_query(
     )),
     #[cfg(feature = "local-files")]
     Q::LocalPlayIndex(target) => FoldAnswer::Decoded(A::LocalPlayIndex(
-      app.local_playback.as_mut().and_then(|local| {
-        local.queue.get(target).map(|uri| {
-          local.advancing = true;
-          (std::sync::Arc::clone(&local.player), uri.clone())
-        })
+      app.local_playback.as_ref().and_then(|local| {
+        local
+          .queue
+          .get(target)
+          .map(|uri| (std::sync::Arc::clone(&local.player), uri.clone()))
       }),
     )),
     #[cfg(feature = "local-files")]
@@ -3072,8 +3655,7 @@ fn answer_decoded_query(
     }
     #[cfg(feature = "subsonic")]
     Q::SubsonicReplay => {
-      FoldAnswer::Decoded(A::SubsonicReplay(app.subsonic_playback.as_mut().map(|s| {
-        s.advancing = true;
+      FoldAnswer::Decoded(A::SubsonicReplay(app.subsonic_playback.as_ref().map(|s| {
         (
           std::sync::Arc::clone(&s.player),
           s.tempfile.path().to_path_buf(),
@@ -3082,8 +3664,7 @@ fn answer_decoded_query(
     }
     #[cfg(feature = "subsonic")]
     Q::SubsonicSkip { forward } => FoldAnswer::Decoded(A::SubsonicSkip(
-      app.subsonic_playback.as_mut().and_then(|s| {
-        s.advancing = true;
+      app.subsonic_playback.as_ref().and_then(|s| {
         crate::infra::queue::advance_index(s.index, s.tracks.len(), app.decoded_repeat, forward)
       }),
     )),
@@ -3091,7 +3672,7 @@ fn answer_decoded_query(
     Q::SubsonicPlayIndex(target) => {
       let plan = app
         .subsonic_playback
-        .as_mut()
+        .as_ref()
         .map(|s| match s.tracks.get(target) {
           None => Ok(None),
           Some(track) => match track
@@ -3099,15 +3680,12 @@ fn answer_decoded_query(
             .as_deref()
             .map(crate::infra::subsonic::track_id_from_uri)
           {
-            Some(Ok(id)) => {
-              s.advancing = true;
-              Ok(Some((
-                std::sync::Arc::clone(&s.player),
-                std::sync::Arc::clone(&s.source),
-                id.to_string(),
-                track.name.clone(),
-              )))
-            }
+            Some(Ok(id)) => Ok(Some((
+              std::sync::Arc::clone(&s.player),
+              std::sync::Arc::clone(&s.source),
+              id.to_string(),
+              track.name.clone(),
+            ))),
             _ => Err(()),
           },
         });
@@ -3133,54 +3711,6 @@ fn answer_decoded_query(
       configured: app.user_config.behavior.radio_stations.clone(),
       saved: app.runtime_state.radio_stations.clone(),
     }),
-    #[cfg(any(
-      feature = "local-files",
-      feature = "subsonic",
-      feature = "internet-radio"
-    ))]
-    Q::ClaimBackendPlayers { keep } => {
-      let answer = A::BackendPlayers {
-        #[cfg(feature = "streaming")]
-        streaming: app.streaming_player.clone(),
-        #[cfg(feature = "local-files")]
-        local: app
-          .local_playback
-          .as_ref()
-          .map(|s| std::sync::Arc::clone(&s.player)),
-        #[cfg(feature = "subsonic")]
-        subsonic: app
-          .subsonic_playback
-          .as_ref()
-          .map(|s| std::sync::Arc::clone(&s.player)),
-        #[cfg(feature = "internet-radio")]
-        radio: app
-          .radio_playback
-          .as_ref()
-          .map(|s| std::sync::Arc::clone(&s.player)),
-        #[cfg(feature = "youtube")]
-        youtube: app
-          .youtube_playback
-          .as_ref()
-          .map(|s| std::sync::Arc::clone(&s.player)),
-      };
-      #[cfg(feature = "local-files")]
-      if keep != Some(crate::core::source::Source::Local) {
-        app.local_playback.take();
-      }
-      #[cfg(feature = "subsonic")]
-      if keep != Some(crate::core::source::Source::Subsonic) {
-        app.subsonic_playback.take();
-      }
-      #[cfg(feature = "internet-radio")]
-      if keep != Some(crate::core::source::Source::Radio) {
-        app.radio_playback.take();
-      }
-      #[cfg(feature = "youtube")]
-      if keep != Some(crate::core::source::Source::YouTube) {
-        app.youtube_playback.take();
-      }
-      FoldAnswer::Decoded(answer)
-    }
   }
 }
 
@@ -3449,6 +3979,88 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn spotify_slot_teardown_revokes_paused_restore_lease() {
+    let track = crate::core::plugin_api::TrackInfo {
+      uri: Some("spotify:track:lease-test".into()),
+      name: "Lease test".into(),
+      artists: Vec::new(),
+      album: String::new(),
+      duration_ms: 0,
+      id: None,
+      album_id: None,
+      artist_refs: Vec::new(),
+      is_playable: true,
+      is_local: false,
+      track_number: 0,
+      explicit: false,
+      image_url: None,
+    };
+    let mut app = App::default();
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueSpotifyPublished(track.clone()),
+    );
+    let old_generation = app.queue_slot_generation;
+    let old_lease = app.queue_slot_lease.clone().expect("published slot lease");
+
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueSpotifyPublished(track),
+    );
+    assert_ne!(app.queue_slot_generation, old_generation);
+    assert!(old_lease.with_valid(|| ()).is_none());
+
+    let current_lease = app.queue_slot_lease.clone().expect("replacement lease");
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueSpotifyCleared,
+    );
+    assert!(current_lease.with_valid(|| ()).is_none());
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn stale_queue_transport_intent_cannot_resurrect_cleared_slot() {
+    let track = crate::core::plugin_api::TrackInfo {
+      uri: Some("spotify:track:intent-test".into()),
+      name: "Intent test".into(),
+      artists: Vec::new(),
+      album: String::new(),
+      duration_ms: 0,
+      id: None,
+      album_id: None,
+      artist_refs: Vec::new(),
+      is_playable: true,
+      is_local: false,
+      track_number: 0,
+      explicit: false,
+      image_url: None,
+    };
+    let mut app = App::default();
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueSpotifyPublished(track),
+    );
+    let generation = app.queue_slot_generation;
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueSpotifyCleared,
+    );
+    app.queue_slot_desired_playing = false;
+
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueTransportIntent {
+        generation,
+        is_playing: true,
+      },
+    );
+    assert!(!app.queue_slot_desired_playing);
+    assert!(!app.queue_now_is_spotify());
+  }
+
   #[test]
   fn catalog_rows_reuse_arc_across_non_catalog_publication() {
     let mut publication = CatalogPublication::default();
@@ -3606,6 +4218,137 @@ mod tests {
       Some(crate::core::app::TrackTableContext::LocalPlaylist)
     );
     assert!(app.track_table.tracks.is_empty());
+  }
+
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  #[test]
+  fn stale_queue_fetch_outcome_cannot_publish_or_advance() {
+    let mut app = App::default();
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueFetchCompleted {
+        fetch_id: 41,
+        result: crate::runtime::engine::QueueFetchResult::Failure(
+          "stale worker failure".to_string(),
+        ),
+      },
+    );
+    assert!(app.queue_now.is_none());
+    assert!(app.status_message.is_none());
+  }
+
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  #[test]
+  fn stale_queue_fetch_claim_is_denied_by_the_fold() {
+    let mut app = App::default();
+    let ack = apply_acked(
+      &mut app,
+      crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueueFetchClaimed { fetch_id: 99 },
+      ),
+    )
+    .expect("acked claim returns a decision");
+    assert!(ack.queue_fetch_claim.is_none());
+  }
+
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  #[test]
+  fn matching_cancelled_queue_fetch_clears_latch_and_advances() {
+    use crate::infra::audio::LocalPlayer;
+    use crate::infra::queue::{DecodedQueuePlayback, QueueNowPlaying};
+    use std::sync::mpsc::channel;
+
+    let (tx, rx) = channel();
+    let mut app = App::new(tx, crate::core::user_config::UserConfig::new(), None);
+    app.queue_now = Some(QueueNowPlaying::Decoded(DecodedQueuePlayback {
+      player: std::sync::Arc::new(LocalPlayer::silent_for_test()),
+      track: crate::core::plugin_api::TrackInfo {
+        uri: Some("subsonic:track:cancelled".to_string()),
+        name: "Cancelled".to_string(),
+        artists: Vec::new(),
+        album: String::new(),
+        duration_ms: 0,
+        id: None,
+        album_id: None,
+        artist_refs: Vec::new(),
+        is_playable: true,
+        is_local: false,
+        track_number: 0,
+        explicit: false,
+        image_url: None,
+      },
+      advancing: true,
+      fetch_id: 17,
+      lease: std::sync::Arc::new(crate::runtime::engine::QueueFetchLease::new()),
+      tempfile: None,
+    }));
+
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueFetchCompleted {
+        fetch_id: 17,
+        result: crate::runtime::engine::QueueFetchResult::Cancelled,
+      },
+    );
+
+    assert!(matches!(
+      app.queue_now,
+      Some(QueueNowPlaying::Decoded(DecodedQueuePlayback {
+        advancing: false,
+        ..
+      }))
+    ));
+    assert!(matches!(
+      rx.try_recv(),
+      Ok(crate::infra::network::IoEvent::AdvanceNativeQueue)
+    ));
+
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueFetchCompleted {
+        fetch_id: 17,
+        result: crate::runtime::engine::QueueFetchResult::Empty,
+      },
+    );
+    assert_eq!(
+      app.status_message.as_deref(),
+      Some("Cannot play Cancelled: audio is empty")
+    );
+    assert!(matches!(
+      rx.try_recv(),
+      Ok(crate::infra::network::IoEvent::AdvanceNativeQueue)
+    ));
+  }
+
+  #[cfg(any(
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube",
+    feature = "internet-radio"
+  ))]
+  #[test]
+  fn backend_claim_is_folded_and_acknowledged_in_order() {
+    let mut app = App::default();
+    let claim = apply_acked(
+      &mut app,
+      crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::ClaimBackendPlayers { keep: None },
+      ),
+    )
+    .expect("backend claim returns an ack");
+    assert!(claim.backend_players.is_some());
+
+    let next = apply_acked(
+      &mut app,
+      crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::TransientStatus {
+          message: "after claim".to_string(),
+          ttl_secs: 1,
+        },
+      ),
+    )
+    .expect("following event returns an ack");
+    assert!(next.backend_players.is_none());
   }
 
   #[test]

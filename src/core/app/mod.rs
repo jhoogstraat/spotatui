@@ -186,6 +186,12 @@ pub struct App {
   /// replay of the slot can honor a user's pause.
   #[cfg(feature = "streaming")]
   pub queue_slot_desired_playing: bool,
+  /// Monotonic identity for the published Spotify queue slot. Async restores
+  /// must not write state into a newer slot that replaced it.
+  #[cfg(feature = "streaming")]
+  pub queue_slot_generation: u64,
+  #[cfg(feature = "streaming")]
+  pub queue_slot_lease: Option<std::sync::Arc<crate::runtime::engine::QueueFetchLease>>,
   /// AI DJ session state: transcript, auto-queue toggle, vibe, and the
   /// generation counter that invalidates in-flight background work.
   #[cfg(feature = "dj-core")]

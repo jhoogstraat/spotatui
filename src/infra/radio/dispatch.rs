@@ -233,40 +233,27 @@ pub(crate) fn snapshot_station(app: &crate::core::app::App, uri: &str) -> TrackI
 
 /// Release the other backends so only radio holds the output device.
 async fn release_other_backends(spine: &Spine, clear_radio: bool) {
-  let backends = decoded(
-    spine,
-    Query::ClaimBackendPlayers {
+  let backends = spine
+    .emit_acked(EngineEvent::Decoded(Fact::ClaimBackendPlayers {
       keep: (!clear_radio).then_some(crate::core::source::Source::Radio),
-    },
-  )
-  .await;
-  if let Some(Answer::BackendPlayers {
+    }))
+    .await
+    .and_then(|ack| ack.backend_players);
+  if let Some(backends) = backends {
     #[cfg(feature = "streaming")]
-    streaming,
-    #[cfg(feature = "local-files")]
-    local,
-    #[cfg(feature = "subsonic")]
-    subsonic,
-    #[cfg(feature = "internet-radio")]
-      radio: _,
-    #[cfg(feature = "youtube")]
-    youtube,
-  }) = backends
-  {
-    #[cfg(feature = "streaming")]
-    if let Some(player) = streaming {
+    if let Some(player) = backends.streaming {
       player.pause();
     }
     #[cfg(feature = "local-files")]
-    if let Some(player) = local {
+    if let Some(player) = backends.local {
       player.stop();
     }
     #[cfg(feature = "subsonic")]
-    if let Some(player) = subsonic {
+    if let Some(player) = backends.subsonic {
       player.stop();
     }
     #[cfg(feature = "youtube")]
-    if let Some(player) = youtube {
+    if let Some(player) = backends.youtube {
       player.stop();
     }
   }

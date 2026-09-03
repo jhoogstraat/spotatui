@@ -324,40 +324,27 @@ fn find_track<'a>(
   allow(unused_variables)
 )]
 async fn release_other_backends(spine: &Spine, clear_subsonic: bool) {
-  let backends = decoded(
-    spine,
-    Query::ClaimBackendPlayers {
+  let backends = spine
+    .emit_acked(EngineEvent::Decoded(Fact::ClaimBackendPlayers {
       keep: (!clear_subsonic).then_some(crate::core::source::Source::Subsonic),
-    },
-  )
-  .await;
-  if let Some(Answer::BackendPlayers {
+    }))
+    .await
+    .and_then(|ack| ack.backend_players);
+  if let Some(backends) = backends {
     #[cfg(feature = "streaming")]
-    streaming,
-    #[cfg(feature = "local-files")]
-    local,
-    #[cfg(feature = "internet-radio")]
-    radio,
-    #[cfg(feature = "youtube")]
-    youtube,
-    #[cfg(feature = "subsonic")]
-      subsonic: _,
-  }) = backends
-  {
-    #[cfg(feature = "streaming")]
-    if let Some(player) = streaming {
+    if let Some(player) = backends.streaming {
       player.pause();
     }
     #[cfg(feature = "local-files")]
-    if let Some(player) = local {
+    if let Some(player) = backends.local {
       player.stop();
     }
     #[cfg(feature = "internet-radio")]
-    if let Some(player) = radio {
+    if let Some(player) = backends.radio {
       player.stop();
     }
     #[cfg(feature = "youtube")]
-    if let Some(player) = youtube {
+    if let Some(player) = backends.youtube {
       player.stop();
     }
   }
@@ -495,7 +482,10 @@ async fn skip(spine: &Spine, forward: bool) -> bool {
   };
 
   match target {
-    Some(idx) => play_index(spine, idx).await,
+    Some(idx) => {
+      emit(spine, Fact::SubsonicAdvancing(true)).await;
+      play_index(spine, idx).await;
+    }
     None => emit(spine, Fact::SubsonicAdvancing(false)).await,
   }
   true
@@ -512,6 +502,7 @@ async fn replay_current(spine: &Spine) -> bool {
   else {
     return false;
   };
+  emit(spine, Fact::SubsonicAdvancing(true)).await;
   if replay_file(player, path).await {
     emit(spine, Fact::SubsonicReplaySucceeded).await;
   } else {
@@ -546,6 +537,7 @@ pub(crate) async fn play_index(spine: &Spine, target: usize) {
     }
     None => return,
   };
+  emit(spine, Fact::SubsonicAdvancing(true)).await;
 
   let tmp = match download_track(&source, &track_id).await {
     Ok(t) => t,

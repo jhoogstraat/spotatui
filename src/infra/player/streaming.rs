@@ -63,6 +63,16 @@ enum DeferredPlayerCommand {
   Activate,
   Transfer(Option<TransferRequest>),
   DirectLoad(SpotifyUri, bool),
+  GuardedDirectLoad(
+    SpotifyUri,
+    bool,
+    Arc<crate::runtime::engine::QueueFetchLease>,
+    Arc<std::sync::atomic::AtomicBool>,
+  ),
+  GuardedPlay(
+    Arc<crate::runtime::engine::QueueFetchLease>,
+    Arc<std::sync::atomic::AtomicBool>,
+  ),
 }
 
 impl DeferredPlayerCommand {
@@ -104,6 +114,20 @@ impl DeferredPlayerCommand {
         player.load(uri, start_playing, 0);
         Ok(())
       }
+      Self::GuardedDirectLoad(uri, start_playing, lease, outcome) => {
+        let _ = lease.with_valid(|| {
+          player.load(uri, start_playing, 0);
+          outcome.store(true, std::sync::atomic::Ordering::Release);
+        });
+        Ok(())
+      }
+      Self::GuardedPlay(lease, outcome) => {
+        let _ = lease.with_valid(|| {
+          player.play();
+          outcome.store(true, std::sync::atomic::Ordering::Release);
+        });
+        Ok(())
+      }
     }
   }
 
@@ -114,6 +138,15 @@ impl DeferredPlayerCommand {
       Self::Stop => player.stop(),
       Self::Seek(position_ms) => player.seek(*position_ms),
       _ => {}
+    }
+  }
+
+  fn is_current(&self) -> bool {
+    match self {
+      Self::GuardedDirectLoad(_, _, lease, _) | Self::GuardedPlay(lease, _) => {
+        lease.with_valid(|| ()).is_some()
+      }
+      _ => true,
     }
   }
 }
@@ -323,6 +356,9 @@ async fn run_spirc_supervisor(mut ctx: SpircSupervisorContext) {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
           for command in commands {
+            if !command.is_current() {
+              continue;
+            }
             if let Err(error) = command.apply(&connection.spirc, &ctx.player) {
               warn!("deferred native command failed after fast reconnect: {error:?}");
             }
@@ -998,6 +1034,12 @@ impl StreamingPlayer {
         .map_err(|error| anyhow!("Native playback command failed: {error:?}")),
       SpircCommandMode::Reconnecting => {
         command.apply_to_buffered_player(&self.player);
+        if let DeferredPlayerCommand::GuardedDirectLoad(_, _, _, outcome) = &command {
+          outcome.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let DeferredPlayerCommand::GuardedPlay(_, outcome) = &command {
+          outcome.store(true, std::sync::atomic::Ordering::Release);
+        }
         router.deferred.push(command);
         Ok(())
       }
@@ -1065,19 +1107,38 @@ impl StreamingPlayer {
     Ok(())
   }
 
-  /// Load a track by URI without starting playback. Used to restore a paused
-  /// queue slot after recovery so the user's pause survives the rebuild.
-  pub async fn load_uri_paused(&self, uri: &str) -> Result<()> {
+  pub async fn play_uri_guarded(
+    &self,
+    uri: &str,
+    lease: &Arc<crate::runtime::engine::QueueFetchLease>,
+  ) -> Result<()> {
     let spotify_uri =
       SpotifyUri::from_uri(uri).map_err(|e| anyhow!("Invalid Spotify URI '{}': {:?}", uri, e))?;
+    let outcome = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    self.route_command(DeferredPlayerCommand::GuardedDirectLoad(
+      spotify_uri,
+      true,
+      Arc::clone(lease),
+      Arc::clone(&outcome),
+    ))?;
+    if !outcome.load(std::sync::atomic::Ordering::Acquire) {
+      return Err(anyhow!("queue slot lease revoked"));
+    }
+    Ok(())
+  }
 
-    self.route_command(DeferredPlayerCommand::DirectLoad(spotify_uri, false))?;
-
-    let mut state = self.state.lock().await;
-    state.is_playing = false;
-    state.track_id = Some(uri.to_string());
-    state.position_ms = 0;
-
+  pub async fn play_guarded(
+    &self,
+    lease: &Arc<crate::runtime::engine::QueueFetchLease>,
+  ) -> Result<()> {
+    let outcome = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    self.route_command(DeferredPlayerCommand::GuardedPlay(
+      Arc::clone(lease),
+      Arc::clone(&outcome),
+    ))?;
+    if !outcome.load(std::sync::atomic::Ordering::Acquire) {
+      return Err(anyhow!("queue slot lease revoked"));
+    }
     Ok(())
   }
 
@@ -1355,6 +1416,7 @@ mod tests {
     should_retry_with_fresh_credentials, wait_for_oauth_callback_port, RecoveringSink,
     StreamingConnectionState,
   };
+  use librespot_core::SpotifyUri;
   use librespot_playback::{audio_backend, convert::Converter, decoder::AudioPacket};
   use std::sync::Arc;
   use std::time::Duration;
@@ -1497,6 +1559,22 @@ mod tests {
     assert!(StreamingConnectionState::Reconnecting { generation: 1 }.accepts_commands());
     assert!(!StreamingConnectionState::Failed { generation: 1 }.accepts_commands());
     assert!(!StreamingConnectionState::Shutdown.accepts_commands());
+  }
+
+  #[test]
+  fn revoked_guarded_deferred_load_is_dropped_on_reconnect_flush() {
+    let lease = Arc::new(crate::runtime::engine::QueueFetchLease::new());
+    let uri =
+      SpotifyUri::from_uri("spotify:track:4iV5W9uYEdYUVa79Axb7Rh").expect("valid Spotify URI");
+    let command = super::DeferredPlayerCommand::GuardedDirectLoad(
+      uri,
+      false,
+      Arc::clone(&lease),
+      Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    assert!(command.is_current());
+    lease.revoke();
+    assert!(!command.is_current());
   }
 
   #[test]

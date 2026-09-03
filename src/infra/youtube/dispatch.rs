@@ -37,9 +37,10 @@ use crate::core::plugin_api::TrackInfo;
 use crate::core::source::{Searcher, Source};
 use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
-use crate::infra::queue::{advance_index, replay_file};
+use crate::infra::queue::replay_file;
 use crate::runtime::engine::{
-  DecodedSourceAnswer as Answer, DecodedSourceQuery as Query, FoldAnswer, FoldQuery,
+  DecodedSourceAnswer as Answer, DecodedSourceFact as Fact, DecodedSourceQuery as Query,
+  EngineEvent, FoldAnswer, FoldQuery, Spine,
 };
 
 /// Skip direction within the YouTube queue.
@@ -87,16 +88,46 @@ pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool
     IoEvent::StartPlayback(None, Some(uris), offset)
       if uris.first().is_some_and(|u| is_youtube_uri(u)) =>
     {
-      start_youtube_queue(app, uris, offset.unwrap_or(0)).await;
+      if let Some(spine) = playback_spine(app).await {
+        start_youtube_queue(&spine, uris, offset.unwrap_or(0)).await;
+      } else {
+        #[cfg(test)]
+        if uris.iter().any(|uri| {
+          app
+            .try_lock()
+            .ok()
+            .and_then(|guard| {
+              guard
+                .search_results
+                .tracks
+                .as_ref()
+                .and_then(|rows| {
+                  rows
+                    .items
+                    .iter()
+                    .find(|row| row.uri.as_deref() == Some(uri))
+                })
+                .map(|row| row.duration_ms == 0)
+            })
+            .unwrap_or(false)
+        }) {
+          app
+            .lock()
+            .await
+            .set_status_message("Live streams aren't supported on the YouTube source yet", 6);
+        }
+      }
       true
     }
     // A single youtube video with no surrounding list: a one-track queue.
     IoEvent::StartPlayback(Some(uri), _, _) if is_youtube_uri(uri) => {
-      start_youtube_queue(app, std::slice::from_ref(uri), 0).await;
+      if let Some(spine) = playback_spine(app).await {
+        start_youtube_queue(&spine, std::slice::from_ref(uri), 0).await;
+      }
       true
     }
     // Bare "resume current" — ours only while YouTube owns the session.
-    IoEvent::StartPlayback(None, None, None) => match player(app).await {
+    IoEvent::StartPlayback(None, None, None) => match youtube_player(app).await {
       Some(p) => {
         p.resume();
         true
@@ -106,47 +137,96 @@ pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool
     // Any other start is a local/Subsonic/radio/Spotify play: relinquish the
     // device, then let the normal dispatch run.
     IoEvent::StartPlayback(..) => {
-      teardown_youtube(app).await;
+      if let Some(spine) = playback_spine(app).await {
+        teardown_youtube(&spine).await;
+      }
       false
     }
-    IoEvent::PausePlayback => match player(app).await {
+    IoEvent::PausePlayback => match youtube_player(app).await {
       Some(p) => {
         p.pause();
         true
       }
       None => false,
     },
-    IoEvent::Seek(position_ms) => match player(app).await {
+    IoEvent::Seek(position_ms) => match youtube_player(app).await {
       Some(p) => {
         let _ = p.seek(Duration::from_millis(*position_ms as u64));
         true
       }
       None => false,
     },
-    IoEvent::ChangeVolume(volume) => match player(app).await {
+    IoEvent::ChangeVolume(volume) => match youtube_player(app).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        crate::runtime::engine::emit_decoded_source(
-          app,
-          crate::runtime::engine::DecodedSourceFact::Volume(*volume),
-        )
-        .await;
+        if let Some(spine) = playback_spine(app).await {
+          let _ = spine
+            .emit_acked(EngineEvent::Decoded(Fact::Volume(*volume)))
+            .await;
+        }
         true
       }
       None => false,
     },
-    IoEvent::NextTrack => skip(app, Direction::Next).await,
-    IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => skip(app, Direction::Prev).await,
+    IoEvent::NextTrack => match playback_spine(app).await {
+      Some(spine) => skip(&spine, Direction::Next).await,
+      None => false,
+    },
+    IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => match playback_spine(app).await {
+      Some(spine) => skip(&spine, Direction::Prev).await,
+      None => false,
+    },
     // Repeat-one auto-advance: replay the current video (dispatched by the runner
     // tick only while YouTube owns the session).
-    IoEvent::ReplayCurrentTrack => replay_current(app).await,
+    IoEvent::ReplayCurrentTrack => match playback_spine(app).await {
+      Some(spine) => replay_current(&spine).await,
+      None => false,
+    },
     // Explicit repeat-mode set (e.g. a plugin's `set_repeat`): store it as the
     // decoded repeat mode while a queueable decoded source owns playback (the
     // method's ownership gate excludes a context suspended under the native
     // queue), so it never reaches the Spotify context.
-    IoEvent::Repeat(state) => app.lock().await.set_decoded_repeat_from_state(*state),
+    IoEvent::Repeat(state) => match playback_spine(app).await {
+      Some(spine) => matches!(
+        decoded(&spine, Query::YouTubeRepeat(*state)).await,
+        Some(Answer::YouTubeRepeat(true))
+      ),
+      None => false,
+    },
     _ => false,
   }
+}
+
+async fn playback_spine(app: &Arc<Mutex<App>>) -> Option<Spine> {
+  app.lock().await.spine.clone()
+}
+
+async fn youtube_player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
+  let spine = playback_spine(app).await?;
+  match decoded(&spine, Query::YouTubePlayer).await? {
+    Answer::YouTubePlayer(player) => player,
+    _ => None,
+  }
+}
+
+async fn decoded(spine: &Spine, query: Query) -> Option<Answer> {
+  match spine.query(FoldQuery::Decoded(query)).await.ok()? {
+    FoldAnswer::Decoded(answer) => Some(answer),
+    _ => None,
+  }
+}
+
+async fn status(spine: &Spine, message: impl Into<String>) {
+  let _ = spine
+    .emit_acked(EngineEvent::Decoded(Fact::YouTubeStatus {
+      message: message.into(),
+      ttl_secs: 6,
+    }))
+    .await;
+}
+
+async fn emit(spine: &Spine, fact: Fact) {
+  let _ = spine.emit_acked(EngineEvent::Decoded(fact)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,20 +508,10 @@ async fn remove_track_from_playlist(app: &Arc<Mutex<App>>, playlist_ref: &str, v
 // Playback
 // ---------------------------------------------------------------------------
 
-/// The live YouTube player, if a YouTube session is active.
-async fn player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  app
-    .lock()
-    .await
-    .youtube_playback
-    .as_ref()
-    .map(|s| Arc::clone(&s.player))
-}
-
 /// Snapshot the `TrackInfo`s for `uris`, preserving order, looking each up in
 /// both browse views a play can originate from (the shared track table and the
 /// search results). Any uri found in neither is dropped.
-fn snapshot_tracks(
+pub(crate) fn snapshot_tracks(
   table: &[TrackInfo],
   search: Option<&[TrackInfo]>,
   uris: &[String],
@@ -460,16 +530,14 @@ fn snapshot_tracks(
 }
 
 /// Release the other backends so only YouTube holds the output device.
-async fn release_other_backends(app: &Arc<Mutex<App>>) {
-  let spine = app.lock().await.spine.clone();
-  let Some(spine) = spine else { return };
+async fn release_other_backends(spine: &Spine) {
   let answer = spine
-    .query(FoldQuery::Decoded(Query::ClaimBackendPlayers {
+    .emit_acked(EngineEvent::Decoded(Fact::ClaimBackendPlayers {
       keep: Some(crate::core::source::Source::YouTube),
     }))
     .await
-    .ok();
-  if let Some(FoldAnswer::Decoded(Answer::BackendPlayers {
+    .and_then(|ack| ack.backend_players);
+  if let Some(crate::runtime::engine::ClaimedBackendPlayers {
     #[cfg(feature = "streaming")]
     streaming,
     #[cfg(feature = "local-files")]
@@ -480,7 +548,7 @@ async fn release_other_backends(app: &Arc<Mutex<App>>) {
     radio,
     #[cfg(feature = "youtube")]
       youtube: _,
-  })) = answer
+  }) = answer
   {
     #[cfg(feature = "streaming")]
     if let Some(player) = streaming {
@@ -504,18 +572,18 @@ async fn release_other_backends(app: &Arc<Mutex<App>>) {
 /// Reuse the live YouTube player, or open a fresh output device for one. A
 /// freshly opened player is **not** published to `App` here — the caller
 /// publishes the session only on a successful first play.
-async fn acquire_player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  if let Some(p) = player(app).await {
+async fn acquire_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
+  if let Some(Answer::YouTubePlayer(Some(p))) = decoded(spine, Query::YouTubePlayer).await {
     return Some(p);
   }
   match tokio::task::spawn_blocking(LocalPlayer::new).await {
     Ok(Ok(p)) => Some(Arc::new(p)),
     Ok(Err(e)) => {
-      set_error(app, format!("No audio output for YouTube playback: {e}")).await;
+      status(spine, format!("No audio output for YouTube playback: {e}")).await;
       None
     }
     Err(e) => {
-      set_error(app, format!("Audio output init failed: {e}")).await;
+      status(spine, format!("Audio output init failed: {e}")).await;
       None
     }
   }
@@ -545,20 +613,13 @@ fn decode_hint(e: impl std::fmt::Display) -> String {
 
 /// Begin playing a queue of YouTube videos, taking over the session and
 /// starting at `start_idx` (clamped into range).
-async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: usize) {
-  // Snapshot the track metadata under one short lock, from whichever browse
-  // view the request came from.
-  let tracks = {
-    let guard = app.lock().await;
-    let search = guard
-      .search_results
-      .tracks
-      .as_ref()
-      .map(|p| p.items.as_slice());
-    snapshot_tracks(&guard.track_table.tracks, search, uris)
+async fn start_youtube_queue(spine: &Spine, uris: &[String], start_idx: usize) {
+  let tracks = match decoded(spine, Query::YouTubeTracks(uris.to_vec())).await {
+    Some(Answer::YouTubeTracks(tracks)) => tracks,
+    _ => Vec::new(),
   };
   if tracks.is_empty() {
-    set_error(app, "No YouTube videos to play".to_string()).await;
+    status(spine, "No YouTube videos to play").await;
     return;
   }
   let index = start_idx.min(tracks.len() - 1);
@@ -566,9 +627,9 @@ async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: 
   // A livestream (duration 0 in the search row) never finishes downloading —
   // the tempfile fetch would just spin until the timeout. Refuse up front.
   if tracks[index].duration_ms == 0 {
-    set_error(
-      app,
-      "Live streams aren't supported on the YouTube source yet".to_string(),
+    status(
+      spine,
+      "Live streams aren't supported on the YouTube source yet",
     )
     .await;
     return;
@@ -577,31 +638,39 @@ async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: 
   let video_id = match tracks[index].uri.as_deref().map(video_id_from_uri) {
     Some(Ok(id)) => id.to_string(),
     _ => {
-      set_error(app, "Invalid YouTube URI".to_string()).await;
+      status(spine, "Invalid YouTube URI").await;
       return;
     }
   };
 
-  let source = Arc::new(build_source(app).await);
+  let ytdlp_path = match decoded(spine, Query::YouTubeConfig).await {
+    Some(Answer::YouTubeConfig(path)) => path,
+    _ => None,
+  };
+  let source = Arc::new(YouTubeSource::new(ytdlp_path));
 
   // Only one backend owns the device at a time.
-  release_other_backends(app).await;
+  release_other_backends(spine).await;
 
-  let Some(player) = acquire_player(app).await else {
+  let Some(player) = acquire_player(spine).await else {
     return;
   };
 
   // yt-dlp can take a while; let the user know something is happening.
   {
-    let mut guard = app.lock().await;
-    guard.set_status_message(format!("Fetching {}\u{2026}", tracks[index].name), 30);
+    let _ = spine
+      .emit_acked(EngineEvent::Decoded(Fact::YouTubeStatus {
+        message: format!("Fetching {}\u{2026}", tracks[index].name),
+        ttl_secs: 30,
+      }))
+      .await;
   }
 
   // Download off the lock, then decode on the blocking pool.
   let tmp = match download_audio(&source, &video_id).await {
     Ok(t) => t,
     Err(e) => {
-      set_error(app, format!("Cannot download YouTube audio: {e}")).await;
+      status(spine, format!("Cannot download YouTube audio: {e}")).await;
       return;
     }
   };
@@ -611,7 +680,10 @@ async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: 
 
   match result {
     Ok(Ok(())) => {
-      let volume = app.lock().await.runtime_state.volume_percent;
+      let volume = match decoded(spine, Query::Volume).await {
+        Some(Answer::Volume(volume)) => volume,
+        _ => 100,
+      };
       player.set_volume(volume as f32 / 100.0);
 
       let display = tracks[index].name.clone();
@@ -626,49 +698,41 @@ async fn start_youtube_queue(app: &Arc<Mutex<App>>, uris: &[String], start_idx: 
         shuffle_backup: None,
       };
       // Honor the player-global decoded shuffle for the freshly-built queue.
-      if app.lock().await.decoded_shuffle {
+      if matches!(
+        decoded(spine, Query::YouTubeShuffle).await,
+        Some(Answer::YouTubeShuffle(true))
+      ) {
         state.set_shuffle(true);
       }
-      crate::runtime::engine::emit_decoded_source(
-        app,
-        crate::runtime::engine::DecodedSourceFact::YouTubePlayback(state),
-      )
-      .await;
-      app
-        .lock()
-        .await
-        .set_status_message(format!("\u{266a} {display}"), 4);
+      emit(spine, Fact::YouTubePlayback(state)).await;
+      status(spine, format!("\u{266a} {display}")).await;
     }
-    Ok(Err(e)) => set_error(app, decode_hint(e)).await,
-    Err(e) => set_error(app, format!("YouTube playback task failed: {e}")).await,
+    Ok(Err(e)) => status(spine, decode_hint(e)).await,
+    Err(e) => status(spine, format!("YouTube playback task failed: {e}")).await,
   }
 }
 
 /// Move the YouTube queue index in `direction` and play the new track. Returns
 /// `true` if YouTube owns the session (so the event is consumed).
-async fn skip(app: &Arc<Mutex<App>>, direction: Direction) -> bool {
-  let target = {
-    let mut guard = app.lock().await;
-    // Repeat-all wraps at the ends; Off/Repeat-one clamp.
-    let mode = guard.decoded_repeat;
-    let Some(s) = guard.youtube_playback.as_mut() else {
-      return false; // not ours
-    };
-    // Guard the empty-sink download window from spurious auto-advance.
-    s.advancing = true;
-    let forward = matches!(direction, Direction::Next);
-    advance_index(s.index, s.tracks.len(), mode, forward)
+async fn skip(spine: &Spine, direction: Direction) -> bool {
+  let target = match decoded(
+    spine,
+    Query::YouTubeSkip {
+      forward: matches!(direction, Direction::Next),
+    },
+  )
+  .await
+  {
+    Some(Answer::YouTubeSkip(target)) => target,
+    _ => return false,
   };
 
   match target {
-    Some(idx) => play_index(app, idx).await,
-    None => {
-      // Queue boundary: clear the optimistic guard so it doesn't wedge
-      // auto-advance off for the rest of the track.
-      if let Some(s) = app.lock().await.youtube_playback.as_mut() {
-        s.advancing = false;
-      }
+    Some(idx) => {
+      emit(spine, Fact::YouTubeAdvancing(true)).await;
+      play_index(spine, idx).await;
     }
+    None => emit(spine, Fact::YouTubeAdvancing(false)).await,
   }
   true
 }
@@ -678,33 +742,20 @@ async fn skip(app: &Arc<Mutex<App>>, direction: Direction) -> bool {
 /// `yt-dlp` fetch — and on failure tears the session down (rather than leaving
 /// an empty sink that would re-fire replay every tick). Returns `true` if
 /// YouTube owns the session.
-async fn replay_current(app: &Arc<Mutex<App>>) -> bool {
-  let (player, path) = {
-    let mut guard = app.lock().await;
-    let Some(s) = guard.youtube_playback.as_mut() else {
-      return false; // not ours
-    };
-    s.advancing = true;
-    (Arc::clone(&s.player), s.tempfile.path().to_path_buf())
+async fn replay_current(spine: &Spine) -> bool {
+  let Some(Answer::YouTubeReplay(Some((player, path)))) =
+    decoded(spine, Query::YouTubeReplay).await
+  else {
+    return false;
   };
+  emit(spine, Fact::YouTubeAdvancing(true)).await;
   if replay_file(player, path).await {
-    if let Some(s) = app.lock().await.youtube_playback.as_mut() {
-      s.advancing = false;
-    }
+    emit(spine, Fact::YouTubeReplaySucceeded).await;
   } else {
-    teardown_youtube(app).await;
-    set_error(app, "Cannot replay YouTube track".to_string()).await;
+    teardown_youtube(spine).await;
+    status(spine, "Cannot replay YouTube track").await;
   }
   true
-}
-
-/// What the locked snapshot in [`play_index`] decided to do.
-enum Plan {
-  Play(Arc<LocalPlayer>, Arc<YouTubeSource>, String, String),
-  OutOfRange,
-  BadUri,
-  /// The target row is a livestream (duration 0) — its download never ends.
-  Live,
 }
 
 /// Play the queued track at `target`, reusing the published session. Used by
@@ -713,64 +764,27 @@ enum Plan {
 /// A download failure tears the session down (same rationale as Subsonic): on
 /// a network outage or a broken extractor, walking the whole queue at tick
 /// speed would spray error toasts, so one failure ends playback instead.
-pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
-  let plan = {
-    let guard = app.lock().await;
-    match guard.youtube_playback.as_ref() {
-      None => return, // session torn down between dispatch and here
-      Some(s) => match s.tracks.get(target) {
-        None => Plan::OutOfRange,
-        Some(track) if track.duration_ms == 0 => Plan::Live,
-        Some(track) => match track.uri.as_deref().map(video_id_from_uri) {
-          Some(Ok(id)) => Plan::Play(
-            Arc::clone(&s.player),
-            Arc::clone(&s.source),
-            id.to_string(),
-            track.name.clone(),
-          ),
-          _ => Plan::BadUri,
-        },
-      },
-    }
+pub(crate) async fn play_index(spine: &Spine, target: usize) {
+  let Some(Answer::YouTubePlayIndex(Some((player, source, video_id, name)))) =
+    decoded(spine, Query::YouTubePlayIndex(target)).await
+  else {
+    return;
   };
 
-  let (player, source, video_id, name) = match plan {
-    Plan::Play(p, s, id, name) => (p, s, id, name),
-    Plan::OutOfRange => {
-      if let Some(s) = app.lock().await.youtube_playback.as_mut() {
-        s.advancing = false;
-      }
-      return;
-    }
-    Plan::BadUri => {
-      teardown_youtube(app).await;
-      set_error(app, "Invalid YouTube URI".to_string()).await;
-      return;
-    }
-    Plan::Live => {
-      // Same semantics as a download failure: end the session rather than
-      // leave an empty sink + unmoved index, which would make auto-advance
-      // re-dispatch onto the same livestream row every tick.
-      teardown_youtube(app).await;
-      set_error(
-        app,
-        "Live streams aren't supported on the YouTube source yet".to_string(),
-      )
-      .await;
-      return;
-    }
-  };
+  emit(spine, Fact::YouTubeAdvancing(true)).await;
 
-  {
-    let mut guard = app.lock().await;
-    guard.set_status_message(format!("Fetching {name}\u{2026}"), 30);
-  }
+  let _ = spine
+    .emit_acked(EngineEvent::Decoded(Fact::YouTubeStatus {
+      message: format!("Fetching {name}\u{2026}"),
+      ttl_secs: 30,
+    }))
+    .await;
 
   let tmp = match download_audio(&source, &video_id).await {
     Ok(t) => t,
     Err(e) => {
-      teardown_youtube(app).await;
-      set_error(app, format!("Cannot download YouTube audio: {e}")).await;
+      teardown_youtube(spine).await;
+      status(spine, format!("Cannot download YouTube audio: {e}")).await;
       return;
     }
   };
@@ -779,14 +793,14 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
   let result = tokio::task::spawn_blocking(move || decode_player.play_file(&path)).await;
 
   match result {
-    Ok(Ok(())) => commit_index(app, target, tmp).await,
+    Ok(Ok(())) => commit_index(spine, target, tmp).await,
     Ok(Err(e)) => {
-      teardown_youtube(app).await;
-      set_error(app, decode_hint(e)).await;
+      teardown_youtube(spine).await;
+      status(spine, decode_hint(e)).await;
     }
     Err(e) => {
-      teardown_youtube(app).await;
-      set_error(app, format!("YouTube playback task failed: {e}")).await;
+      teardown_youtube(spine).await;
+      status(spine, format!("YouTube playback task failed: {e}")).await;
     }
   }
 }
@@ -795,29 +809,21 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
 /// in the new track's tempfile (dropping the previous one). Ordering is safe:
 /// the blocking `play_file` already cleared the old source from the sink, so
 /// rodio no longer holds the old file by the time it is dropped here.
-async fn commit_index(app: &Arc<Mutex<App>>, target: usize, tmp: NamedTempFile) {
-  let mut guard = app.lock().await;
-  let display = if let Some(s) = guard.youtube_playback.as_mut() {
-    s.index = target;
-    s.advancing = false;
-    s.tempfile = tmp;
-    s.tracks.get(target).map(|t| t.name.clone())
-  } else {
-    None
-  };
-  if let Some(display) = display {
-    guard.set_status_message(format!("\u{266a} {display}"), 4);
-  }
+async fn commit_index(spine: &Spine, target: usize, tmp: NamedTempFile) {
+  emit(
+    spine,
+    Fact::YouTubeIndex {
+      target,
+      tempfile: tmp,
+    },
+  )
+  .await;
 }
 
 /// End the YouTube session, releasing the output device and cleaning up the
 /// current tempfile.
-pub async fn teardown_youtube(app: &Arc<Mutex<App>>) {
-  crate::runtime::engine::emit_decoded_source(
-    app,
-    crate::runtime::engine::DecodedSourceFact::YouTubePlaybackCleared,
-  )
-  .await;
+pub async fn teardown_youtube(spine: &Spine) {
+  emit(spine, Fact::YouTubePlaybackCleared).await;
 }
 
 async fn set_error(app: &Arc<Mutex<App>>, message: String) {

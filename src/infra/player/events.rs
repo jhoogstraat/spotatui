@@ -1123,21 +1123,17 @@ fn recovery_watchdog_should_escalate(desired_playing: bool, stalled_for: Duratio
   desired_playing && stalled_for >= STALLED_PLAYBACK_RECOVERY_TIMEOUT
 }
 
-/// Reissue the published Spotify queue slot, honoring its desired-playing
-/// state: a slot the user paused is reloaded silently so a stale Spirc event
-/// cannot restart it.
+/// Reissue a published Spotify queue slot only when it should be playing. A
+/// paused slot stays logical-only; explicit resume owns the next load/play.
 async fn reissue_published_queue_slot(
   player: &Arc<StreamingPlayer>,
   uri: &str,
   desired_playing: bool,
 ) {
-  let result = if desired_playing {
-    player.play_uri(uri).await
-  } else {
-    player.load_uri_paused(uri).await
-  };
-  if let Err(e) = result {
-    info!("failed to reissue queued Spotify track: {}", e);
+  if desired_playing {
+    if let Err(e) = player.play_uri(uri).await {
+      info!("failed to reissue queued Spotify track: {}", e);
+    }
   }
 }
 

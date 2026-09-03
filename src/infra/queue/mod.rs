@@ -377,6 +377,11 @@ pub struct DecodedQueuePlayback {
   /// local-files-only build) writes it without reading it.
   #[cfg_attr(not(any(feature = "subsonic", feature = "youtube")), allow(dead_code))]
   pub fetch_id: u64,
+  /// Fold-issued lease gate held across the generation check and `play_file`.
+  /// Teardown revokes the lease under the same gate, so stale workers cannot
+  /// begin playback after supersession.
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  pub lease: std::sync::Arc<crate::runtime::engine::QueueFetchLease>,
   /// The tempfile backing a downloaded track (Subsonic / YouTube). `None` for a
   /// local file, which is played straight from disk. Held purely to keep the
   /// file alive on disk for the duration of playback (dropped with the slot), so

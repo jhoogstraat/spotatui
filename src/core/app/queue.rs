@@ -9,6 +9,19 @@ pub struct QueueState {
 }
 
 impl App {
+  /// Invalidate the native Spotify queue slot before any teardown or source
+  /// replacement. The lease revocation linearizes against paused restores.
+  #[cfg(feature = "streaming")]
+  pub(crate) fn invalidate_spotify_queue_slot(&mut self) {
+    if let Some(lease) = self.queue_slot_lease.take() {
+      lease.revoke();
+    }
+    if self.queue_now_is_spotify() {
+      self.queue_now = None;
+      self.queue_slot_generation = self.queue_slot_generation.wrapping_add(1);
+    }
+  }
+
   /// Add a track to the native cross-source queue.
   ///
   /// Rejects tracks with no URI and radio streams (a live stream is not a finite
@@ -187,6 +200,8 @@ impl App {
   /// the caller can stop it). Clears [`Self::queue_now`] either way.
   #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
   pub fn take_queue_now_decoded_player(&mut self) -> Option<Arc<crate::infra::audio::LocalPlayer>> {
+    #[cfg(feature = "streaming")]
+    self.invalidate_spotify_queue_slot();
     match self.queue_now.take() {
       Some(QueueNowPlaying::Decoded(d)) => Some(d.player),
       _ => None,
@@ -251,7 +266,7 @@ impl App {
   #[cfg(feature = "streaming")]
   pub(crate) fn handle_native_spotify_track_end(&mut self) -> bool {
     if self.queue_now_is_spotify() {
-      self.queue_now = None;
+      self.invalidate_spotify_queue_slot();
       self.spotify_queue_guard_reloads = 0;
       if let Some(player) = self.streaming_player.as_ref() {
         player.pause();
@@ -409,11 +424,16 @@ mod tests {
     app.queue_now = Some(QueueNowPlaying::Spotify {
       track: queue_track(Some("spotify:track:queued"), "Queued"),
     });
+    let queue_lease = std::sync::Arc::new(crate::runtime::engine::QueueFetchLease::new());
+    app.queue_slot_lease = Some(std::sync::Arc::clone(&queue_lease));
+    let queue_generation = app.queue_slot_generation;
     app.spotify_queue_guard_reloads = 1;
 
     assert!(app.handle_native_spotify_track_end());
 
     assert!(!app.queue_owns_playback(), "the ended slot is cleared");
+    assert!(queue_lease.with_valid(|| ()).is_none());
+    assert_ne!(app.queue_slot_generation, queue_generation);
     assert_eq!(app.spotify_queue_guard_reloads, 0);
     assert!(
       app

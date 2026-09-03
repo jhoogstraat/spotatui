@@ -124,7 +124,10 @@ async fn skip(spine: &Spine, forward: bool) -> bool {
     _ => return false,
   };
   match target {
-    Some(index) => play_index(spine, index).await,
+    Some(index) => {
+      emit(spine, Fact::LocalAdvancing(true)).await;
+      play_index(spine, index).await;
+    }
     None => emit(spine, Fact::LocalAdvancing(false)).await,
   }
   true
@@ -138,6 +141,9 @@ async fn replay_current(spine: &Spine) -> bool {
     Some(Answer::LocalReplay(target)) => target,
     _ => return false,
   };
+  if target.is_some() {
+    emit(spine, Fact::LocalAdvancing(true)).await;
+  }
   let replayed = match target {
     Some((player, path)) => replay_file(player, path).await,
     None => false,
@@ -219,40 +225,27 @@ async fn start_local_queue(spine: &Spine, queue: Vec<String>, start_idx: usize) 
 }
 
 async fn teardown_backends(spine: &Spine, clear_local: bool) {
-  let backends = decoded(
-    spine,
-    Query::ClaimBackendPlayers {
+  let backends = spine
+    .emit_acked(EngineEvent::Decoded(Fact::ClaimBackendPlayers {
       keep: (!clear_local).then_some(crate::core::source::Source::Local),
-    },
-  )
-  .await;
-  if let Some(Answer::BackendPlayers {
+    }))
+    .await
+    .and_then(|ack| ack.backend_players);
+  if let Some(backends) = backends {
     #[cfg(feature = "streaming")]
-    streaming,
-    #[cfg(feature = "local-files")]
-      local: _,
-    #[cfg(feature = "subsonic")]
-    subsonic,
-    #[cfg(feature = "internet-radio")]
-    radio,
-    #[cfg(feature = "youtube")]
-    youtube,
-  }) = backends
-  {
-    #[cfg(feature = "streaming")]
-    if let Some(player) = streaming {
+    if let Some(player) = backends.streaming {
       player.pause();
     }
     #[cfg(feature = "subsonic")]
-    if let Some(player) = subsonic {
+    if let Some(player) = backends.subsonic {
       player.stop();
     }
     #[cfg(feature = "internet-radio")]
-    if let Some(player) = radio {
+    if let Some(player) = backends.radio {
       player.stop();
     }
     #[cfg(feature = "youtube")]
-    if let Some(player) = youtube {
+    if let Some(player) = backends.youtube {
       player.stop();
     }
   }
@@ -278,6 +271,7 @@ pub(crate) async fn play_index(spine: &Spine, target: usize) {
     Some(Answer::LocalPlayIndex(Some(value))) => value,
     _ => return,
   };
+  emit(spine, Fact::LocalAdvancing(true)).await;
   let path = match file_uri_to_path(&uri) {
     Ok(path) => path,
     Err(error) => {

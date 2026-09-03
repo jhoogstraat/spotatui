@@ -292,7 +292,7 @@ pub(crate) fn clear_native_recovery_intent_for_external_playback(app: &mut App) 
   app.last_device_activation = None;
   app.clear_native_playback_recovery();
   if app.queue_now_is_spotify() {
-    app.queue_now = None;
+    app.invalidate_spotify_queue_slot();
     app.spotify_queue_guard_reloads = 0;
   }
 }
@@ -3201,6 +3201,9 @@ mod tests {
     app.queue_now = Some(QueueNowPlaying::Spotify {
       track: queued_track("spotify:track:queued"),
     });
+    let queue_lease = std::sync::Arc::new(crate::runtime::engine::QueueFetchLease::new());
+    app.queue_slot_lease = Some(std::sync::Arc::clone(&queue_lease));
+    let queue_generation = app.queue_slot_generation;
     app.spotify_queue_guard_reloads = 2;
     app.is_streaming_active = true;
     app.native_activation_pending = true;
@@ -3213,6 +3216,8 @@ mod tests {
     assert!(app.last_device_activation.is_none());
     assert!(app.native_playback_recovery.is_none());
     assert!(app.queue_now.is_none());
+    assert!(queue_lease.with_valid(|| ()).is_none());
+    assert_ne!(app.queue_slot_generation, queue_generation);
     assert_eq!(app.spotify_queue_guard_reloads, 0);
     assert!(app.pending_start_playback.is_some());
   }

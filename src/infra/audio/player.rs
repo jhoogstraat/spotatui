@@ -49,6 +49,16 @@ pub struct LocalPlayer {
 }
 
 impl LocalPlayer {
+  #[cfg(test)]
+  pub(crate) fn silent_for_test() -> Self {
+    let (sink, _output) = Player::new();
+    let (keepalive, _receiver) = mpsc::channel();
+    Self {
+      sink,
+      _keepalive: keepalive,
+    }
+  }
+
   /// Open the default audio output device and return a ready player.
   ///
   /// **Blocking:** waits for the audio thread to open the device. Call once at
@@ -85,17 +95,35 @@ impl LocalPlayer {
     // instead of dead-ending on a stale, still-playing track.
     self.sink.clear();
 
+    let decoder = Self::decode_file(path)?;
+    self.play_decoded(decoder);
+    Ok(())
+  }
+
+  /// Decode a file without touching the sink. Queue workers use this before
+  /// taking their short ownership lease, so a stale download cannot hold the
+  /// fold hostage during disk I/O or codec work.
+  #[cfg_attr(
+    not(any(feature = "local-files", feature = "subsonic")),
+    allow(dead_code)
+  )]
+  pub(crate) fn decode_file(path: &Path) -> Result<Decoder<BufReader<std::fs::File>>> {
     let file = std::fs::File::open(path)
       .with_context(|| format!("opening audio file {}", path.display()))?;
+    Decoder::new(BufReader::new(file))
+      .with_context(|| format!("decoding audio file {}", path.display()))
+  }
 
-    // On decode error we return with the sink already empty (no old track
-    // playing); on success we append and start the new source below.
-    let decoder = Decoder::new(BufReader::new(file))
-      .with_context(|| format!("decoding audio file {}", path.display()))?;
-
+  /// Replace the sink with an already-decoded source. Callers that need
+  /// cancellation/ownership ordering wrap this short mutation in their gate.
+  #[cfg_attr(
+    not(any(feature = "local-files", feature = "subsonic")),
+    allow(dead_code)
+  )]
+  pub(crate) fn play_decoded(&self, decoder: Decoder<BufReader<std::fs::File>>) {
+    self.sink.clear();
     self.sink.append(decoder);
     self.sink.play();
-    Ok(())
   }
 
   /// Decode an already-opened **live stream** and play it, replacing whatever

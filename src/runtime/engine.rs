@@ -198,6 +198,63 @@ pub enum HistoryFact {
 /// Fold-owned writes for the decoded sources.  Read-only decisions still use
 /// the existing `FoldQuery` protocol; these facts carry only completed work.
 pub enum DecodedSourceFact {
+  /// Native queue ownership facts. Queue workers emit these after their I/O;
+  /// the fold is the only writer of `queue_now`/`queue_suspended`.
+  #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+  QueuePendingDecoded {
+    player: Arc<crate::infra::audio::LocalPlayer>,
+    track: crate::core::plugin_api::TrackInfo,
+    fetch_id: u64,
+  },
+  #[cfg(feature = "local-files")]
+  QueueDecodedLocalReady { fetch_id: u64 },
+  #[cfg(feature = "streaming")]
+  QueueSpotifyPublished(crate::core::plugin_api::TrackInfo),
+  #[cfg(feature = "streaming")]
+  QueueSpotifyCleared,
+  #[cfg(feature = "streaming")]
+  QueueTransportIntent { generation: u64, is_playing: bool },
+  #[cfg(feature = "streaming")]
+  QueueSpotifyPausedRestored { generation: u64 },
+  #[cfg(feature = "streaming")]
+  QueueNativeTrackPopped {
+    track: crate::core::plugin_api::TrackInfo,
+  },
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube"
+  ))]
+  QueuePlaybackCleared,
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube"
+  ))]
+  QueueSlotCleared,
+  /// Ordered teardown of every decoded backend except `keep`. The ack carries
+  /// the claimed handles so the caller can stop them without another query.
+  #[cfg(any(
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube",
+    feature = "internet-radio"
+  ))]
+  ClaimBackendPlayers {
+    keep: Option<crate::core::source::Source>,
+  },
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube",
+    feature = "internet-radio"
+  ))]
+  QueueTakeSuspended,
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  QueueFetchClaimed { fetch_id: u64 },
   #[cfg(feature = "local-files")]
   LocalPlaylists(Vec<crate::core::plugin_api::PlaylistInfo>),
   #[cfg(feature = "local-files")]
@@ -220,6 +277,8 @@ pub enum DecodedSourceFact {
   RadioPlayback(crate::infra::radio::RadioPlaybackState),
   #[cfg(feature = "internet-radio")]
   RadioPlaybackCleared,
+  #[cfg(feature = "internet-radio")]
+  RadioResume(crate::core::plugin_api::TrackInfo),
   #[cfg(feature = "youtube")]
   YouTubePlaylists(Vec<crate::core::plugin_api::PlaylistInfo>),
   #[cfg(feature = "youtube")]
@@ -228,6 +287,17 @@ pub enum DecodedSourceFact {
   YouTubePlayback(crate::infra::youtube::YouTubePlaybackState),
   #[cfg(feature = "youtube")]
   YouTubePlaybackCleared,
+  #[cfg(feature = "youtube")]
+  YouTubeStatus { message: String, ttl_secs: u64 },
+  #[cfg(feature = "youtube")]
+  YouTubeAdvancing(bool),
+  #[cfg(feature = "youtube")]
+  YouTubeIndex {
+    target: usize,
+    tempfile: tempfile::NamedTempFile,
+  },
+  #[cfg(feature = "youtube")]
+  YouTubeReplaySucceeded,
   /// Shared runtime volume mirror used by all decoded sources.
   Volume(u8),
   #[cfg(feature = "local-files")]
@@ -261,6 +331,14 @@ pub enum DecodedSourceFact {
   SubsonicRepeat(crate::infra::queue::RepeatMode),
   #[cfg(feature = "internet-radio")]
   RadioStatus { message: String, ttl_secs: u64 },
+  /// Completion of a detached decoded queue fetch. The producer owns only
+  /// immutable I/O inputs and reports every terminal outcome here; the fold
+  /// decides whether the fetch is still the live queue slot.
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  QueueFetchCompleted {
+    fetch_id: u64,
+    result: QueueFetchResult,
+  },
 }
 
 /// Typed decoded-source reads. Source handlers receive the live `Spine` and
@@ -303,20 +381,30 @@ pub enum DecodedSourceQuery {
   SubsonicPlayIndex(usize),
   #[cfg(feature = "subsonic")]
   SubsonicRepeat(rspotify::model::enums::RepeatState),
-  #[cfg(any(
-    feature = "local-files",
-    feature = "subsonic",
-    feature = "internet-radio"
-  ))]
-  ClaimBackendPlayers {
-    keep: Option<crate::core::source::Source>,
-  },
   #[cfg(feature = "internet-radio")]
   RadioPlayer,
   #[cfg(feature = "internet-radio")]
   RadioStationsSnapshot(String),
   #[cfg(feature = "internet-radio")]
   RadioConfig,
+  #[cfg(feature = "youtube")]
+  YouTubeConfig,
+  #[cfg(feature = "youtube")]
+  YouTubePlayer,
+  #[cfg(feature = "youtube")]
+  YouTubeTracks(Vec<String>),
+  #[cfg(feature = "youtube")]
+  YouTubeSkip {
+    forward: bool,
+  },
+  #[cfg(feature = "youtube")]
+  YouTubeReplay,
+  #[cfg(feature = "youtube")]
+  YouTubePlayIndex(usize),
+  #[cfg(feature = "youtube")]
+  YouTubeShuffle,
+  #[cfg(feature = "youtube")]
+  YouTubeRepeat(rspotify::model::enums::RepeatState),
   Volume,
 }
 
@@ -342,23 +430,6 @@ pub enum DecodedSourceAnswer {
   LocalPlayIndex(Option<(Arc<crate::infra::audio::LocalPlayer>, String)>),
   #[cfg(feature = "local-files")]
   LocalRepeat(bool),
-  #[cfg(any(
-    feature = "local-files",
-    feature = "subsonic",
-    feature = "internet-radio"
-  ))]
-  BackendPlayers {
-    #[cfg(feature = "streaming")]
-    streaming: Option<Arc<crate::infra::player::StreamingPlayer>>,
-    #[cfg(feature = "local-files")]
-    local: Option<Arc<crate::infra::audio::LocalPlayer>>,
-    #[cfg(feature = "subsonic")]
-    subsonic: Option<Arc<crate::infra::audio::LocalPlayer>>,
-    #[cfg(feature = "internet-radio")]
-    radio: Option<Arc<crate::infra::audio::LocalPlayer>>,
-    #[cfg(feature = "youtube")]
-    youtube: Option<Arc<crate::infra::audio::LocalPlayer>>,
-  },
   #[cfg(feature = "subsonic")]
   SubsonicConfig {
     url: Option<String>,
@@ -388,6 +459,29 @@ pub enum DecodedSourceAnswer {
     configured: Vec<crate::core::state::RadioStationConfig>,
     saved: Vec<crate::core::state::RadioStationConfig>,
   },
+  #[cfg(feature = "youtube")]
+  YouTubeConfig(Option<String>),
+  #[cfg(feature = "youtube")]
+  YouTubePlayer(Option<Arc<crate::infra::audio::LocalPlayer>>),
+  #[cfg(feature = "youtube")]
+  YouTubeTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(feature = "youtube")]
+  YouTubeSkip(Option<usize>),
+  #[cfg(feature = "youtube")]
+  YouTubeReplay(Option<(Arc<crate::infra::audio::LocalPlayer>, std::path::PathBuf)>),
+  #[cfg(feature = "youtube")]
+  YouTubePlayIndex(
+    Option<(
+      Arc<crate::infra::audio::LocalPlayer>,
+      Arc<crate::infra::youtube::YouTubeSource>,
+      String,
+      String,
+    )>,
+  ),
+  #[cfg(feature = "youtube")]
+  YouTubeShuffle(bool),
+  #[cfg(feature = "youtube")]
+  YouTubeRepeat(bool),
 }
 
 #[cfg(feature = "subsonic")]
@@ -406,6 +500,51 @@ pub type SubsonicPlayTarget = Option<
 impl std::fmt::Debug for DecodedSourceFact {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     let name = match self {
+      #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+      Self::QueuePendingDecoded { .. } => "QueuePendingDecoded",
+      #[cfg(feature = "local-files")]
+      Self::QueueDecodedLocalReady { .. } => "QueueDecodedLocalReady",
+      #[cfg(feature = "streaming")]
+      Self::QueueSpotifyPublished(_) => "QueueSpotifyPublished",
+      #[cfg(feature = "streaming")]
+      Self::QueueSpotifyCleared => "QueueSpotifyCleared",
+      #[cfg(feature = "streaming")]
+      Self::QueueTransportIntent { .. } => "QueueTransportIntent",
+      #[cfg(feature = "streaming")]
+      Self::QueueSpotifyPausedRestored { .. } => "QueueSpotifyPausedRestored",
+      #[cfg(feature = "streaming")]
+      Self::QueueNativeTrackPopped { .. } => "QueueNativeTrackPopped",
+      #[cfg(any(
+        feature = "streaming",
+        feature = "local-files",
+        feature = "subsonic",
+        feature = "youtube"
+      ))]
+      Self::QueuePlaybackCleared => "QueuePlaybackCleared",
+      #[cfg(any(
+        feature = "streaming",
+        feature = "local-files",
+        feature = "subsonic",
+        feature = "youtube"
+      ))]
+      Self::QueueSlotCleared => "QueueSlotCleared",
+      #[cfg(any(
+        feature = "local-files",
+        feature = "subsonic",
+        feature = "youtube",
+        feature = "internet-radio"
+      ))]
+      Self::ClaimBackendPlayers { .. } => "ClaimBackendPlayers",
+      #[cfg(any(
+        feature = "streaming",
+        feature = "local-files",
+        feature = "subsonic",
+        feature = "youtube",
+        feature = "internet-radio"
+      ))]
+      Self::QueueTakeSuspended => "QueueTakeSuspended",
+      #[cfg(any(feature = "subsonic", feature = "youtube"))]
+      Self::QueueFetchClaimed { .. } => "QueueFetchClaimed",
       #[cfg(feature = "local-files")]
       Self::LocalPlaylists(_) => "LocalPlaylists",
       #[cfg(feature = "local-files")]
@@ -428,6 +567,8 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::RadioPlayback(_) => "RadioPlayback",
       #[cfg(feature = "internet-radio")]
       Self::RadioPlaybackCleared => "RadioPlaybackCleared",
+      #[cfg(feature = "internet-radio")]
+      Self::RadioResume(_) => "RadioResume",
       #[cfg(feature = "youtube")]
       Self::YouTubePlaylists(_) => "YouTubePlaylists",
       #[cfg(feature = "youtube")]
@@ -436,6 +577,14 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::YouTubePlayback(_) => "YouTubePlayback",
       #[cfg(feature = "youtube")]
       Self::YouTubePlaybackCleared => "YouTubePlaybackCleared",
+      #[cfg(feature = "youtube")]
+      Self::YouTubeStatus { .. } => "YouTubeStatus",
+      #[cfg(feature = "youtube")]
+      Self::YouTubeAdvancing(_) => "YouTubeAdvancing",
+      #[cfg(feature = "youtube")]
+      Self::YouTubeIndex { .. } => "YouTubeIndex",
+      #[cfg(feature = "youtube")]
+      Self::YouTubeReplaySucceeded => "YouTubeReplaySucceeded",
       #[cfg(feature = "local-files")]
       Self::LocalAdvancing(_) => "LocalAdvancing",
       #[cfg(feature = "local-files")]
@@ -460,9 +609,36 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::SubsonicRepeat(_) => "SubsonicRepeat",
       #[cfg(feature = "internet-radio")]
       Self::RadioStatus { .. } => "RadioStatus",
+      #[cfg(any(feature = "subsonic", feature = "youtube"))]
+      Self::QueueFetchCompleted { .. } => "QueueFetchCompleted",
       Self::Volume(_) => "Volume",
     };
     f.write_str(name)
+  }
+}
+
+/// Terminal result of a decoded queue worker. `Empty`, `Cancelled`, and
+/// `Superseded` are explicit so an abandoned worker never looks like a silent
+/// success or mutates the next queue item.
+#[cfg(any(feature = "subsonic", feature = "youtube"))]
+pub enum QueueFetchResult {
+  Success(tempfile::NamedTempFile),
+  Empty,
+  Failure(String),
+  Cancelled,
+  Superseded,
+}
+
+#[cfg(any(feature = "subsonic", feature = "youtube"))]
+impl std::fmt::Debug for QueueFetchResult {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(match self {
+      Self::Success(_) => "Success",
+      Self::Empty => "Empty",
+      Self::Failure(_) => "Failure",
+      Self::Cancelled => "Cancelled",
+      Self::Superseded => "Superseded",
+    })
   }
 }
 
@@ -1082,6 +1258,9 @@ pub enum FoldQuery {
   /// Decoded-source read envelope; concrete variants are kept in the source
   /// domain so this central vocabulary stays compact.
   Decoded(DecodedSourceQuery),
+  /// Snapshot the decoded queue player without changing ownership.
+  #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+  QueueDecodedPlayer,
   /// Was this library request superseded before it even fetched? The
   /// detached prefetch workers check their generation against the fold's
   /// (the old `app.saved_tracks_prefetch_generation == generation` read).
@@ -1469,6 +1648,8 @@ pub enum FoldAnswer {
   HistoryState(HistoryQueryState),
   /// The native queue's tracks, in order.
   QueueTracks(Vec<crate::core::plugin_api::TrackInfo>),
+  #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+  QueueDecodedPlayer(Option<Arc<crate::infra::audio::LocalPlayer>>),
   #[cfg(feature = "streaming")]
   NativePlayerState(NativePlayerState),
   #[cfg(feature = "streaming")]
@@ -1591,6 +1772,11 @@ impl std::fmt::Debug for FoldAnswer {
         .field("recap", &v.enable_monthly_recap_prompt)
         .finish(),
       FoldAnswer::QueueTracks(v) => f.debug_tuple("QueueTracks").field(&v.len()).finish(),
+      #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+      FoldAnswer::QueueDecodedPlayer(v) => f
+        .debug_tuple("QueueDecodedPlayer")
+        .field(&v.is_some())
+        .finish(),
       #[cfg(feature = "streaming")]
       FoldAnswer::NativePlayerState(v) => f.debug_tuple("NativePlayerState").field(v).finish(),
       #[cfg(feature = "streaming")]
@@ -1887,6 +2073,30 @@ pub struct FoldAck {
   /// fold's generation/pointer guard (e.g. queue continuation).
   #[cfg(feature = "streaming")]
   pub native: Option<NativePlaybackAck>,
+  /// Track atomically removed by a native-queue pop fact.
+  #[cfg(feature = "streaming")]
+  pub queue_track: Option<crate::core::plugin_api::TrackInfo>,
+  /// Handles removed by an ordered backend-ownership claim.
+  #[cfg(any(
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube",
+    feature = "internet-radio"
+  ))]
+  pub backend_players: Option<ClaimedBackendPlayers>,
+  /// Result of an ordered queue worker claim (the player and volume snapshot).
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  pub queue_fetch_claim: Option<QueueFetchClaim>,
+  /// Result of an ordered suspended-context take. `None` means this ack was
+  /// for another fact; `Some(None)` means no context was suspended.
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube",
+    feature = "internet-radio"
+  ))]
+  pub queue_suspended: Option<Option<crate::core::queue::SuspendedContext>>,
 }
 
 #[cfg(feature = "streaming")]
@@ -1934,6 +2144,111 @@ impl std::fmt::Debug for NativePlaybackAck {
       Self::RecoveryRoute(_) => "RecoveryRoute",
     };
     f.write_str(name)
+  }
+}
+
+#[cfg(any(
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube",
+  feature = "internet-radio"
+))]
+#[derive(Clone)]
+pub struct ClaimedBackendPlayers {
+  #[cfg(feature = "streaming")]
+  pub streaming: Option<Arc<crate::infra::player::StreamingPlayer>>,
+  #[cfg(feature = "local-files")]
+  pub local: Option<Arc<crate::infra::audio::LocalPlayer>>,
+  #[cfg(feature = "subsonic")]
+  pub subsonic: Option<Arc<crate::infra::audio::LocalPlayer>>,
+  #[cfg(feature = "internet-radio")]
+  pub radio: Option<Arc<crate::infra::audio::LocalPlayer>>,
+  #[cfg(feature = "youtube")]
+  pub youtube: Option<Arc<crate::infra::audio::LocalPlayer>>,
+}
+
+#[cfg(any(
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube",
+  feature = "internet-radio"
+))]
+impl std::fmt::Debug for ClaimedBackendPlayers {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ClaimedBackendPlayers")
+      .finish_non_exhaustive()
+  }
+}
+
+#[cfg(any(feature = "subsonic", feature = "youtube"))]
+#[derive(Clone)]
+pub struct QueueFetchClaim {
+  pub player: Arc<crate::infra::audio::LocalPlayer>,
+  pub volume: u8,
+  pub lease: Arc<QueueFetchLease>,
+}
+
+#[cfg(any(feature = "subsonic", feature = "youtube"))]
+impl std::fmt::Debug for QueueFetchClaim {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("QueueFetchClaim")
+      .field("volume", &self.volume)
+      .finish_non_exhaustive()
+  }
+}
+
+#[cfg(any(feature = "streaming", feature = "subsonic", feature = "youtube"))]
+pub struct QueueFetchLease {
+  gate: std::sync::Mutex<()>,
+  valid: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(feature = "streaming", feature = "subsonic", feature = "youtube"))]
+impl QueueFetchLease {
+  pub fn new() -> Self {
+    Self {
+      gate: std::sync::Mutex::new(()),
+      valid: std::sync::atomic::AtomicBool::new(true),
+    }
+  }
+
+  pub fn revoke(&self) {
+    let _guard = self.gate.lock().expect("queue lease gate poisoned");
+    self
+      .valid
+      .store(false, std::sync::atomic::Ordering::Release);
+  }
+
+  /// Run the sink-start mutation only while this fetch still owns its slot.
+  /// The callback must stay tiny: decoding happens before this gate is taken.
+  pub(crate) fn with_valid<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+    let _guard = self.gate.lock().expect("queue lease gate poisoned");
+    if !self.valid.load(std::sync::atomic::Ordering::Acquire) {
+      return None;
+    }
+    Some(f())
+  }
+
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  pub fn play_file(
+    &self,
+    player: &crate::infra::audio::LocalPlayer,
+    path: &std::path::Path,
+  ) -> anyhow::Result<()> {
+    let decoder = match crate::infra::audio::LocalPlayer::decode_file(path) {
+      Ok(decoder) => decoder,
+      Err(error) => {
+        // Preserve LocalPlayer's failure semantics without clearing a sink
+        // after teardown has revoked this worker.
+        let _ = self.with_valid(|| player.stop());
+        return Err(error);
+      }
+    };
+    self
+      .with_valid(|| {
+        player.play_decoded(decoder);
+      })
+      .ok_or_else(|| anyhow::anyhow!("queue fetch lease revoked"))
   }
 }
 
@@ -2211,5 +2526,41 @@ mod tests {
     };
     let _ = responder.send(None);
     assert!(ack_task.await.unwrap().is_none());
+  }
+
+  #[cfg(any(feature = "streaming", feature = "subsonic", feature = "youtube"))]
+  #[test]
+  fn queue_fetch_lease_serializes_start_and_teardown() {
+    use std::sync::{mpsc, Arc, Barrier};
+
+    let lease = Arc::new(QueueFetchLease::new());
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let started_lease = Arc::clone(&lease);
+    let started_entered = Arc::clone(&entered);
+    let started_release = Arc::clone(&release);
+    let worker = std::thread::spawn(move || {
+      started_lease.with_valid(|| {
+        started_entered.wait();
+        started_release.wait();
+      })
+    });
+
+    entered.wait();
+    let (revoked, done) = mpsc::channel();
+    let revoke_lease = Arc::clone(&lease);
+    let revoker = std::thread::spawn(move || {
+      revoke_lease.revoke();
+      revoked.send(()).unwrap();
+    });
+    assert!(
+      done.try_recv().is_err(),
+      "teardown waits for the short start gate"
+    );
+    release.wait();
+    assert!(worker.join().unwrap().is_some());
+    revoker.join().unwrap();
+    assert!(done.try_recv().is_ok());
+    assert!(lease.with_valid(|| ()).is_none(), "stale start is rejected");
   }
 }

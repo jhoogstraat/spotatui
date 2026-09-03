@@ -66,6 +66,10 @@ impl Default for App {
       spotify_queue_guard_reloads: 0,
       #[cfg(feature = "streaming")]
       queue_slot_desired_playing: true,
+      #[cfg(feature = "streaming")]
+      queue_slot_generation: 0,
+      #[cfg(feature = "streaming")]
+      queue_slot_lease: None,
       playlist_offset: 0,
       playlist_tracks: None,
       playlist_track_pages: ScrollableResultPages::new(),
