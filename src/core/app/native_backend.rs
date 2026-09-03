@@ -106,8 +106,10 @@ impl App {
 
     self.set_status_message("Native streaming disconnected; attempting recovery.", 8);
     if let Some(tx) = &self.streaming_recovery_tx {
+      let generation = self.native_playback_restore_generation().unwrap_or(0);
       self.native_backend_pending = tx
         .send(crate::infra::player::StreamingRecoveryRequest {
+          generation,
           reselect_device,
           restore_playback: true,
           continue_after_track: None,

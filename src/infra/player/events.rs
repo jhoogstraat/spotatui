@@ -37,6 +37,9 @@ fn session_disconnect_recovery(reason: SessionDisconnectReason) -> SessionDiscon
 
 #[derive(Clone, Default)]
 pub struct StreamingRecoveryRequest {
+  /// Playback generation that requested recovery. A completion from an older
+  /// generation must not replace or clear a newer native session.
+  pub generation: u64,
   pub reselect_device: bool,
   pub restore_playback: bool,
   pub continue_after_track: Option<String>,
@@ -108,6 +111,18 @@ pub fn spawn_streaming_recovery_handler(ctx: StreamingRecoveryContext) {
 /// (`restore_playback == false`) stickily vetoes restore/reselect: restoring
 /// over the user's handoff would steal playback back (#437).
 fn merge_recovery_requests(request: &mut StreamingRecoveryRequest, next: StreamingRecoveryRequest) {
+  // A handoff is a user veto, not a generation-local hint. Preserve it when
+  // a newer restore request supersedes the request carrying that veto.
+  let handoff_vetoed = !request.restore_playback || !next.restore_playback;
+  if request.generation != next.generation {
+    *request = next;
+    if handoff_vetoed {
+      request.reselect_device = false;
+      request.restore_playback = false;
+      request.continue_after_track = None;
+    }
+    return;
+  }
   if !request.restore_playback || !next.restore_playback {
     request.reselect_device = false;
     request.restore_playback = false;
@@ -144,13 +159,13 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
       );
       let _ = ctx
         .spine
-        .query(
-          crate::runtime::engine::FoldQuery::NativePlayerRecoveryRoute {
+        .emit_acked(crate::runtime::engine::EngineEvent::Native(
+          crate::runtime::engine::NativePlaybackFact::RecoveryRoute {
             player: active_player.expect("active player checked above"),
             request,
             device_name: ctx.client_config.streaming_device_name.clone(),
           },
-        )
+        ))
         .await;
       continue;
     }
@@ -184,13 +199,30 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
     {
       Ok(recovered_player) => {
         let recovered_player = Arc::new(recovered_player);
-        if let Ok(crate::runtime::engine::FoldAnswer::StreamingPlayer(Some(old))) = ctx
+        let installed = ctx
           .spine
-          .query(crate::runtime::engine::FoldQuery::NativePlayerInstall {
-            player: Arc::clone(&recovered_player),
-          })
+          .emit_acked(crate::runtime::engine::EngineEvent::Native(
+            crate::runtime::engine::NativePlaybackFact::Install {
+              player: Arc::clone(&recovered_player),
+              generation: Some(request.generation),
+            },
+          ))
           .await
-        {
+          .and_then(|ack| ack.native)
+          .and_then(|ack| match ack {
+            crate::runtime::engine::NativePlaybackAck::Installed { old, accepted } => {
+              Some((old, accepted))
+            }
+            _ => None,
+          });
+        let Some((old, accepted)) = installed else {
+          recovered_player.shutdown();
+          continue;
+        };
+        if !accepted {
+          continue;
+        }
+        if let Some(old) = old {
           if !Arc::ptr_eq(&old, &recovered_player) {
             old.shutdown();
           }
@@ -216,24 +248,25 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
         );
         let _ = ctx
           .spine
-          .query(
-            crate::runtime::engine::FoldQuery::NativePlayerRecoveryRoute {
+          .emit_acked(crate::runtime::engine::EngineEvent::Native(
+            crate::runtime::engine::NativePlaybackFact::RecoveryRoute {
               player: Arc::clone(&recovered_player),
               request,
               device_name: ctx.client_config.streaming_device_name.clone(),
             },
-          )
+          ))
           .await;
       }
       Err(e) => {
         info!("native streaming recovery failed: {}", e);
         let _ = ctx
           .spine
-          .query(
-            crate::runtime::engine::FoldQuery::NativePlayerRecoveryFailed {
+          .emit_acked(crate::runtime::engine::EngineEvent::Native(
+            crate::runtime::engine::NativePlaybackFact::RecoveryFailed {
+              generation: request.generation,
               error: e.to_string(),
             },
-          )
+          ))
           .await;
       }
     }
@@ -270,14 +303,17 @@ async fn apply_streaming_facts(
   for fact in facts {
     applied &= matches!(
       spine
-        .query(crate::runtime::engine::FoldQuery::NativePlayerFact {
-          player: Arc::clone(player),
-          event: fact,
-        })
+        .emit_acked(crate::runtime::engine::EngineEvent::Native(
+          crate::runtime::engine::NativePlaybackFact::State {
+            player: Arc::clone(player),
+            event: fact,
+          },
+        ))
         .await,
-      Ok(crate::runtime::engine::FoldAnswer::NativePlayerFactApplied(
-        true
-      ))
+      Some(crate::runtime::engine::FoldAck {
+        native: Some(crate::runtime::engine::NativePlaybackAck::Applied(true)),
+        ..
+      })
     );
   }
   // Recovery-observer side effects still need synchronous execution against
@@ -389,7 +425,7 @@ async fn handle_player_events(
             transport_recovery_pending = true;
             last_progress_at = Instant::now();
             info!("native streaming fast reconnect generation {} started", generation);
-            let _ = spine.query(crate::runtime::engine::FoldQuery::NativePlayerReconnect { player: Arc::clone(&player), connected: false }).await;
+            let _ = spine.emit(crate::runtime::engine::EngineEvent::Native(crate::runtime::engine::NativePlaybackFact::Reconnect { player: Arc::clone(&player), connected: false })).await;
           }
           StreamingConnectionState::Connected { generation }
             if session_lost || generation != observed_connection_generation =>
@@ -401,7 +437,7 @@ async fn handle_player_events(
             transport_recovery_pending = true;
             last_progress_at = Instant::now();
             info!("native streaming fast reconnect generation {} completed", generation);
-            let _ = spine.query(crate::runtime::engine::FoldQuery::NativePlayerReconnect { player: Arc::clone(&player), connected: true }).await;
+            let _ = spine.emit(crate::runtime::engine::EngineEvent::Native(crate::runtime::engine::NativePlaybackFact::Reconnect { player: Arc::clone(&player), connected: true })).await;
           }
           StreamingConnectionState::Connected { .. } => {}
           StreamingConnectionState::Failed { generation } => {
@@ -546,13 +582,18 @@ async fn handle_player_events(
         // progress land via the fold task instead of bare field writes.
         let current = matches!(
           spine
-            .query(crate::runtime::engine::FoldQuery::NativePlayerPlaying {
-              player: Arc::clone(&player),
-              track_uri: track_uri.clone(),
-              position_ms,
-            })
+            .emit_acked(crate::runtime::engine::EngineEvent::Native(
+              crate::runtime::engine::NativePlaybackFact::Playing {
+                player: Arc::clone(&player),
+                track_uri: track_uri.clone(),
+                position_ms,
+              }
+            ))
             .await,
-          Ok(crate::runtime::engine::FoldAnswer::NativePlayerPlaying { current: true })
+          Some(crate::runtime::engine::FoldAck {
+            native: Some(crate::runtime::engine::NativePlaybackAck::Playing { current: true }),
+            ..
+          })
         );
         if current {
           shared_is_playing.store(true, Ordering::Relaxed);
@@ -580,13 +621,18 @@ async fn handle_player_events(
         // Reaction half: recovery confirmation in the paused state.
         let current = matches!(
           spine
-            .query(crate::runtime::engine::FoldQuery::NativePlayerPaused {
-              player: Arc::clone(&player),
-              track_uri: track_uri.clone(),
-              position_ms,
-            })
+            .emit_acked(crate::runtime::engine::EngineEvent::Native(
+              crate::runtime::engine::NativePlaybackFact::Paused {
+                player: Arc::clone(&player),
+                track_uri: track_uri.clone(),
+                position_ms,
+              }
+            ))
             .await,
-          Ok(crate::runtime::engine::FoldAnswer::NativePlayerPaused { current: true })
+          Some(crate::runtime::engine::FoldAck {
+            native: Some(crate::runtime::engine::NativePlaybackAck::Paused { current: true }),
+            ..
+          })
         );
         if current {
           shared_is_playing.store(false, Ordering::Relaxed);
@@ -664,8 +710,8 @@ async fn handle_player_events(
         // The restore observer keeps the full URI (it canonicalizes internally).
         let playing_uri = audio_item.track_id.to_string();
         let decision = spine
-          .query(
-            crate::runtime::engine::FoldQuery::NativePlayerTrackChanged {
+          .emit_acked(crate::runtime::engine::EngineEvent::Native(
+            crate::runtime::engine::NativePlaybackFact::TrackChanged {
               player: Arc::clone(&player),
               track_uri: playing_uri.clone(),
               info: crate::core::app::NativeTrackInfo {
@@ -682,13 +728,14 @@ async fn handle_player_events(
               },
               previous_track_id: pending_end_of_track.clone(),
             },
-          )
-          .await
-          .ok();
-        let (current, reload_uri, transition_advanced) = match decision {
-          Some(crate::runtime::engine::FoldAnswer::NativePlayerTrackChanged(d)) => {
-            (d.current, d.reload_uri, d.transition_advanced)
-          }
+          ))
+          .await;
+        let (current, reload_uri, transition_advanced) = match decision.and_then(|a| a.native) {
+          Some(crate::runtime::engine::NativePlaybackAck::TrackChanged {
+            current,
+            reload_uri,
+            transition_advanced,
+          }) => (current, reload_uri, transition_advanced),
           _ => (false, None, false),
         };
         if current {
@@ -778,18 +825,23 @@ async fn handle_player_events(
         // `EndOfTrack { reset_progress: true }` (below); the decision logic
         // itself stays synchronous because it must observe pre-clear state.
         let decision = spine
-          .query(crate::runtime::engine::FoldQuery::NativePlayerEndOfTrack {
-            player: Arc::clone(&player),
-            previous_track_id: previous_track_id.clone(),
-          })
-          .await
-          .ok();
-        let (current, should_ensure_playback, reissue_queue_slot) = match decision {
-          Some(crate::runtime::engine::FoldAnswer::NativePlayerEndOfTrack(d)) => {
-            (d.current, d.should_ensure_playback, d.reissue_queue_slot)
-          }
-          _ => (false, false, None),
-        };
+          .emit_acked(crate::runtime::engine::EngineEvent::Native(
+            crate::runtime::engine::NativePlaybackFact::EndOfTrack {
+              player: Arc::clone(&player),
+              previous_track_id: previous_track_id.clone(),
+            },
+          ))
+          .await;
+        let (current, should_ensure_playback, reissue_queue_slot) =
+          match decision.and_then(|a| a.native) {
+            Some(crate::runtime::engine::NativePlaybackAck::EndOfTrack {
+              current,
+              should_ensure_playback,
+              reissue_queue_slot,
+              ..
+            }) => (current, should_ensure_playback, reissue_queue_slot),
+            _ => (false, false, None),
+          };
         if current {
           #[cfg(all(feature = "mpris", target_os = "linux"))]
           if let Some(ref mpris) = mpris_manager {
@@ -916,10 +968,12 @@ async fn handle_player_events(
             // shutdowns remove the player before this event, failing the
             // ptr_eq guard above.)
             let _ = spine
-              .query(crate::runtime::engine::FoldQuery::NativePlayerReconnect {
-                player: Arc::clone(&player),
-                connected: true,
-              })
+              .emit(crate::runtime::engine::EngineEvent::Native(
+                crate::runtime::engine::NativePlaybackFact::Reconnect {
+                  player: Arc::clone(&player),
+                  connected: true,
+                },
+              ))
               .await;
           } else {
             let _ = recovery_tx.send(request);
@@ -950,13 +1004,16 @@ async fn handle_player_events(
         // effect, no separate Unavailable variant needed).
         let current = matches!(
           spine
-            .query(crate::runtime::engine::FoldQuery::NativePlayerUnavailable {
-              player: Arc::clone(&player),
-            })
+            .emit_acked(crate::runtime::engine::EngineEvent::Native(
+              crate::runtime::engine::NativePlaybackFact::Unavailable {
+                player: Arc::clone(&player),
+              },
+            ))
             .await,
-          Ok(crate::runtime::engine::FoldAnswer::NativePlayerFactApplied(
-            true
-          ))
+          Some(crate::runtime::engine::FoldAck {
+            native: Some(crate::runtime::engine::NativePlaybackAck::Applied(true)),
+            ..
+          })
         );
         if !current {
           continue;
@@ -1004,15 +1061,18 @@ async fn handle_player_events(
         // fold (same stale-load rejection semantics).
         let current = matches!(
           spine
-            .query(crate::runtime::engine::FoldQuery::NativePlayerLoading {
-              player: Arc::clone(&player),
-              track_uri: track_id.to_string(),
-              position_ms,
-            })
+            .emit_acked(crate::runtime::engine::EngineEvent::Native(
+              crate::runtime::engine::NativePlaybackFact::Loading {
+                player: Arc::clone(&player),
+                track_uri: track_id.to_string(),
+                position_ms,
+              },
+            ))
             .await,
-          Ok(crate::runtime::engine::FoldAnswer::NativePlayerFactApplied(
-            true
-          ))
+          Some(crate::runtime::engine::FoldAck {
+            native: Some(crate::runtime::engine::NativePlaybackAck::Applied(true)),
+            ..
+          })
         );
         if !current {
           continue;
@@ -1197,21 +1257,20 @@ async fn disconnect_streaming_player(
   status_message: &str,
   restore_playback: bool,
 ) -> Option<StreamingRecoveryRequest> {
-  let position_ms = u32::try_from(shared_position.load(Ordering::Relaxed)).unwrap_or(u32::MAX);
-  let is_playing = shared_is_playing.load(Ordering::Relaxed);
   let answer = spine
-    .query(crate::runtime::engine::FoldQuery::NativePlayerDisconnect {
-      player: Arc::clone(player),
-      shared_position: position_ms,
-      shared_is_playing: is_playing,
-      status_message: status_message.to_string(),
-      restore_playback,
-    })
-    .await
-    .ok()?;
+    .emit_acked(crate::runtime::engine::EngineEvent::Native(
+      crate::runtime::engine::NativePlaybackFact::Disconnect {
+        player: Arc::clone(player),
+        position_ms: u32::try_from(shared_position.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
+        is_playing: shared_is_playing.load(Ordering::Relaxed),
+        status_message: status_message.to_string(),
+        restore_playback,
+      },
+    ))
+    .await?;
 
-  match answer {
-    crate::runtime::engine::FoldAnswer::NativePlayerRecovery(request) => {
+  match answer.native {
+    Some(crate::runtime::engine::NativePlaybackAck::Disconnect(request)) => {
       if request.is_some() {
         player.shutdown();
         shared_position.store(0, Ordering::Relaxed);
@@ -1333,6 +1392,7 @@ mod tests {
     merge_recovery_requests(
       &mut request,
       StreamingRecoveryRequest {
+        generation: 0,
         reselect_device: true,
         restore_playback: true,
         continue_after_track: None,
@@ -1346,6 +1406,7 @@ mod tests {
     merge_recovery_requests(
       &mut request,
       StreamingRecoveryRequest {
+        generation: 0,
         reselect_device: false,
         restore_playback: true,
         continue_after_track: Some("newer".to_string()),
@@ -1358,6 +1419,7 @@ mod tests {
   #[test]
   fn recovery_request_merge_handoff_vetoes_restore_intent() {
     let restore = StreamingRecoveryRequest {
+      generation: 0,
       reselect_device: true,
       restore_playback: true,
       continue_after_track: Some("track".to_string()),
@@ -1382,6 +1444,28 @@ mod tests {
     merge_recovery_requests(&mut request, restore);
     assert!(!request.reselect_device);
     assert!(!request.restore_playback);
+    assert!(request.continue_after_track.is_none());
+  }
+
+  #[test]
+  fn recovery_request_merge_keeps_handoff_veto_across_generations() {
+    let mut request = StreamingRecoveryRequest {
+      generation: 2,
+      restore_playback: false,
+      ..StreamingRecoveryRequest::default()
+    };
+    merge_recovery_requests(
+      &mut request,
+      StreamingRecoveryRequest {
+        generation: 3,
+        restore_playback: true,
+        reselect_device: true,
+        continue_after_track: Some("track".to_string()),
+      },
+    );
+    assert_eq!(request.generation, 3);
+    assert!(!request.restore_playback);
+    assert!(!request.reselect_device);
     assert!(request.continue_after_track.is_none());
   }
 }

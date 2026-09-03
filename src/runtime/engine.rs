@@ -61,6 +61,96 @@ pub enum EngineEvent {
   Decoded(DecodedSourceFact),
   /// Listening-history cache and recap facts, reduced by the fold.
   History(HistoryFact),
+  /// Native-player and recovery completions.  The player handle is carried
+  /// through the event so the fold can reject facts from a replaced backend.
+  #[cfg(feature = "streaming")]
+  Native(NativePlaybackFact),
+}
+
+/// Work completed by a native player/recovery worker.  These are facts, not
+/// commands: workers perform librespot/device I/O and the fold owns every
+/// authoritative state mutation.
+#[cfg(feature = "streaming")]
+pub enum NativePlaybackFact {
+  /// A plain streaming state observation (position/loading/transport/volume).
+  State {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    event: StreamingStateEvent,
+  },
+  Playing {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    position_ms: u32,
+  },
+  Paused {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    position_ms: u32,
+  },
+  TrackChanged {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    info: crate::core::app::NativeTrackInfo,
+    previous_track_id: Option<String>,
+  },
+  EndOfTrack {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    previous_track_id: String,
+  },
+  Disconnect {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    position_ms: u32,
+    is_playing: bool,
+    status_message: String,
+    restore_playback: bool,
+  },
+  Install {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    /// `Some` for a recovery worker completion; `None` for first startup.
+    generation: Option<u64>,
+  },
+  RecoveryFailed {
+    generation: u64,
+    error: String,
+  },
+  RecoveryRoute {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    request: crate::infra::player::StreamingRecoveryRequest,
+    device_name: String,
+  },
+  Unavailable {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+  },
+  Loading {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    track_uri: String,
+    position_ms: u32,
+  },
+  Reconnect {
+    player: Arc<crate::infra::player::StreamingPlayer>,
+    connected: bool,
+  },
+}
+
+#[cfg(feature = "streaming")]
+impl std::fmt::Debug for NativePlaybackFact {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let name = match self {
+      Self::State { .. } => "State",
+      Self::Playing { .. } => "Playing",
+      Self::Paused { .. } => "Paused",
+      Self::TrackChanged { .. } => "TrackChanged",
+      Self::EndOfTrack { .. } => "EndOfTrack",
+      Self::Disconnect { .. } => "Disconnect",
+      Self::Install { .. } => "Install",
+      Self::RecoveryFailed { .. } => "RecoveryFailed",
+      Self::RecoveryRoute { .. } => "RecoveryRoute",
+      Self::Unavailable { .. } => "Unavailable",
+      Self::Loading { .. } => "Loading",
+      Self::Reconnect { .. } => "Reconnect",
+    };
+    f.write_str(name)
+  }
 }
 
 /// One-shot deadline facts emitted by the private engine scheduler.
@@ -397,6 +487,17 @@ pub enum SessionFact {
     ttl_secs: u64,
     is_error: bool,
   },
+  /// The deferred native startup window opened or closed.
+  #[cfg(feature = "streaming")]
+  NativeBackendPending(bool),
+  /// Complete deferred native startup in one ordered fold step: clear the
+  /// interlock, apply the configured Spotify startup action, then replay any
+  /// user request parked while the backend initialized.
+  #[cfg(feature = "streaming")]
+  NativeStartupFinished {
+    spotify_startup_behavior: Option<crate::core::user_config::StartupBehavior>,
+    initial_shuffle_enabled: bool,
+  },
   /// The generic end-of-handler reset: global spinner down.
   LoadingCleared,
   /// Direct mirror sync for the token-refresh path (requests.rs), whose
@@ -627,6 +728,9 @@ pub enum SessionFact {
   /// plugin-data generation (completion, not success, is what requests wait
   /// on).
   QueueLanded(Option<crate::core::app::QueueState>),
+  /// Restore the persisted native queue during startup.
+  #[cfg(feature = "streaming")]
+  NativeQueueLanded(Vec<crate::core::plugin_api::TrackInfo>),
   /// A playback poll landed; the fold applies all native/context mirrors.
   #[cfg(feature = "streaming")]
   PlaybackPolled {
@@ -723,6 +827,20 @@ impl std::fmt::Debug for SessionFact {
         .field("message", message)
         .field("ttl_secs", ttl_secs)
         .field("is_error", is_error)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeBackendPending(pending) => f
+        .debug_tuple("NativeBackendPending")
+        .field(pending)
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeStartupFinished {
+        spotify_startup_behavior,
+        initial_shuffle_enabled,
+      } => f
+        .debug_struct("NativeStartupFinished")
+        .field("spotify_startup_behavior", spotify_startup_behavior)
+        .field("initial_shuffle_enabled", initial_shuffle_enabled)
         .finish(),
       SessionFact::LoadingCleared => f.write_str("LoadingCleared"),
       SessionFact::AuthMirrors {
@@ -857,6 +975,11 @@ impl std::fmt::Debug for SessionFact {
       SessionFact::QueueLanded(queue) => f
         .debug_tuple("QueueLanded")
         .field(&queue.is_some())
+        .finish(),
+      #[cfg(feature = "streaming")]
+      SessionFact::NativeQueueLanded(queue) => f
+        .debug_tuple("NativeQueueLanded")
+        .field(&queue.len())
         .finish(),
       SessionFact::ApplyAction(action) => f.debug_tuple("ApplyAction").field(action).finish(),
       #[cfg(feature = "dj-core")]
@@ -1092,70 +1215,6 @@ pub enum FoldQuery {
   },
   #[cfg(feature = "streaming")]
   NativeRuntimeVolume,
-  #[cfg(feature = "streaming")]
-  NativePlayerUnavailable {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerLoading {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    track_uri: String,
-    position_ms: u32,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerPlaying {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    track_uri: String,
-    position_ms: u32,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerPaused {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    track_uri: String,
-    position_ms: u32,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerTrackChanged {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    track_uri: String,
-    info: crate::core::app::NativeTrackInfo,
-    previous_track_id: Option<String>,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerEndOfTrack {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    previous_track_id: String,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerDisconnect {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    shared_position: u32,
-    shared_is_playing: bool,
-    status_message: String,
-    restore_playback: bool,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerInstall {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerRecoveryFailed { error: String },
-  #[cfg(feature = "streaming")]
-  NativePlayerRecoveryRoute {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    request: crate::infra::player::StreamingRecoveryRequest,
-    device_name: String,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerReconnect {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    connected: bool,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerFact {
-    player: std::sync::Arc<crate::infra::player::StreamingPlayer>,
-    event: crate::core::streaming::StreamingStateEvent,
-  },
   /// Claim a playlist-tracks page offset for fetching (the old
   /// `playlist_tracks_prefetch_in_flight.insert(offset)` RMW, combined with
   /// the generation + still-open checks into one atomic fold decision).
@@ -1414,22 +1473,6 @@ pub enum FoldAnswer {
   NativePlayerState(NativePlayerState),
   #[cfg(feature = "streaming")]
   NativeRuntimeVolume(u8),
-  #[cfg(feature = "streaming")]
-  NativePlayerPlaying {
-    current: bool,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerPaused {
-    current: bool,
-  },
-  #[cfg(feature = "streaming")]
-  NativePlayerTrackChanged(NativePlayerTrackChanged),
-  #[cfg(feature = "streaming")]
-  NativePlayerEndOfTrack(NativePlayerEndOfTrack),
-  #[cfg(feature = "streaming")]
-  NativePlayerRecovery(Option<crate::infra::player::StreamingRecoveryRequest>),
-  #[cfg(feature = "streaming")]
-  NativePlayerFactApplied(bool),
   /// The standing DJ vibe and whether the auto-queue DJ is on.
   #[cfg(feature = "dj-core")]
   DjVibe {
@@ -1552,33 +1595,6 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::NativePlayerState(v) => f.debug_tuple("NativePlayerState").field(v).finish(),
       #[cfg(feature = "streaming")]
       FoldAnswer::NativeRuntimeVolume(v) => f.debug_tuple("NativeRuntimeVolume").field(v).finish(),
-      #[cfg(feature = "streaming")]
-      FoldAnswer::NativePlayerPlaying { current } => {
-        f.debug_tuple("NativePlayerPlaying").field(current).finish()
-      }
-      #[cfg(feature = "streaming")]
-      FoldAnswer::NativePlayerPaused { current } => {
-        f.debug_tuple("NativePlayerPaused").field(current).finish()
-      }
-      #[cfg(feature = "streaming")]
-      FoldAnswer::NativePlayerTrackChanged(v) => f
-        .debug_tuple("NativePlayerTrackChanged")
-        .field(&v.current)
-        .finish(),
-      #[cfg(feature = "streaming")]
-      FoldAnswer::NativePlayerEndOfTrack(v) => f
-        .debug_tuple("NativePlayerEndOfTrack")
-        .field(&v.current)
-        .finish(),
-      #[cfg(feature = "streaming")]
-      FoldAnswer::NativePlayerRecovery(v) => f
-        .debug_tuple("NativePlayerRecovery")
-        .field(&v.is_some())
-        .finish(),
-      #[cfg(feature = "streaming")]
-      FoldAnswer::NativePlayerFactApplied(v) => {
-        f.debug_tuple("NativePlayerFactApplied").field(v).finish()
-      }
       #[cfg(feature = "dj-core")]
       FoldAnswer::DjVibe { vibe, auto_queue } => f
         .debug_struct("DjVibe")
@@ -1771,21 +1787,6 @@ pub struct NativePlayerState {
   pub volume_percent: u8,
 }
 
-#[cfg(feature = "streaming")]
-pub struct NativePlayerTrackChanged {
-  pub current: bool,
-  pub reload_uri: Option<(String, bool)>,
-  pub transition_advanced: bool,
-}
-
-#[cfg(feature = "streaming")]
-pub struct NativePlayerEndOfTrack {
-  pub current: bool,
-  pub should_ensure_playback: bool,
-  pub stop_after_current: bool,
-  pub reissue_queue_slot: Option<(String, bool)>,
-}
-
 /// Whether a native playback activation should persist the native device id
 /// into the client config (`Persist`), or leave the user's saved device alone
 /// (`KeepExistingPreference`). Lives here because the producer (client
@@ -1874,7 +1875,7 @@ pub enum NativeShuffleToggleDecision {
 /// back what the producer used to read after its own write. Today: the next
 /// missing offset for both offset-keyed library caches (`None` when the
 /// event was dropped as stale or the cache is complete).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FoldAck {
   /// The next missing saved-tracks offset after the folded upsert.
   pub next_saved_tracks_offset: Option<u32>,
@@ -1882,6 +1883,58 @@ pub struct FoldAck {
   pub next_playlist_tracks_offset: Option<u32>,
   /// Synchronous result of a folded external action.
   pub action_outcome: Option<crate::core::action::ActionOutcome>,
+  /// Native fact result used only for decisions that must happen after the
+  /// fold's generation/pointer guard (e.g. queue continuation).
+  #[cfg(feature = "streaming")]
+  pub native: Option<NativePlaybackAck>,
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Clone)]
+pub enum NativePlaybackAck {
+  Applied(bool),
+  Playing {
+    current: bool,
+  },
+  Paused {
+    current: bool,
+  },
+  TrackChanged {
+    current: bool,
+    reload_uri: Option<(String, bool)>,
+    transition_advanced: bool,
+  },
+  EndOfTrack {
+    current: bool,
+    should_ensure_playback: bool,
+    stop_after_current: bool,
+    reissue_queue_slot: Option<(String, bool)>,
+  },
+  Disconnect(Option<crate::infra::player::StreamingRecoveryRequest>),
+  Installed {
+    old: Option<Arc<crate::infra::player::StreamingPlayer>>,
+    accepted: bool,
+  },
+  RecoveryFailed(bool),
+  RecoveryRoute(bool),
+}
+
+#[cfg(feature = "streaming")]
+impl std::fmt::Debug for NativePlaybackAck {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let name = match self {
+      Self::Applied(_) => "Applied",
+      Self::Playing { .. } => "Playing",
+      Self::Paused { .. } => "Paused",
+      Self::TrackChanged { .. } => "TrackChanged",
+      Self::EndOfTrack { .. } => "EndOfTrack",
+      Self::Disconnect(_) => "Disconnect",
+      Self::Installed { .. } => "Installed",
+      Self::RecoveryFailed(_) => "RecoveryFailed",
+      Self::RecoveryRoute(_) => "RecoveryRoute",
+    };
+    f.write_str(name)
+  }
 }
 
 /// Channel bounds: the engine never blocks the window on a full channel, but
@@ -2045,14 +2098,6 @@ pub struct FoldHandles {
 /// Drain helper: `recv().await` / `try_recv()` on the taken receiver.
 pub struct FoldQueries {
   pub(crate) rx: mpsc::Receiver<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
-}
-
-impl FoldQueries {
-  pub async fn recv(
-    &mut self,
-  ) -> Option<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)> {
-    self.rx.recv().await
-  }
 }
 
 /// Read the producer spine off `App` and emit one catalog event (ticket 15).

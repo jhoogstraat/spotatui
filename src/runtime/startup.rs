@@ -427,34 +427,21 @@ struct DeferredStreamingContext {
 #[cfg(feature = "streaming")]
 fn deferred_streaming_startup(ctx: DeferredStreamingContext) {
   tokio::spawn(async move {
-    let app = Arc::clone(&ctx.app);
+    let spine = ctx.spine.clone();
     let spotify_startup_behavior = ctx.spotify_startup_behavior;
     let initial_shuffle_enabled = ctx.initial_shuffle_enabled;
     deferred_streaming_startup_inner(ctx).await;
     // Whatever happened above (backend up, unsupported account, failed or
-    // timed-out init), the pending window is over.
-    let mut app = app.lock().await;
-    app.native_backend_pending = false;
-    // The Spotify startup Play/Pause runs here, after the device decision:
-    // before init was deferred, the device transfer always completed first,
-    // and firing these earlier 404s with NO_ACTIVE_DEVICE straight onto the
-    // Error screen. A request the user parked during init takes precedence
-    // over the configured startup behavior — their intent is newer.
-    if app.pending_start_playback.is_none() {
-      match spotify_startup_behavior {
-        Some(StartupBehavior::Play) => {
-          app.dispatch(IoEvent::Shuffle(initial_shuffle_enabled));
-          app.dispatch(IoEvent::StartPlayback(None, None, None));
-        }
-        Some(StartupBehavior::Pause) => {
-          app.dispatch(IoEvent::PausePlayback);
-        }
-        Some(StartupBehavior::Continue) | None => {}
-      }
-    }
-    // A StartPlayback parked during init replays now — against the native
-    // backend when it exists, else through the normal Connect path.
-    app.replay_pending_start_playback();
+    // timed-out init), the pending window is over. Keep startup ordering in
+    // the fold so the worker never mutates native App state directly.
+    let _ = spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::NativeStartupFinished {
+          spotify_startup_behavior,
+          initial_shuffle_enabled,
+        },
+      ))
+      .await;
   });
 }
 
@@ -464,7 +451,16 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
     account_supports_native_streaming(&ctx.spotify, ctx.cached_me, &ctx.token_cache_path, &ctx.app)
       .await;
   if let Some(message) = status_message {
-    ctx.app.lock().await.set_status_message(message, 12);
+    let _ = ctx
+      .spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::Status {
+          message: message.to_string(),
+          ttl_secs: 12,
+          is_error: false,
+        },
+      ))
+      .await;
   }
   if !supported {
     return;
@@ -512,10 +508,16 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
         "failed to initialize streaming: {} - falling back to web api",
         e
       );
-      ctx.app.lock().await.set_status_message(
-        "Native streaming didn't start; using Spotify Connect for now. Restart spotatui to reconnect native playback.",
-        12,
-      );
+      let _ = ctx
+        .spine
+        .emit(crate::runtime::engine::EngineEvent::Session(
+          crate::runtime::engine::SessionFact::Status {
+            message: "Native streaming didn't start; using Spotify Connect for now. Restart spotatui to reconnect native playback.".to_string(),
+            ttl_secs: 12,
+            is_error: false,
+          },
+        ))
+        .await;
       return;
     }
     Ok(Err(e)) => {
@@ -537,15 +539,34 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
 
   info!("native playback enabled - spotatui is available as a spotify connect device");
 
-  // Store streaming player reference in App for direct control (bypasses event channel)
-  {
-    let mut app_mut = ctx.app.lock().await;
-    app_mut.streaming_player = Some(Arc::clone(&streaming_player));
-    // Startup playlist loading may have fallen back to a flat list while the
-    // deferred player was unavailable. Refresh once so rootlist folders are
-    // reconciled now that librespot is ready.
-    app_mut.dispatch(IoEvent::GetPlaylists);
+  // Install the player and refresh playlists through the fold. The player
+  // itself was constructed immutably above; only the fold publishes it.
+  let installed = ctx
+    .spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Native(
+      crate::runtime::engine::NativePlaybackFact::Install {
+        player: Arc::clone(&streaming_player),
+        generation: None,
+      },
+    ))
+    .await
+    .and_then(|ack| ack.native)
+    .is_some_and(|ack| {
+      matches!(
+        ack,
+        crate::runtime::engine::NativePlaybackAck::Installed { accepted: true, .. }
+      )
+    });
+  if !installed {
+    streaming_player.shutdown();
+    return;
   }
+  let _ = ctx
+    .spine
+    .emit(crate::runtime::engine::EngineEvent::Session(
+      crate::runtime::engine::SessionFact::DispatchIo(vec![IoEvent::GetPlaylists]),
+    ))
+    .await;
 
   // Spawn player event listener (updates app state from native player events)
   player::spawn_player_event_handler(player::PlayerEventContext {
@@ -579,10 +600,15 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
     .await
   {
     let devices_vec = devices.devices;
-    let mut app_mut = ctx.app.lock().await;
-    app_mut.devices = Some(rspotify::model::device::DevicePayload {
-      devices: devices_vec.clone(),
-    });
+    let _ = ctx
+      .spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::DevicesLanded {
+          devices: devices_vec.clone(),
+          navigate: false,
+        },
+      ))
+      .await;
     devices_snapshot = Some(devices_vec);
   }
 
@@ -593,12 +619,25 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
     &device_name,
   );
 
-  let mut app_mut = ctx.app.lock().await;
   if let Some(message) = startup_decision.status_message {
-    app_mut.set_status_message(message, 5);
+    let _ = ctx
+      .spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::Status {
+          message,
+          ttl_secs: 5,
+          is_error: false,
+        },
+      ))
+      .await;
   }
   if let Some(event) = startup_decision.event {
-    app_mut.dispatch(event.into_io_event());
+    let _ = ctx
+      .spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::DispatchIo(vec![event.into_io_event()]),
+      ))
+      .await;
   }
 }
 
@@ -631,12 +670,18 @@ pub(super) struct Services {
 /// runner so a second frontend boots through exactly the same sequence.
 pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let app = boot.app;
+  // Open the fold spine before any asynchronous startup work so even
+  // account/credential notices use typed facts rather than App lock writes.
+  let (spine_for_events, spine_rx, spine_queries) =
+    crate::runtime::engine::Spine::open(Default::default());
+  app.lock().await.spine = Some(spine_for_events.clone());
   let sync_io_rx = boot.sync_io_rx;
   let user_config = boot.user_config;
   let client_config = boot.client_config;
   let spotify = boot.spotify;
   let final_token_cache_path = boot.token_cache_path;
   let restore_playback = boot.restore_playback;
+  #[cfg(feature = "streaming")]
   let restore_queue = boot.restore_queue;
   let initial_shuffle_enabled = boot.initial_shuffle_enabled;
   let initial_startup_behavior = boot.initial_startup_behavior;
@@ -663,7 +708,15 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       )
       .await;
       if let Some(message) = status_message {
-        app.lock().await.set_status_message(message, 12);
+        let _ = spine_for_events
+          .emit(crate::runtime::engine::EngineEvent::Session(
+            crate::runtime::engine::SessionFact::Status {
+              message: message.to_string(),
+              ttl_secs: 12,
+              is_error: false,
+            },
+          ))
+          .await;
       }
       if supported {
         // The OAuth flow spins up a blocking local callback server and waits on
@@ -681,10 +734,17 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
           // reporter with a browser "unable to connect" page, a login that
           // repeated every launch, and nothing on screen or in reach that
           // said which half of startup had failed or why.
-          app.lock().await.set_status_message(
-            format!("Native streaming authentication failed ({error}); using Spotify Connect."),
-            10,
-          );
+          let _ = spine_for_events
+            .emit(crate::runtime::engine::EngineEvent::Session(
+              crate::runtime::engine::SessionFact::Status {
+                message: format!(
+                  "Native streaming authentication failed ({error}); using Spotify Connect."
+                ),
+                ttl_secs: 10,
+                is_error: false,
+              },
+            ))
+            .await;
         }
       }
     }
@@ -766,12 +826,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // One spine for every producer: streaming (player events, recovery) plus
   // catalog (dispatchers, network layer). The fold task in `frontend` takes
   // the receiving half via Services.
-  let (spine_for_events, spine_rx, spine_queries) =
-    crate::runtime::engine::Spine::open(Default::default());
-  {
-    let mut app_mut = app.lock().await;
-    app_mut.spine = Some(spine_for_events.clone());
-  }
   let history_collector = crate::infra::history::spawn_history_collector(spine_for_events.clone());
   #[cfg(feature = "streaming")]
   {
@@ -1004,7 +1058,11 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     // While init is running, a playback request that finds no active device
     // parks itself for replay instead of erroring (the task clears this and
     // replays whatever parked when it finishes, whatever the outcome).
-    app.lock().await.native_backend_pending = true;
+    let _ = spine_for_events
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::NativeBackendPending(true),
+      ))
+      .await;
     deferred_streaming_startup(DeferredStreamingContext {
       app: Arc::clone(&app),
       spotify: spotify
@@ -1073,8 +1131,13 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     // transfer devices, change shuffle, or otherwise activate Spotatui.
     // Restore the persisted native queue into app state before the runner
     // starts, independent of whether a source playback is resumed.
+    #[cfg(feature = "streaming")]
     if !restore_queue.is_empty() {
-      network.app.lock().await.native_queue = restore_queue;
+      let _ = network_spine
+        .emit(crate::runtime::engine::EngineEvent::Session(
+          crate::runtime::engine::SessionFact::NativeQueueLanded(restore_queue),
+        ))
+        .await;
     }
     if let Some(session) = restore_playback {
       // Resume off the event pump: a slow source (yt-dlp download, remote
