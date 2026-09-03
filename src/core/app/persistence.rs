@@ -5,6 +5,122 @@ use super::*;
 const STATE_SAVE_DEBOUNCE_MS: u64 = 500;
 const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(3);
 
+type SessionCompletion = (
+  crate::runtime::engine::Spine,
+  tokio::runtime::Handle,
+  crate::runtime::engine::SessionPersistenceOperation,
+);
+
+enum SessionWrite {
+  Save {
+    path: anyhow::Result<std::path::PathBuf>,
+    session: crate::core::persisted_playback::PersistedSession,
+    done: Option<std::sync::mpsc::Sender<anyhow::Result<()>>>,
+    completion: Option<SessionCompletion>,
+  },
+  Clear {
+    path: anyhow::Result<std::path::PathBuf>,
+    done: Option<std::sync::mpsc::Sender<anyhow::Result<()>>>,
+    completion: Option<SessionCompletion>,
+  },
+  Barrier(std::sync::mpsc::Sender<anyhow::Result<()>>),
+}
+
+static SESSION_WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<SessionWrite>> =
+  std::sync::OnceLock::new();
+static SESSION_COMPLETIONS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+  std::sync::OnceLock::new();
+
+fn session_completion_lock() -> std::sync::Arc<tokio::sync::Mutex<()>> {
+  SESSION_COMPLETIONS
+    .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+    .clone()
+}
+
+fn session_writer() -> &'static std::sync::mpsc::Sender<SessionWrite> {
+  SESSION_WRITER.get_or_init(|| {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+      .name("spotatui-session-writer".into())
+      .spawn(move || {
+        while let Ok(write) = rx.recv() {
+          match write {
+            SessionWrite::Save {
+              path,
+              session,
+              done,
+              completion,
+            } => {
+              let result =
+                path.and_then(|path| crate::core::persisted_playback::save(&path, &session));
+              let success = result.is_ok();
+              if let Some(done) = done {
+                let _ = done.send(result);
+              } else if let Err(error) = &result {
+                log::warn!("[session] failed to persist playback session: {error}");
+              }
+              if let Some((spine, handle, operation)) = completion {
+                let completion_lock = session_completion_lock();
+                // Do not block this ordered writer on the bounded fold queue:
+                // shutdown can be waiting for the writer's barrier on that
+                // same fold thread.
+                handle.spawn(async move {
+                  let _guard = completion_lock.lock().await;
+                  spine
+                    .emit(crate::runtime::engine::EngineEvent::Session(
+                      crate::runtime::engine::SessionFact::PersistenceCompleted {
+                        operation,
+                        success,
+                      },
+                    ))
+                    .await;
+                });
+              }
+            }
+            SessionWrite::Clear {
+              path,
+              done,
+              completion,
+            } => {
+              let result = path.and_then(|path| crate::core::persisted_playback::clear(&path));
+              let success = result.is_ok();
+              if let Some(done) = done {
+                let _ = done.send(result);
+              } else if let Err(error) = &result {
+                log::warn!("[session] failed to clear playback session: {error}");
+              }
+              if let Some((spine, handle, operation)) = completion {
+                let completion_lock = session_completion_lock();
+                handle.spawn(async move {
+                  let _guard = completion_lock.lock().await;
+                  spine
+                    .emit(crate::runtime::engine::EngineEvent::Session(
+                      crate::runtime::engine::SessionFact::PersistenceCompleted {
+                        operation,
+                        success,
+                      },
+                    ))
+                    .await;
+                });
+              }
+            }
+            SessionWrite::Barrier(done) => {
+              let _ = done.send(Ok(()));
+            }
+          }
+        }
+      })
+      .expect("spawn persisted-session writer");
+    tx
+  })
+}
+
+fn enqueue_session_write(write: SessionWrite) {
+  if session_writer().send(write).is_err() {
+    log::warn!("[session] persisted-session writer stopped");
+  }
+}
+
 impl App {
   /// Return the next explicit deadline for persisted playback. The first save
   /// is immediate; subsequent saves retain the historical three-second
@@ -20,7 +136,7 @@ impl App {
   }
 
   /// Handle the named persisted-session deadline. Disk work runs on the
-  /// blocking pool; the fold only snapshots state and arms the next deadline.
+  /// ordered writer thread; the fold only snapshots state and arms deadlines.
   pub(crate) fn flush_persisted_session(&mut self) {
     let Some(deadline) = self.persisted_session_deadline() else {
       return;
@@ -31,41 +147,72 @@ impl App {
     if let Some(session) = self.current_persisted_session() {
       self.session_save_due = Some(Instant::now() + SESSION_SAVE_INTERVAL);
       self.session_was_present = true;
-      tokio::task::spawn_blocking(move || {
-        if let Ok(path) = crate::core::persisted_playback::default_session_path() {
-          if let Err(error) = crate::core::persisted_playback::save(&path, &session) {
-            log::warn!("[session] failed to persist playback session: {error}");
-          }
-        }
+      enqueue_session_write(SessionWrite::Save {
+        path: crate::core::persisted_playback::default_session_path(),
+        session,
+        done: None,
+        completion: self
+          .persistence_completion(crate::runtime::engine::SessionPersistenceOperation::Save),
       });
     } else if self.session_was_present {
-      self.session_save_due = None;
-      self.session_was_present = false;
-      tokio::task::spawn_blocking(|| {
-        if let Ok(path) = crate::core::persisted_playback::default_session_path() {
-          if let Err(error) = crate::core::persisted_playback::clear(&path) {
-            log::warn!("[session] failed to clear playback session: {error}");
-          }
-        }
-      });
+      // Keep a retry deadline while the asynchronous clear is in flight;
+      // otherwise the no-session branch would enqueue duplicate clears every
+      // scheduler turn before its completion fact arrives.
+      self.session_save_due = Some(Instant::now() + SESSION_SAVE_INTERVAL);
+      let completion =
+        self.persistence_completion(crate::runtime::engine::SessionPersistenceOperation::Clear);
+      if completion.is_some() {
+        enqueue_session_write(SessionWrite::Clear {
+          path: crate::core::persisted_playback::default_session_path(),
+          done: None,
+          completion,
+        });
+      } else {
+        // App instances without a running fold retain a synchronous fallback.
+        self.flush_persisted_session_force();
+      }
     }
   }
 
   /// Synchronously flush the persisted session during shutdown. Unlike the
   /// deadline path this must complete before the runtime is dropped.
   pub(crate) fn flush_persisted_session_force(&mut self) {
-    let result = match self.current_persisted_session() {
-      Some(session) => crate::core::persisted_playback::default_session_path()
-        .and_then(|path| crate::core::persisted_playback::save(&path, &session)),
-      None if self.session_was_present => crate::core::persisted_playback::default_session_path()
-        .and_then(|path| crate::core::persisted_playback::clear(&path)),
-      None => return,
-    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    match self.current_persisted_session() {
+      Some(session) => enqueue_session_write(SessionWrite::Save {
+        path: crate::core::persisted_playback::default_session_path(),
+        session,
+        done: Some(done_tx),
+        completion: None,
+      }),
+      None if self.session_was_present => enqueue_session_write(SessionWrite::Clear {
+        path: crate::core::persisted_playback::default_session_path(),
+        done: Some(done_tx),
+        completion: None,
+      }),
+      None => enqueue_session_write(SessionWrite::Barrier(done_tx)),
+    }
+    let result = done_rx.recv().unwrap_or_else(|_| {
+      Err(anyhow!(
+        "persisted-session writer stopped before flush completed"
+      ))
+    });
     if let Err(error) = result {
       log::warn!("[session] failed to flush playback session on shutdown: {error}");
     }
     self.session_save_due = None;
     self.session_was_present = self.current_persisted_session().is_some();
+  }
+
+  fn persistence_completion(
+    &self,
+    operation: crate::runtime::engine::SessionPersistenceOperation,
+  ) -> Option<SessionCompletion> {
+    Some((
+      self.spine.clone()?,
+      tokio::runtime::Handle::try_current().ok()?,
+      operation,
+    ))
   }
 
   /// Snapshot the currently-playing non-Spotify session for persistence, or
@@ -513,6 +660,74 @@ mod tests {
     app.flush_persisted_session();
 
     assert_eq!(app.session_save_due, Some(deadline));
+  }
+
+  #[test]
+  fn session_writer_serializes_save_before_clear() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("last_session.yml");
+    let session = crate::core::persisted_playback::PersistedSession {
+      playback: None,
+      queue: vec![queue_track(Some("track:queued"), "queued")],
+    };
+    let (save_done_tx, save_done_rx) = std::sync::mpsc::channel();
+    let (clear_done_tx, clear_done_rx) = std::sync::mpsc::channel();
+    enqueue_session_write(SessionWrite::Save {
+      path: Ok(path.clone()),
+      session,
+      done: Some(save_done_tx),
+      completion: None,
+    });
+    enqueue_session_write(SessionWrite::Clear {
+      path: Ok(path.clone()),
+      done: Some(clear_done_tx),
+      completion: None,
+    });
+
+    assert!(save_done_rx.recv().unwrap().is_ok());
+    assert!(clear_done_rx.recv().unwrap().is_ok());
+    assert!(!path.exists());
+  }
+
+  #[test]
+  fn session_writer_barrier_waits_for_final_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("last_session.yml");
+    enqueue_session_write(SessionWrite::Save {
+      path: Ok(path.clone()),
+      session: crate::core::persisted_playback::PersistedSession::default(),
+      done: None,
+      completion: None,
+    });
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    enqueue_session_write(SessionWrite::Barrier(done_tx));
+    assert!(done_rx.recv().unwrap().is_ok());
+    assert!(path.exists());
+  }
+
+  #[tokio::test]
+  async fn flush_persistence_does_not_wait_on_completion_before_barrier() {
+    let app = std::sync::Arc::new(tokio::sync::Mutex::new(App::default()));
+    let (spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
+    let directory = tempfile::tempdir().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    enqueue_session_write(SessionWrite::Save {
+      path: Ok(directory.path().join("last_session.yml")),
+      session: crate::core::persisted_playback::PersistedSession::default(),
+      done: Some(done_tx),
+      completion: Some((
+        spine.clone(),
+        tokio::runtime::Handle::current(),
+        crate::runtime::engine::SessionPersistenceOperation::Save,
+      )),
+    });
+    spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::FlushPersistence,
+      ))
+      .await
+      .expect("flush should complete while prior completion is pending");
+    assert!(done_rx.recv().unwrap().is_ok());
   }
 }
 

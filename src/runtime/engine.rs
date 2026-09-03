@@ -656,6 +656,13 @@ impl std::fmt::Debug for QueueFetchResult {
   }
 }
 
+/// Which persisted playback-session operation completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPersistenceOperation {
+  Save,
+  Clear,
+}
+
 /// One session-level fact (ticket 16). The fold applies these through the
 /// same methods the old inline writes used, so behavior is byte-for-byte
 /// parity while the lock sites disappear. Debug and Clone are manual:
@@ -664,6 +671,14 @@ impl std::fmt::Debug for QueueFetchResult {
 pub enum SessionFact {
   /// Reserve a metadata navigation generation before an async request.
   MetadataRequested,
+  /// Completion of an ordered playback-session write. The fold retries failed
+  /// writes and ignores a clear that no longer matches current state.
+  PersistenceCompleted {
+    operation: SessionPersistenceOperation,
+    success: bool,
+  },
+  /// Flush all pending durable state before the fold closes.
+  FlushPersistence,
   /// A metadata request ended empty or failed; stale generations are ignored.
   MetadataTerminal {
     generation: u64,
@@ -1015,6 +1030,12 @@ impl std::fmt::Debug for SessionFact {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       SessionFact::MetadataRequested => f.write_str("MetadataRequested"),
+      SessionFact::PersistenceCompleted { operation, success } => f
+        .debug_struct("PersistenceCompleted")
+        .field("operation", operation)
+        .field("success", success)
+        .finish(),
+      SessionFact::FlushPersistence => f.write_str("FlushPersistence"),
       SessionFact::MetadataTerminal { .. } => f.write_str("MetadataTerminal"),
       SessionFact::Auth {
         transition,

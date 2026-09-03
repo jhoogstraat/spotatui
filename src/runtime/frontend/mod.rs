@@ -321,13 +321,13 @@ impl Runtime {
   pub fn shutdown(self) -> Result<()> {
     self.rt.block_on(async {
       let _ = self.shutdown_tx.send(true);
-      {
-        let mut app = self.app.lock().await;
-        app.flush_persisted_session_force();
-      }
+      // Emit an acked fact so the final flush is ordered in the fold event
+      // stream, rather than racing a direct App lock.
       let _ = self
         .spine
-        .query(crate::runtime::engine::FoldQuery::FlushStateSave)
+        .emit_acked(crate::runtime::engine::EngineEvent::Session(
+          crate::runtime::engine::SessionFact::FlushPersistence,
+        ))
         .await;
       #[cfg(feature = "streaming")]
       super::startup::pause_native_playback_before_exit(&self.app).await;
@@ -788,6 +788,10 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         metadata_generation: Some(app.metadata_generation),
         ..FoldAck::default()
       })
+    }
+    EngineEvent::Session(crate::runtime::engine::SessionFact::FlushPersistence) => {
+      apply_session_fact(app, crate::runtime::engine::SessionFact::FlushPersistence);
+      Some(FoldAck::default())
     }
     EngineEvent::Catalog(CatalogStateEvent::LibraryGenerationStarted { section }) => {
       crate::core::apply_catalog_state(app, event_catalog(&event));
@@ -1871,6 +1875,32 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     }
     SessionFact::MetadataRequested => {
       app.metadata_generation = app.metadata_generation.wrapping_add(1);
+    }
+    SessionFact::PersistenceCompleted { operation, success } => {
+      use crate::runtime::engine::SessionPersistenceOperation;
+      match (operation, success) {
+        (SessionPersistenceOperation::Save, true) => {}
+        (SessionPersistenceOperation::Save, false) => {
+          if app.session_was_present && app.current_persisted_session().is_some() {
+            app.session_save_due = Some(Instant::now() + Duration::from_secs(3));
+          }
+        }
+        (SessionPersistenceOperation::Clear, true) => {
+          if app.current_persisted_session().is_none() {
+            app.session_save_due = None;
+            app.session_was_present = false;
+          }
+        }
+        (SessionPersistenceOperation::Clear, false) => {
+          if app.current_persisted_session().is_none() {
+            app.session_save_due = Some(Instant::now() + Duration::from_secs(3));
+          }
+        }
+      }
+    }
+    SessionFact::FlushPersistence => {
+      app.flush_persisted_session_force();
+      app.flush_state_save(true);
     }
     SessionFact::MetadataTerminal {
       generation,
@@ -4329,6 +4359,55 @@ mod tests {
       crate::runtime::engine::FoldAnswer::HistoryState(_)
     ));
     assert_eq!(app.lock().await.status_message.as_deref(), Some("ready"));
+  }
+
+  #[tokio::test]
+  async fn final_persistence_flush_is_folded_after_prior_events() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+    spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::Status {
+          message: "before shutdown".into(),
+          ttl_secs: 5,
+          is_error: false,
+        },
+      ))
+      .await;
+    let ack = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::FlushPersistence,
+      ))
+      .await;
+    assert!(ack.is_some());
+    assert_eq!(
+      app.lock().await.status_message.as_deref(),
+      Some("before shutdown")
+    );
+  }
+
+  #[test]
+  fn failed_session_clear_rearms_named_retry_deadline() {
+    let mut app = App::default();
+    app.session_was_present = true;
+    apply_session_fact(
+      &mut app,
+      crate::runtime::engine::SessionFact::PersistenceCompleted {
+        operation: crate::runtime::engine::SessionPersistenceOperation::Clear,
+        success: false,
+      },
+    );
+    assert!(app.session_save_due.is_some());
+    apply_session_fact(
+      &mut app,
+      crate::runtime::engine::SessionFact::PersistenceCompleted {
+        operation: crate::runtime::engine::SessionPersistenceOperation::Clear,
+        success: true,
+      },
+    );
+    assert!(!app.session_was_present);
+    assert!(app.session_save_due.is_none());
   }
 
   #[tokio::test]

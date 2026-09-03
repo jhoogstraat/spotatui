@@ -530,6 +530,43 @@ pub fn spawn_history_collector(spine: crate::runtime::engine::Spine) -> HistoryC
         }
       }
     }
+    // Append the active listen immediately, before waiting on any potentially
+    // slow upload. The durable local record must survive a shutdown timeout.
+    let final_record = match collector.finalize_current(Utc::now()) {
+      Ok(record) => record,
+      Err(error) => {
+        log::warn!("final listening history record failed: {error}");
+        None
+      }
+    };
+    // Drain in-flight uploads before starting the final sync so its cursor
+    // cannot race a request that was already in progress.
+    while let Some(result) = network_tasks.join_next().await {
+      if let Err(error) = result {
+        log::warn!("history collector network task failed: {}", error);
+      }
+    }
+    if let Some(record) = final_record {
+      if record.qualified {
+        if let Some(totals) = &mut day_totals {
+          let date = record.ended_at.with_timezone(&Local).date_naive();
+          *totals.entry(date).or_default() += record.listened_ms;
+          let _ = spine
+            .emit_acked(crate::runtime::engine::EngineEvent::History(
+              crate::runtime::engine::HistoryFact::Streaks(streaks_from_day_totals(totals)),
+            ))
+            .await;
+        }
+      }
+      if let Some(ref token) = sync_token_opt {
+        spawn_cloud_history_sync(
+          &http_client,
+          token,
+          &history_sync_in_flight,
+          &mut network_tasks,
+        );
+      }
+    }
     while let Some(result) = network_tasks.join_next().await {
       if let Err(error) = result {
         log::warn!("history collector network task failed: {}", error);
