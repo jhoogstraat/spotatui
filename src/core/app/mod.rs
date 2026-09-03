@@ -405,6 +405,14 @@ pub struct App {
   /// Incremented every time the playlist track table is reloaded to guard stale prefetch tasks
   pub playlist_tracks_prefetch_generation: u64,
   pub playlist_tracks_prefetch_in_flight: HashSet<u32>,
+  /// Monotonic generations fence saved-library page completions after a
+  /// fresh page-one request.
+  pub saved_albums_prefetch_generation: u64,
+  pub saved_shows_prefetch_generation: u64,
+  pub saved_artists_prefetch_generation: u64,
+  /// Metadata navigation generation; stale artist/album/show responses are
+  /// ignored by the fold when the user has moved on.
+  pub metadata_generation: u64,
   /// Playlist ids whose full track list is being fetched for sorting. Further
   /// sort changes reuse the active fetch and apply the newest sort at completion.
   pub playlist_sort_fetch_in_flight: HashSet<String>,
@@ -525,8 +533,8 @@ impl App {
   pub fn dispatch(&mut self, action: IoEvent) {
     // `is_loading` will be set to false again after the async action has finished in network.rs
     self.is_loading = true;
-    // Search events additionally raise the search-scoped flag; cleared with
-    // `is_loading` at the end of the network handler.
+    // Search events additionally raise the search-scoped flag; the catalog
+    // completion clears it only when its fold-owned generation is current.
     if matches!(
       action,
       IoEvent::GetSearchResults(..)

@@ -57,31 +57,45 @@ enum Direction {
 pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
   match event {
     IoEvent::GetYouTubeSearchResults(query) => {
-      run_youtube_search(app, query).await;
+      if let Some(spine) = playback_spine(app).await {
+        run_youtube_search(app, &spine, query).await;
+      }
       true
     }
     IoEvent::GetYouTubePlaylists => {
-      load_playlists(app).await;
+      if let Some(spine) = playback_spine(app).await {
+        load_playlists(&spine).await;
+      }
       true
     }
     IoEvent::GetYouTubeTracks(uri) => {
-      load_playlist_tracks(app, uri).await;
+      if let Some(spine) = playback_spine(app).await {
+        load_playlist_tracks(&spine, uri).await;
+      }
       true
     }
     IoEvent::CreateYouTubePlaylist(name) => {
-      create_playlist(app, name).await;
+      if let Some(spine) = playback_spine(app).await {
+        create_playlist(&spine, name).await;
+      }
       true
     }
     IoEvent::DeleteYouTubePlaylist(uri) => {
-      delete_playlist(app, uri).await;
+      if let Some(spine) = playback_spine(app).await {
+        delete_playlist(&spine, uri).await;
+      }
       true
     }
     IoEvent::AddTrackToYouTubePlaylist(playlist_ref, video_ref) => {
-      add_track_to_playlist(app, playlist_ref, video_ref).await;
+      if let Some(spine) = playback_spine(app).await {
+        add_track_to_playlist(&spine, playlist_ref, video_ref).await;
+      }
       true
     }
     IoEvent::RemoveTrackFromYouTubePlaylist(playlist_ref, video_ref) => {
-      remove_track_from_playlist(app, playlist_ref, video_ref).await;
+      if let Some(spine) = playback_spine(app).await {
+        remove_track_from_playlist(&spine, playlist_ref, video_ref).await;
+      }
       true
     }
     // Start a queue of youtube videos: queue all and start at the offset.
@@ -228,7 +242,6 @@ async fn status(spine: &Spine, message: impl Into<String>) {
 async fn emit(spine: &Spine, fact: Fact) {
   let _ = spine.emit_acked(EngineEvent::Decoded(fact)).await;
 }
-
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
@@ -245,39 +258,75 @@ pub(crate) async fn build_source(app: &Arc<Mutex<App>>) -> YouTubeSource {
 /// Run a YouTube search and populate `app.search_results`. Like the Subsonic
 /// M2 search, only the songs block is populated — each row is a video; Enter
 /// dispatches the `youtube:` URIs back through this module.
-async fn run_youtube_search(app: &Arc<Mutex<App>>, query: &str) {
-  crate::runtime::engine::emit_catalog_event(
-    app,
-    CatalogStateEvent::SearchRequested {
-      source: Source::YouTube,
-      query: query.to_string(),
-      scoped_loading: true,
-    },
-  )
-  .await;
+async fn run_youtube_search(
+  app: &Arc<Mutex<App>>,
+  spine: &crate::runtime::engine::Spine,
+  query: &str,
+) {
+  let generation = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Catalog(
+      CatalogStateEvent::SearchRequested {
+        source: Source::YouTube,
+        query: query.to_string(),
+        scoped_loading: true,
+      },
+    ))
+    .await
+    .and_then(|ack| ack.catalog_generation);
+  let Some(generation) = generation else {
+    return;
+  };
   let source = build_source(app).await;
   match source.search(query).await {
     Ok(results) => {
       let total = results.tracks.len() as u32;
-      crate::runtime::engine::emit_catalog_event(
-        app,
-        CatalogStateEvent::SearchCompleted {
-          source: Source::YouTube,
-          query: query.to_string(),
-          pages: Box::new(crate::core::catalog::SearchCompletionPages {
-            tracks: Some(Paged {
-              items: results.tracks,
-              total,
+      spine
+        .emit(crate::runtime::engine::EngineEvent::Catalog(
+          CatalogStateEvent::SearchCompleted {
+            source: Source::YouTube,
+            query: query.to_string(),
+            generation,
+            pages: Box::new(crate::core::catalog::SearchCompletionPages {
+              tracks: Some(Paged {
+                items: results.tracks,
+                total,
+                ..Default::default()
+              }),
               ..Default::default()
             }),
-            ..Default::default()
-          }),
-        },
-      )
-      .await;
+          },
+        ))
+        .await;
     }
-    Err(e) => set_error(app, format!("YouTube search failed: {e}")).await,
+    Err(e) => {
+      search_failed(
+        spine,
+        query,
+        generation,
+        format!("YouTube search failed: {e}"),
+      )
+      .await
+    }
   }
+}
+
+async fn search_failed(
+  spine: &crate::runtime::engine::Spine,
+  query: &str,
+  generation: u64,
+  message: String,
+) {
+  let _ = spine
+    .emit(crate::runtime::engine::EngineEvent::Catalog(
+      CatalogStateEvent::SearchCompleted {
+        source: Source::YouTube,
+        query: query.to_string(),
+        generation,
+        pages: Box::default(),
+      },
+    ))
+    .await;
+  set_error_spine(spine, message).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,38 +363,41 @@ async fn read_playlists_file() -> Result<super::playlists::PlaylistsFile> {
 }
 
 /// Refresh the sidebar list in `App` from an already-loaded file.
-async fn publish_playlists(app: &Arc<Mutex<App>>, file: &super::playlists::PlaylistsFile) {
+async fn publish_playlists(
+  spine: &crate::runtime::engine::Spine,
+  file: &super::playlists::PlaylistsFile,
+) {
   let infos: Vec<_> = file
     .playlists
     .iter()
     .map(super::playlists::playlist_to_info)
     .collect();
-  crate::runtime::engine::emit_decoded_source(
-    app,
-    crate::runtime::engine::DecodedSourceFact::YouTubePlaylists(infos),
-  )
-  .await;
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::YouTubePlaylists(infos),
+    ))
+    .await;
 }
 
 /// Load `youtube_playlists.yml` into the sidebar.
-async fn load_playlists(app: &Arc<Mutex<App>>) {
+async fn load_playlists(spine: &crate::runtime::engine::Spine) {
   match read_playlists_file().await {
-    Ok(file) => publish_playlists(app, &file).await,
-    Err(e) => set_error(app, format!("Cannot load YouTube playlists: {e}")).await,
+    Ok(file) => publish_playlists(spine, &file).await,
+    Err(e) => set_error_spine(spine, format!("Cannot load YouTube playlists: {e}")).await,
   }
 }
 
 /// Open a playlist's saved tracks in the shared track table.
-async fn load_playlist_tracks(app: &Arc<Mutex<App>>, uri: &str) {
+async fn load_playlist_tracks(spine: &crate::runtime::engine::Spine, uri: &str) {
   let file = match read_playlists_file().await {
     Ok(f) => f,
     Err(e) => {
-      set_error(app, format!("Cannot load YouTube playlists: {e}")).await;
+      set_error_spine(spine, format!("Cannot load YouTube playlists: {e}")).await;
       return;
     }
   };
   let Some(playlist) = super::playlists::find_playlist(&file, uri) else {
-    set_error(app, "That YouTube playlist no longer exists".to_string()).await;
+    set_error_spine(spine, "That YouTube playlist no longer exists".to_string()).await;
     return;
   };
   let rows: Vec<TrackInfo> = playlist
@@ -353,18 +405,20 @@ async fn load_playlist_tracks(app: &Arc<Mutex<App>>, uri: &str) {
     .iter()
     .map(super::playlists::stored_to_track_info)
     .collect();
-  crate::runtime::engine::emit_decoded_source(
-    app,
-    crate::runtime::engine::DecodedSourceFact::YouTubeTracks(rows),
-  )
-  .await;
-  // The open-playlist marker is a small request token; retain its existing
-  // direct update until the source query envelope grows a marker operation.
-  app.lock().await.youtube_open_playlist = Some(uri.to_string());
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::YouTubeTracks(rows),
+    ))
+    .await;
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::YouTubeOpenPlaylist(Some(uri.to_string())),
+    ))
+    .await;
 }
 
 /// Create a playlist and refresh the sidebar.
-async fn create_playlist(app: &Arc<Mutex<App>>, name: &str) {
+async fn create_playlist(spine: &crate::runtime::engine::Spine, name: &str) {
   let name_owned = name.to_string();
   let result = with_playlists_file(move |file| {
     super::playlists::create_playlist(file, &name_owned)?;
@@ -373,17 +427,22 @@ async fn create_playlist(app: &Arc<Mutex<App>>, name: &str) {
   .await;
   match result {
     Ok(file) => {
-      publish_playlists(app, &file).await;
-      let mut guard = app.lock().await;
-      guard.set_status_message(format!("Created YouTube playlist \"{}\"", name.trim()), 4);
+      publish_playlists(spine, &file).await;
+      set_status(
+        spine,
+        format!("Created YouTube playlist \"{}\"", name.trim()),
+        4,
+      )
+      .await;
     }
-    Err(e) => set_error(app, format!("Cannot create YouTube playlist: {e}")).await,
+    Err(e) => set_error_spine(spine, format!("Cannot create YouTube playlist: {e}")).await,
   }
 }
 
 /// Delete a playlist and refresh the sidebar.
-async fn delete_playlist(app: &Arc<Mutex<App>>, uri: &str) {
+async fn delete_playlist(spine: &crate::runtime::engine::Spine, uri: &str) {
   let uri_owned = uri.to_string();
+  let deleted_uri = uri_owned.clone();
   let result = with_playlists_file(move |file| {
     let deleted = super::playlists::delete_playlist(file, &uri_owned)?;
     Ok((deleted.name, file.clone()))
@@ -391,51 +450,39 @@ async fn delete_playlist(app: &Arc<Mutex<App>>, uri: &str) {
   .await;
   match result {
     Ok((name, file)) => {
-      publish_playlists(app, &file).await;
-      let mut guard = app.lock().await;
-      // The deleted playlist may be open in the track table; drop the marker so
-      // the remove-track flow can't edit a ghost.
-      if guard.youtube_open_playlist.as_deref() == Some(uri) {
-        guard.youtube_open_playlist = None;
-      }
-      guard.set_status_message(format!("Deleted YouTube playlist \"{name}\""), 4);
+      publish_playlists(spine, &file).await;
+      let _ = spine
+        .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+          crate::runtime::engine::DecodedSourceFact::YouTubePlaylistDeleted(deleted_uri),
+        ))
+        .await;
+      set_status(spine, format!("Deleted YouTube playlist \"{name}\""), 4).await;
     }
-    Err(e) => set_error(app, format!("Cannot delete YouTube playlist: {e}")).await,
+    Err(e) => set_error_spine(spine, format!("Cannot delete YouTube playlist: {e}")).await,
   }
 }
 
-/// Find a video's browse row by bare id or `youtube:` URI, in the search
-/// results or the track table (whichever view the add originated from).
-fn find_video_row(app: &App, video_ref: &str) -> Option<TrackInfo> {
-  let uri = super::uri_for_video_id(video_ref);
-  let matches = |t: &&TrackInfo| {
-    t.id.as_deref() == Some(video_ref)
-      || t.uri.as_deref() == Some(video_ref)
-      || t.uri.as_deref() == Some(uri.as_str())
-  };
-  app
-    .search_results
-    .tracks
-    .as_ref()
-    .and_then(|p| p.items.iter().find(matches))
-    .or_else(|| app.track_table.tracks.iter().find(matches))
-    .cloned()
-}
-
 /// Add a video to a playlist, resolving its metadata from the browse views.
-async fn add_track_to_playlist(app: &Arc<Mutex<App>>, playlist_ref: &str, video_ref: &str) {
-  let row = {
-    let guard = app.lock().await;
-    find_video_row(&guard, video_ref)
+async fn add_track_to_playlist(
+  spine: &crate::runtime::engine::Spine,
+  playlist_ref: &str,
+  video_ref: &str,
+) {
+  let row = match spine
+    .query(FoldQuery::YouTubeTrack(video_ref.to_string()))
+    .await
+  {
+    Ok(FoldAnswer::Track(row)) => row,
+    _ => None,
   };
   let Some(row) = row else {
-    set_error(app, "Cannot resolve that video's metadata".to_string()).await;
+    set_error_spine(spine, "Cannot resolve that video's metadata".to_string()).await;
     return;
   };
   let stored = match super::playlists::track_info_to_stored(&row) {
     Ok(s) => s,
     Err(e) => {
-      set_error(app, format!("Cannot add video to playlist: {e}")).await;
+      set_error_spine(spine, format!("Cannot add video to playlist: {e}")).await;
       return;
     }
   };
@@ -452,21 +499,25 @@ async fn add_track_to_playlist(app: &Arc<Mutex<App>>, playlist_ref: &str, video_
 
   match result {
     Ok((added, playlist_name, file)) => {
-      publish_playlists(app, &file).await;
+      publish_playlists(spine, &file).await;
       let msg = if added {
         format!("Added \"{}\" to {playlist_name}", row.name)
       } else {
         format!("\"{}\" is already in {playlist_name}", row.name)
       };
-      app.lock().await.set_status_message(msg, 4);
+      set_status(spine, msg, 4).await;
     }
-    Err(e) => set_error(app, format!("Cannot add video to playlist: {e}")).await,
+    Err(e) => set_error_spine(spine, format!("Cannot add video to playlist: {e}")).await,
   }
 }
 
 /// Remove a video from a playlist; refreshes the open track table when it
 /// shows that playlist.
-async fn remove_track_from_playlist(app: &Arc<Mutex<App>>, playlist_ref: &str, video_ref: &str) {
+async fn remove_track_from_playlist(
+  spine: &crate::runtime::engine::Spine,
+  playlist_ref: &str,
+  video_ref: &str,
+) {
   // The remove dialog passes the bare video id; normalize from a URI too.
   let video_id = super::video_id_from_uri(video_ref)
     .map(str::to_owned)
@@ -489,18 +540,24 @@ async fn remove_track_from_playlist(app: &Arc<Mutex<App>>, playlist_ref: &str, v
 
   match result {
     Ok((title, remaining, file)) => {
-      publish_playlists(app, &file).await;
-      let mut guard = app.lock().await;
-      // Keep the open track table in sync with the file.
-      if guard.youtube_open_playlist.as_deref() == Some(playlist_ref) {
-        let len = remaining.len();
-        guard.track_table.tracks = remaining;
-        guard.track_table.selected_index =
-          guard.track_table.selected_index.min(len.saturating_sub(1));
+      publish_playlists(spine, &file).await;
+      let is_open = match spine
+        .query(FoldQuery::Decoded(Query::YouTubeOpenPlaylist))
+        .await
+      {
+        Ok(FoldAnswer::Decoded(Answer::YouTubeOpenPlaylist(Some(open)))) => open == playlist_ref,
+        _ => false,
+      };
+      if is_open {
+        let _ = spine
+          .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+            crate::runtime::engine::DecodedSourceFact::YouTubeTracks(remaining),
+          ))
+          .await;
       }
-      guard.set_status_message(format!("Removed \"{title}\" from playlist"), 4);
+      set_status(spine, format!("Removed \"{title}\" from playlist"), 4).await;
     }
-    Err(e) => set_error(app, format!("Cannot remove video from playlist: {e}")).await,
+    Err(e) => set_error_spine(spine, format!("Cannot remove video from playlist: {e}")).await,
   }
 }
 
@@ -826,8 +883,40 @@ pub async fn teardown_youtube(spine: &Spine) {
   emit(spine, Fact::YouTubePlaybackCleared).await;
 }
 
+async fn set_error_spine(spine: &crate::runtime::engine::Spine, message: String) {
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Session(
+      crate::runtime::engine::SessionFact::Status {
+        message,
+        ttl_secs: 6,
+        is_error: true,
+      },
+    ))
+    .await;
+}
+
 async fn set_error(app: &Arc<Mutex<App>>, message: String) {
-  app.lock().await.set_status_message(message, 6);
+  if let Some(spine) = playback_spine(app).await {
+    set_error_spine(&spine, message).await;
+  } else {
+    log::warn!("YouTube operation failed without an engine spine: {message}");
+  }
+}
+
+async fn set_status(
+  spine: &crate::runtime::engine::Spine,
+  message: impl Into<String>,
+  ttl_secs: u64,
+) {
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Session(
+      crate::runtime::engine::SessionFact::Status {
+        message: message.into(),
+        ttl_secs,
+        is_error: false,
+      },
+    ))
+    .await;
 }
 
 #[cfg(test)]
@@ -891,6 +980,41 @@ mod tests {
     assert!(snap.is_empty());
   }
 
+  #[tokio::test]
+  async fn deleting_noncurrent_playlist_preserves_open_marker() {
+    let app = Arc::new(Mutex::new(test_app()));
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
+    let emit = |fact| spine.emit_acked(crate::runtime::engine::EngineEvent::Decoded(fact));
+
+    emit(
+      crate::runtime::engine::DecodedSourceFact::YouTubeOpenPlaylist(Some(
+        "youtube:playlist:open".to_string(),
+      )),
+    )
+    .await
+    .expect("open marker fact should be folded");
+    emit(
+      crate::runtime::engine::DecodedSourceFact::YouTubePlaylistDeleted(
+        "youtube:playlist:other".to_string(),
+      ),
+    )
+    .await
+    .expect("delete fact should be folded");
+    assert_eq!(
+      app.lock().await.youtube_open_playlist.as_deref(),
+      Some("youtube:playlist:open")
+    );
+
+    emit(
+      crate::runtime::engine::DecodedSourceFact::YouTubePlaylistDeleted(
+        "youtube:playlist:open".to_string(),
+      ),
+    )
+    .await
+    .expect("matching delete fact should be folded");
+    assert!(app.lock().await.youtube_open_playlist.is_none());
+  }
+
   /// Search/transport events that are not YouTube's must fall through.
   #[tokio::test]
   async fn foreign_events_fall_through_without_a_session() {
@@ -939,6 +1063,7 @@ mod tests {
   #[tokio::test]
   async fn livestream_rows_are_refused_without_session() {
     let app = Arc::new(Mutex::new(test_app()));
+    let (_spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
     {
       let mut guard = app.lock().await;
       let mut live = video("youtube:live12345", "24/7 Lofi Radio");
@@ -982,6 +1107,9 @@ mod tests {
     std::env::set_var(super::super::playlists::PATH_ENV, &path);
 
     let app = Arc::new(Mutex::new(test_app()));
+    // CRUD facts now flow through the fold; keep this integration test on the
+    // same production path rather than relying on a mutex fallback.
+    let (_spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
 
     // Empty file → empty sidebar list.
     assert!(route_youtube_event(&app, &IoEvent::GetYouTubePlaylists).await);

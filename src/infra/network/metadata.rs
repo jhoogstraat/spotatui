@@ -118,6 +118,34 @@ pub(super) async fn fetch_album_tracks_from(
   Ok(items)
 }
 
+async fn claim_metadata_generation(network: &Network) -> u64 {
+  let Some(spine) = network.spine.as_ref() else {
+    return 0;
+  };
+  match spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Session(
+      SessionFact::MetadataRequested,
+    ))
+    .await
+  {
+    Some(ack) => ack.metadata_generation.unwrap_or(0),
+    _ => 0,
+  }
+}
+
+async fn metadata_terminal(network: &Network, generation: u64, message: Option<String>) {
+  if let Some(spine) = network.spine.as_ref() {
+    spine
+      .emit(crate::runtime::engine::EngineEvent::Session(
+        SessionFact::MetadataTerminal {
+          generation,
+          message,
+        },
+      ))
+      .await;
+  }
+}
+
 pub trait MetadataNetwork {
   async fn get_artist(
     &mut self,
@@ -145,6 +173,7 @@ impl MetadataNetwork for Network {
     input_artist_name: String,
     country: Option<Country>,
   ) {
+    let generation = claim_metadata_generation(self).await;
     let artist_id_str = artist_id.id().to_string();
     let cache_key = format!("{}:{:?}", artist_id_str, country);
 
@@ -172,14 +201,14 @@ impl MetadataNetwork for Network {
       let top_tracks = match top_tracks_res {
         Ok(res) => res.tracks,
         Err(e) => {
-          self.handle_error(anyhow!(e)).await;
+          metadata_terminal(self, generation, Some(e.to_string())).await;
           return;
         }
       };
       let related_artists = match related_artists_res {
         Ok(res) => res.artists,
         Err(e) => {
-          self.handle_error(anyhow!(e)).await;
+          metadata_terminal(self, generation, Some(e.to_string())).await;
           return;
         }
       };
@@ -194,7 +223,7 @@ impl MetadataNetwork for Network {
       {
         Ok(page) => page.items,
         Err(e) => {
-          self.handle_error(anyhow!(e)).await;
+          metadata_terminal(self, generation, Some(e.to_string())).await;
           return;
         }
       };
@@ -251,72 +280,85 @@ impl MetadataNetwork for Network {
     }
 
     self
-      .emit_session(SessionFact::ArtistView(Box::new(Artist {
-        artist_id: artist_id_str,
-        artist_name: input_artist_name,
-        albums,
-        related_artists: domain_related_artists,
-        top_tracks: domain_top_tracks,
-        selected_album_index: 0,
-        selected_related_artist_index: 0,
-        selected_top_track_index: 0,
-        artist_selected_block: ArtistBlock::TopTracks,
-        artist_hovered_block: ArtistBlock::TopTracks,
-      })))
+      .emit_session(SessionFact::ArtistView {
+        generation,
+        artist: Box::new(Artist {
+          artist_id: artist_id_str,
+          artist_name: input_artist_name,
+          albums,
+          related_artists: domain_related_artists,
+          top_tracks: domain_top_tracks,
+          selected_album_index: 0,
+          selected_related_artist_index: 0,
+          selected_top_track_index: 0,
+          artist_selected_block: ArtistBlock::TopTracks,
+          artist_hovered_block: ArtistBlock::TopTracks,
+        }),
+      })
       .await;
   }
 
   async fn get_album_tracks(&mut self, album: Box<SimplifiedAlbum>) {
+    let generation = claim_metadata_generation(self).await;
     let album_id = album.id.clone();
-    if let Some(id) = album_id {
-      let fetched = match self.album_tracks_cache.get(id.id()) {
-        Some(tracks) => Ok(tracks),
-        None => match fetch_album_tracks_from(self, id.id(), 0).await {
-          Ok(tracks) => {
-            self
-              .album_tracks_cache
-              .put(id.id().to_string(), tracks.clone());
-            Ok(tracks)
-          }
-          Err(e) => Err(e),
-        },
-      };
-      match fetched {
-        Ok(track_items) => {
-          let album_info = crate::core::plugin_api::AlbumInfo::from(album.as_ref());
-          // Check if these tracks are liked (before `track_items` is consumed).
-          let track_check = ids::track_check_ids(track_items.iter().map(|t| t.id.as_ref()));
-          let total = track_items.len() as u32;
-          let tracks = Page {
-            items: track_items,
-            href: String::new(),
-            limit: total,
-            next: None,
-            offset: 0,
-            previous: None,
-            total,
-          };
-          let tracks_domain = map_page(&tracks, |t| crate::core::plugin_api::TrackInfo::from(t));
-          if !track_check.is_empty() {
-            self
-              .emit_session(SessionFact::DispatchIo(vec![
-                IoEvent::CurrentUserSavedTracksContains(track_check),
-              ]))
-              .await;
-          }
+    let Some(id) = album_id else {
+      metadata_terminal(
+        self,
+        generation,
+        Some("album is missing a Spotify id".into()),
+      )
+      .await;
+      return;
+    };
+    let fetched = match self.album_tracks_cache.get(id.id()) {
+      Some(tracks) => Ok(tracks),
+      None => match fetch_album_tracks_from(self, id.id(), 0).await {
+        Ok(tracks) => {
           self
-            .emit_session(SessionFact::AlbumTracksSimplified {
-              album: album_info,
-              tracks: tracks_domain,
-            })
+            .album_tracks_cache
+            .put(id.id().to_string(), tracks.clone());
+          Ok(tracks)
+        }
+        Err(e) => Err(e),
+      },
+    };
+    match fetched {
+      Ok(track_items) => {
+        let album_info = crate::core::plugin_api::AlbumInfo::from(album.as_ref());
+        // Check if these tracks are liked (before `track_items` is consumed).
+        let track_check = ids::track_check_ids(track_items.iter().map(|t| t.id.as_ref()));
+        let total = track_items.len() as u32;
+        let tracks = Page {
+          items: track_items,
+          href: String::new(),
+          limit: total,
+          next: None,
+          offset: 0,
+          previous: None,
+          total,
+        };
+        let tracks_domain = map_page(&tracks, |t| crate::core::plugin_api::TrackInfo::from(t));
+        if !track_check.is_empty() {
+          self
+            .emit_session(SessionFact::DispatchIo(vec![
+              IoEvent::CurrentUserSavedTracksContains(track_check),
+            ]))
             .await;
         }
-        Err(e) => self.handle_error(anyhow!(e)).await,
+        self
+          .emit_session(SessionFact::AlbumTracksSimplified {
+            generation,
+            album: album_info,
+            tracks: tracks_domain,
+          })
+          .await;
       }
+      Err(e) => metadata_terminal(self, generation, Some(e.to_string())).await,
     }
   }
 
   async fn get_album(&mut self, album_id: AlbumId<'static>) {
+    let generation = claim_metadata_generation(self).await;
     let fetched = if let Some(album) = self.album_cache.get(album_id.id()) {
       Ok(album)
     } else {
@@ -337,7 +379,7 @@ impl MetadataNetwork for Network {
               album.tracks.next = None;
             }
             Err(e) => {
-              self.handle_error(anyhow!(e)).await;
+              metadata_terminal(self, generation, Some(e.to_string())).await;
               return;
             }
           }
@@ -356,15 +398,25 @@ impl MetadataNetwork for Network {
             .await;
         }
         self
-          .emit_session(SessionFact::AlbumTracksFull { album: album_info })
+          .emit_session(SessionFact::AlbumTracksFull {
+            generation,
+            album: album_info,
+          })
           .await;
       }
-      Err(e) => self.handle_error(anyhow!(e)).await,
+      Err(e) => metadata_terminal(self, generation, Some(e.to_string())).await,
     }
   }
 
   async fn get_show_episodes(&mut self, show: Box<ShowInfo>) {
+    let generation = claim_metadata_generation(self).await;
     let Some(show_id) = show.id.as_deref().and_then(|id| ShowId::from_id(id).ok()) else {
+      metadata_terminal(
+        self,
+        generation,
+        Some("show is missing or has an invalid Spotify id".into()),
+      )
+      .await;
       return;
     };
     let path = format!("shows/{}/episodes", show_id.id());
@@ -381,19 +433,23 @@ impl MetadataNetwork for Network {
           let domain_page = map_page(&episodes, |e| EpisodeInfo::from(e));
           self
             .emit_session(SessionFact::ShowEpisodesLanded {
+              generation,
               page: domain_page,
               show: *show,
             })
             .await;
+        } else {
+          metadata_terminal(self, generation, None).await;
         }
       }
       Err(e) => {
-        self.handle_error(anyhow!(e)).await;
+        metadata_terminal(self, generation, Some(e.to_string())).await;
       }
     }
   }
 
   async fn get_show(&mut self, show_id: ShowId<'static>) {
+    let generation = claim_metadata_generation(self).await;
     let path = format!("shows/{}", show_id.id());
     match self
       .spotify_get_typed::<rspotify::model::show::FullShow>(&path, &[])
@@ -402,17 +458,19 @@ impl MetadataNetwork for Network {
       Ok(show) => {
         self
           .emit_session(SessionFact::FullShowLanded {
+            generation,
             show: ShowInfo::from(&show),
           })
           .await;
       }
       Err(e) => {
-        self.handle_error(anyhow!(e)).await;
+        metadata_terminal(self, generation, Some(e.to_string())).await;
       }
     }
   }
 
   async fn get_current_show_episodes(&mut self, show_id: ShowId<'static>, offset: Option<u32>) {
+    let generation = claim_metadata_generation(self).await;
     let path = format!("shows/{}/episodes", show_id.id());
     let mut query = vec![("limit", self.large_search_limit.to_string())];
     if let Some(offset) = offset {
@@ -427,17 +485,43 @@ impl MetadataNetwork for Network {
         if !episodes.items.is_empty() {
           let domain_page = map_page(&episodes, |e| EpisodeInfo::from(e));
           self
-            .emit_session(SessionFact::ShowEpisodesAppended { page: domain_page })
+            .emit_session(SessionFact::ShowEpisodesAppended {
+              generation,
+              page: domain_page,
+            })
             .await;
+        } else {
+          metadata_terminal(self, generation, None).await;
         }
       }
       Err(e) => {
-        self.handle_error(anyhow!(e)).await;
+        metadata_terminal(self, generation, Some(e.to_string())).await;
       }
     }
   }
 
   async fn get_followed_artists(&mut self, after: Option<ArtistId<'static>>) {
+    let generation = match self.spine.as_ref() {
+      Some(spine) if after.is_none() => spine
+        .emit_acked(crate::runtime::engine::EngineEvent::Catalog(
+          crate::core::catalog::CatalogStateEvent::LibraryGenerationStarted {
+            section: crate::core::catalog::LibrarySection::SavedArtists,
+          },
+        ))
+        .await
+        .and_then(|ack| ack.library_generation)
+        .unwrap_or(0),
+      Some(spine) => match spine
+        .query(crate::runtime::engine::FoldQuery::LibraryGeneration {
+          section: crate::core::catalog::LibrarySection::SavedArtists,
+        })
+        .await
+      {
+        Ok(crate::runtime::engine::FoldAnswer::U64(generation)) => generation,
+        _ => 0,
+      },
+      None => 0,
+    };
     let limit = self.large_search_limit;
     let mut query = vec![("type", "artist".to_string()), ("limit", limit.to_string())];
     if let Some(after) = after.as_ref() {
@@ -457,6 +541,7 @@ impl MetadataNetwork for Network {
           spine
             .emit(crate::runtime::engine::EngineEvent::Catalog(
               crate::core::catalog::CatalogStateEvent::SavedArtistsPageUpserted {
+                generation,
                 page: Some(domain_page),
               },
             ))

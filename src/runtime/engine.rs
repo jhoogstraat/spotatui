@@ -284,6 +284,12 @@ pub enum DecodedSourceFact {
   #[cfg(feature = "youtube")]
   YouTubeTracks(Vec<crate::core::plugin_api::TrackInfo>),
   #[cfg(feature = "youtube")]
+  YouTubeOpenPlaylist(Option<String>),
+  /// A playlist was deleted; the fold clears the open marker only when this
+  /// URI is the one currently displayed.
+  #[cfg(feature = "youtube")]
+  YouTubePlaylistDeleted(String),
+  #[cfg(feature = "youtube")]
   YouTubePlayback(crate::infra::youtube::YouTubePlaybackState),
   #[cfg(feature = "youtube")]
   YouTubePlaybackCleared,
@@ -381,6 +387,8 @@ pub enum DecodedSourceQuery {
   SubsonicPlayIndex(usize),
   #[cfg(feature = "subsonic")]
   SubsonicRepeat(rspotify::model::enums::RepeatState),
+  #[cfg(feature = "youtube")]
+  YouTubeOpenPlaylist,
   #[cfg(feature = "internet-radio")]
   RadioPlayer,
   #[cfg(feature = "internet-radio")]
@@ -450,6 +458,8 @@ pub enum DecodedSourceAnswer {
   SubsonicPlayIndex(SubsonicPlayTarget),
   #[cfg(feature = "subsonic")]
   SubsonicRepeat(bool),
+  #[cfg(feature = "youtube")]
+  YouTubeOpenPlaylist(Option<String>),
   #[cfg(feature = "internet-radio")]
   RadioPlayer(Option<Arc<crate::infra::audio::LocalPlayer>>),
   #[cfg(feature = "internet-radio")]
@@ -574,6 +584,10 @@ impl std::fmt::Debug for DecodedSourceFact {
       #[cfg(feature = "youtube")]
       Self::YouTubeTracks(_) => "YouTubeTracks",
       #[cfg(feature = "youtube")]
+      Self::YouTubeOpenPlaylist(_) => "YouTubeOpenPlaylist",
+      #[cfg(feature = "youtube")]
+      Self::YouTubePlaylistDeleted(_) => "YouTubePlaylistDeleted",
+      #[cfg(feature = "youtube")]
       Self::YouTubePlayback(_) => "YouTubePlayback",
       #[cfg(feature = "youtube")]
       Self::YouTubePlaybackCleared => "YouTubePlaybackCleared",
@@ -648,6 +662,13 @@ impl std::fmt::Debug for QueueFetchResult {
 /// `IoEvent` has no Debug and must not grow one.
 #[derive(Clone)]
 pub enum SessionFact {
+  /// Reserve a metadata navigation generation before an async request.
+  MetadataRequested,
+  /// A metadata request ended empty or failed; stale generations are ignored.
+  MetadataTerminal {
+    generation: u64,
+    message: Option<String>,
+  },
   /// An auth-state transition (token refreshed, login completed, session
   /// lost). The fold runs `AuthState::transition` + the legacy mirror sync.
   Auth {
@@ -746,29 +767,37 @@ pub enum SessionFact {
   },
   /// The artist view landed (metadata.rs): the fold writes `app.artist` and
   /// pushes the navigation route. Boxed — the view bundles three pages.
-  ArtistView(Box<crate::core::app::Artist>),
+  ArtistView {
+    generation: u64,
+    artist: Box<crate::core::app::Artist>,
+  },
   /// An album's tracklist landed. `Simplified` comes from the playlist-style
   /// listing (context Simplified); `Full` from the album endpoint (context
   /// Full). Both push the AlbumTracks route with a reset selection.
   AlbumTracksSimplified {
+    generation: u64,
     album: crate::core::plugin_api::AlbumInfo,
     tracks: crate::core::pagination::Paged<crate::core::plugin_api::TrackInfo>,
   },
   AlbumTracksFull {
+    generation: u64,
     album: crate::core::plugin_api::AlbumInfo,
   },
   /// Podcast episodes landed: `reset` clears the paged library cache and
   /// selects the show (entry from a show list); otherwise pages append to the
   /// existing cache (scroll pagination).
   ShowEpisodesLanded {
+    generation: u64,
     page: crate::core::pagination::Paged<crate::core::plugin_api::EpisodeInfo>,
     show: crate::core::plugin_api::ShowInfo,
   },
   ShowEpisodesAppended {
+    generation: u64,
     page: crate::core::pagination::Paged<crate::core::plugin_api::EpisodeInfo>,
   },
   /// The full show landed (metadata.rs).
   FullShowLanded {
+    generation: u64,
     show: crate::core::plugin_api::ShowInfo,
   },
   /// The follow-check round-trip for ids already known to be followed
@@ -985,6 +1014,8 @@ pub enum PostConnectFetch {
 impl std::fmt::Debug for SessionFact {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      SessionFact::MetadataRequested => f.write_str("MetadataRequested"),
+      SessionFact::MetadataTerminal { .. } => f.write_str("MetadataTerminal"),
       SessionFact::Auth {
         transition,
         new_expiry,
@@ -1035,7 +1066,7 @@ impl std::fmt::Debug for SessionFact {
       }
       SessionFact::DispatchPlaylistRefresh => f.write_str("DispatchPlaylistRefresh"),
       SessionFact::StatsLoadingCleared => f.write_str("StatsLoadingCleared"),
-      SessionFact::ArtistView(_) => f.write_str("ArtistView"),
+      SessionFact::ArtistView { .. } => f.write_str("ArtistView"),
       SessionFact::AlbumTracksSimplified { .. } => f.write_str("AlbumTracksSimplified"),
       SessionFact::AlbumTracksFull { .. } => f.write_str("AlbumTracksFull"),
       SessionFact::ShowEpisodesLanded { .. } => f.write_str("ShowEpisodesLanded"),
@@ -1282,6 +1313,7 @@ pub enum FoldQuery {
   /// Release a claimed offset (fetch failed or the task is exiting).
   ReleaseLibraryOffset {
     section: crate::core::catalog::LibrarySection,
+    generation: u64,
   },
   /// Liked membership for these ids (the like toggle reads it to decide
   /// save-vs-delete; the detached worker used to merge under one lock).
@@ -1330,7 +1362,11 @@ pub enum FoldQuery {
   PlaylistRefreshLive { generation: u64 },
   /// Release a playlist page-1 fetch slot + clear the pending open (the
   /// error path of `GetPlaylistItems`).
-  ReleasePlaylistTracksPage { playlist_id: String, offset: u32 },
+  ReleasePlaylistTracksPage {
+    playlist_id: String,
+    offset: u32,
+    generation: u64,
+  },
   /// Clear the playlist track filter (the empty-query branch of
   /// `SearchPlaylistTracks`); the fold rebuilds the unfiltered table.
   ClearPlaylistTrackFilter,
@@ -1397,9 +1433,25 @@ pub enum FoldQuery {
   /// Claim a playlist-tracks page offset for fetching (the old
   /// `playlist_tracks_prefetch_in_flight.insert(offset)` RMW, combined with
   /// the generation + still-open checks into one atomic fold decision).
-  ClaimPlaylistTracksOffset { playlist_id: String, offset: u32 },
+  ClaimPlaylistTracksOffset {
+    playlist_id: String,
+    offset: u32,
+    generation: u64,
+  },
+  /// Read the current playlist-track table generation before an async page
+  /// request.
+  PlaylistTracksGeneration,
   /// Release a claimed playlist-tracks offset (fetch failed).
-  ReleasePlaylistTracksOffset { playlist_id: String, offset: u32 },
+  ReleasePlaylistTracksOffset {
+    playlist_id: String,
+    offset: u32,
+    generation: u64,
+  },
+  /// Claim or read the generation for saved albums/shows/artists. `reset`
+  /// starts a fresh page-one request; pagination reads the current token.
+  LibraryGeneration {
+    section: crate::core::catalog::LibrarySection,
+  },
   /// The saved-tracks view state the `GetCurrentSavedTracks` handler needs
   /// to decide what to do with a fresh page 1: is the table already
   /// showing this section, and which offset should the user's pending
@@ -1416,6 +1468,9 @@ pub enum FoldQuery {
   Playlists,
   /// The visible track-table rows (CLI `list liked`).
   TableTracks,
+  /// Resolve a YouTube browse row for a playlist mutation.
+  #[cfg(feature = "youtube")]
+  YouTubeTrack(String),
   /// The latest catalog search results (CLI `play`/`search`).
   SearchResults,
   /// The last surfaced API error text (CLI decides success vs. failure).
@@ -1641,6 +1696,9 @@ pub enum FoldAnswer {
   Playlists(Option<crate::core::pagination::Paged<crate::core::plugin_api::PlaylistInfo>>),
   /// The visible track-table rows.
   Tracks(Vec<crate::core::plugin_api::TrackInfo>),
+  /// A YouTube browse row resolved by source-owned identity.
+  #[cfg(feature = "youtube")]
+  Track(Option<crate::core::plugin_api::TrackInfo>),
   /// The latest catalog search results.
   Search(Box<crate::core::app::SearchResult>),
   /// The source-agnostic playback snapshot (or `None` when nothing plays).
@@ -1763,6 +1821,8 @@ impl std::fmt::Debug for FoldAnswer {
       FoldAnswer::Devices(v) => f.debug_tuple("Devices").field(&v.is_some()).finish(),
       FoldAnswer::Playlists(v) => f.debug_tuple("Playlists").field(&v.is_some()).finish(),
       FoldAnswer::Tracks(v) => f.debug_tuple("Tracks").field(&v.len()).finish(),
+      #[cfg(feature = "youtube")]
+      FoldAnswer::Track(v) => f.debug_tuple("Track").field(&v.is_some()).finish(),
       FoldAnswer::Search(v) => f.debug_tuple("Search").field(v).finish(),
       FoldAnswer::Media(v) => f.debug_tuple("Media").field(&v.is_some()).finish(),
       FoldAnswer::HistoryState(v) => f
@@ -2061,8 +2121,14 @@ pub enum NativeShuffleToggleDecision {
 /// back what the producer used to read after its own write. Today: the next
 /// missing offset for both offset-keyed library caches (`None` when the
 /// event was dropped as stale or the cache is complete).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FoldAck {
+  /// Generation assigned when a catalog request is accepted.
+  pub catalog_generation: Option<u64>,
+  /// Generation allocated for a saved-library refresh.
+  pub library_generation: Option<u64>,
+  /// Generation allocated for a metadata navigation request.
+  pub metadata_generation: Option<u64>,
   /// The next missing saved-tracks offset after the folded upsert.
   pub next_saved_tracks_offset: Option<u32>,
   /// The next missing playlist-tracks offset after the folded upsert.
@@ -2424,21 +2490,21 @@ pub(crate) async fn emit_catalog_event(
   app: &Arc<Mutex<App>>,
   event: crate::core::catalog::CatalogStateEvent,
 ) {
-  if let Some(spine) = app.lock().await.spine.as_ref() {
+  let spine = app.lock().await.spine.clone();
+  if let Some(spine) = spine {
     spine.emit(EngineEvent::Catalog(event)).await;
   }
 }
 
-/// Emit one decoded-source fact through the fold. Tests that do not install a
-/// fold use the same reducer synchronously as a compatibility fallback.
+/// Emit one decoded-source fact through the fold. A missing spine means the
+/// runtime is not booted; do not mutate authoritative state outside the fold.
 #[allow(dead_code)]
 pub(crate) async fn emit_decoded_source(app: &Arc<Mutex<App>>, fact: DecodedSourceFact) {
   let spine = app.lock().await.spine.clone();
   if let Some(spine) = spine {
     spine.emit(EngineEvent::Decoded(fact)).await;
   } else {
-    let mut guard = app.lock().await;
-    crate::runtime::frontend::apply_decoded_source_fact(&mut guard, fact);
+    log::warn!("decoded source fact dropped because engine spine is unavailable");
   }
 }
 

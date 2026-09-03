@@ -782,9 +782,87 @@ async fn publish(
 }
 fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
   match &event {
+    EngineEvent::Session(crate::runtime::engine::SessionFact::MetadataRequested) => {
+      apply_session_fact(app, crate::runtime::engine::SessionFact::MetadataRequested);
+      Some(FoldAck {
+        metadata_generation: Some(app.metadata_generation),
+        ..FoldAck::default()
+      })
+    }
+    EngineEvent::Catalog(CatalogStateEvent::LibraryGenerationStarted { section }) => {
+      crate::core::apply_catalog_state(app, event_catalog(&event));
+      Some(FoldAck {
+        catalog_generation: None,
+        library_generation: Some(library_generation_matches_value(app, *section)),
+        metadata_generation: None,
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: None,
+        #[cfg(feature = "streaming")]
+        native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
+      })
+    }
+    EngineEvent::Catalog(CatalogStateEvent::SearchRequested { .. }) => {
+      crate::core::apply_catalog_state(app, event_catalog(&event));
+      Some(FoldAck {
+        catalog_generation: app
+          .catalog_state
+          .latest
+          .as_ref()
+          .map(|(_, token)| token.seq),
+        library_generation: None,
+        metadata_generation: None,
+        next_saved_tracks_offset: None,
+        next_playlist_tracks_offset: None,
+        action_outcome: None,
+        #[cfg(feature = "streaming")]
+        native: None,
+        #[cfg(feature = "streaming")]
+        queue_track: None,
+        #[cfg(any(
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        backend_players: None,
+        #[cfg(any(feature = "subsonic", feature = "youtube"))]
+        queue_fetch_claim: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube",
+          feature = "internet-radio"
+        ))]
+        queue_suspended: None,
+      })
+    }
     EngineEvent::Catalog(CatalogStateEvent::SavedTracksPageUpserted { .. }) => {
       let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: if outcome.stale_event_dropped {
           None
         } else {
@@ -818,6 +896,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
     EngineEvent::Catalog(CatalogStateEvent::PlaylistTracksPageUpserted { .. }) => {
       let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: if outcome.stale_event_dropped {
           None
@@ -850,6 +931,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
     }
     EngineEvent::Session(crate::runtime::engine::SessionFact::ApplyAction(action)) => {
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: Some(app.apply(action.clone())),
@@ -886,6 +970,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         None
       };
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: None,
@@ -925,6 +1012,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         _ => None,
       });
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: None,
@@ -1000,6 +1090,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         app.youtube_playback.take();
       }
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: None,
@@ -1030,6 +1123,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
     EngineEvent::Decoded(crate::runtime::engine::DecodedSourceFact::QueueTakeSuspended) => {
       let suspended = app.queue_suspended.take();
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: None,
@@ -1060,6 +1156,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         EngineEvent::Native(fact) => {
           let native = apply_native_fact(app, fact);
           return Some(FoldAck {
+            catalog_generation: None,
+            library_generation: None,
+            metadata_generation: None,
             next_saved_tracks_offset: None,
             next_playlist_tracks_offset: None,
             action_outcome: None,
@@ -1087,6 +1186,9 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         _ => fold_one(app, &event),
       }
       Some(FoldAck {
+        catalog_generation: None,
+        library_generation: None,
+        metadata_generation: None,
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: None,
@@ -1656,6 +1758,14 @@ pub(crate) fn apply_decoded_source_fact(
       app.track_table.context = Some(crate::core::app::TrackTableContext::YouTubePlaylist);
     }
     #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeOpenPlaylist(uri) => app.youtube_open_playlist = uri,
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubePlaylistDeleted(uri) => {
+      if app.youtube_open_playlist.as_deref() == Some(uri.as_str()) {
+        app.youtube_open_playlist = None;
+      }
+    }
+    #[cfg(feature = "youtube")]
     DecodedSourceFact::YouTubePlayback(state) => app.youtube_playback = Some(state),
     #[cfg(feature = "youtube")]
     DecodedSourceFact::YouTubePlaybackCleared => {
@@ -1759,9 +1869,21 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
       }
       app.replay_pending_start_playback();
     }
+    SessionFact::MetadataRequested => {
+      app.metadata_generation = app.metadata_generation.wrapping_add(1);
+    }
+    SessionFact::MetadataTerminal {
+      generation,
+      message,
+    } => {
+      if app.metadata_generation == generation {
+        if let Some(message) = message {
+          app.handle_error(anyhow::anyhow!(message));
+        }
+      }
+    }
     SessionFact::LoadingCleared => {
       app.is_loading = false;
-      app.search_loading = false;
     }
     SessionFact::AuthMirrors {
       token_expiry,
@@ -1794,41 +1916,61 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
     SessionFact::StatsLoadingCleared => {
       app.stats_loading = false;
     }
-    SessionFact::ArtistView(artist) => {
-      app.artist = Some(*artist);
-      app.push_navigation_stack(RouteId::Artist, ActiveBlock::ArtistBlock);
+    SessionFact::ArtistView { generation, artist } => {
+      if app.metadata_generation == generation {
+        app.artist = Some(*artist);
+        app.push_navigation_stack(RouteId::Artist, ActiveBlock::ArtistBlock);
+      }
     }
-    SessionFact::AlbumTracksSimplified { album, tracks } => {
-      app.selected_album_simplified = Some(SelectedAlbum {
-        album,
-        tracks,
-        selected_index: 0,
-      });
-      app.album_table_context = AlbumTableContext::Simplified;
-      app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+    SessionFact::AlbumTracksSimplified {
+      generation,
+      album,
+      tracks,
+    } => {
+      if app.metadata_generation == generation {
+        app.selected_album_simplified = Some(SelectedAlbum {
+          album,
+          tracks,
+          selected_index: 0,
+        });
+        app.album_table_context = AlbumTableContext::Simplified;
+        app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+      }
     }
-    SessionFact::AlbumTracksFull { album } => {
-      app.selected_album_full = Some(SelectedFullAlbum {
-        album,
-        selected_index: 0,
-      });
-      app.album_table_context = AlbumTableContext::Full;
-      app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+    SessionFact::AlbumTracksFull { generation, album } => {
+      if app.metadata_generation == generation {
+        app.selected_album_full = Some(SelectedFullAlbum {
+          album,
+          selected_index: 0,
+        });
+        app.album_table_context = AlbumTableContext::Full;
+        app.push_navigation_stack(RouteId::AlbumTracks, ActiveBlock::AlbumTracks);
+      }
     }
-    SessionFact::ShowEpisodesLanded { page, show } => {
-      app.library.show_episodes = ScrollableResultPages::new();
-      app.library.show_episodes.add_pages(page);
-      app.selected_show_simplified = Some(SelectedShow { show });
-      app.episode_table_context = EpisodeTableContext::Simplified;
-      app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+    SessionFact::ShowEpisodesLanded {
+      generation,
+      page,
+      show,
+    } => {
+      if app.metadata_generation == generation {
+        app.library.show_episodes = ScrollableResultPages::new();
+        app.library.show_episodes.add_pages(page);
+        app.selected_show_simplified = Some(SelectedShow { show });
+        app.episode_table_context = EpisodeTableContext::Simplified;
+        app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+      }
     }
-    SessionFact::ShowEpisodesAppended { page } => {
-      app.library.show_episodes.add_pages(page);
+    SessionFact::ShowEpisodesAppended { generation, page } => {
+      if app.metadata_generation == generation {
+        app.library.show_episodes.add_pages(page);
+      }
     }
-    SessionFact::FullShowLanded { show } => {
-      app.selected_show_full = Some(SelectedFullShow { show });
-      app.episode_table_context = EpisodeTableContext::Full;
-      app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+    SessionFact::FullShowLanded { generation, show } => {
+      if app.metadata_generation == generation {
+        app.selected_show_full = Some(SelectedFullShow { show });
+        app.episode_table_context = EpisodeTableContext::Full;
+        app.push_navigation_stack(RouteId::PodcastEpisodes, ActiveBlock::EpisodeTable);
+      }
     }
     SessionFact::FollowedArtistsConfirmed(ids) => {
       for id in ids {
@@ -2771,22 +2913,42 @@ pub(crate) fn answer_query(
     FoldQuery::LibraryRequestLive { generation, .. } => {
       FoldAnswer::Bool(app.saved_tracks_prefetch_generation == generation)
     }
-    FoldQuery::ClaimLibraryOffset { section, .. } => {
+    FoldQuery::ClaimLibraryOffset {
+      section,
+      generation,
+    } => {
       let claimed = match section {
-        LibrarySection::SavedTracks { offset } => {
+        LibrarySection::SavedTracks { offset }
+          if app.saved_tracks_prefetch_generation == generation =>
+        {
           app.saved_tracks_prefetch_in_flight.insert(offset)
+        }
+        LibrarySection::SavedTracks { .. } => false,
+        LibrarySection::SavedAlbums | LibrarySection::SavedShows | LibrarySection::SavedArtists => {
+          false
         }
       };
       FoldAnswer::Bool(claimed)
     }
-    FoldQuery::ReleaseLibraryOffset { section } => {
-      let LibrarySection::SavedTracks { offset } = section;
+    FoldQuery::ReleaseLibraryOffset {
+      section,
+      generation,
+    } => {
+      if !library_generation_matches(app, section, generation) {
+        return FoldAnswer::Bool(false);
+      }
+      let LibrarySection::SavedTracks { offset } = section else {
+        return FoldAnswer::Bool(false);
+      };
       app.saved_tracks_prefetch_in_flight.remove(&offset);
       FoldAnswer::Bool(true)
     }
     FoldQuery::NextLibraryOffset { section } => {
       let offset = match section {
         LibrarySection::SavedTracks { .. } => app.next_missing_saved_tracks_offset_continuous(),
+        LibrarySection::SavedAlbums | LibrarySection::SavedShows | LibrarySection::SavedArtists => {
+          None
+        }
       };
       FoldAnswer::Offset(offset)
     }
@@ -2892,6 +3054,30 @@ pub(crate) fn answer_query(
     FoldQuery::Devices => FoldAnswer::Devices(app.devices.as_ref().map(DeviceList::from)),
     FoldQuery::Playlists => FoldAnswer::Playlists(app.playlists.clone()),
     FoldQuery::TableTracks => FoldAnswer::Tracks(app.track_table.tracks.clone()),
+    #[cfg(feature = "youtube")]
+    FoldQuery::YouTubeTrack(video_ref) => {
+      let uri = crate::infra::youtube::uri_for_video_id(&video_ref);
+      let found = app
+        .search_results
+        .tracks
+        .as_ref()
+        .and_then(|page| {
+          page.items.iter().find(|track| {
+            track.id.as_deref() == Some(&video_ref)
+              || track.uri.as_deref() == Some(&video_ref)
+              || track.uri.as_deref() == Some(uri.as_str())
+          })
+        })
+        .or_else(|| {
+          app.track_table.tracks.iter().find(|track| {
+            track.id.as_deref() == Some(&video_ref)
+              || track.uri.as_deref() == Some(&video_ref)
+              || track.uri.as_deref() == Some(uri.as_str())
+          })
+        })
+        .cloned();
+      FoldAnswer::Track(found)
+    }
     FoldQuery::SearchResults => FoldAnswer::Search(Box::new(app.search_results.clone())),
     FoldQuery::LastError => FoldAnswer::StatusText(app.api_error.clone()),
     FoldQuery::MediaSnapshot => {
@@ -3319,7 +3505,11 @@ pub(crate) fn answer_query(
     FoldQuery::ReleasePlaylistTracksPage {
       playlist_id,
       offset,
+      generation,
     } => {
+      if app.playlist_tracks_prefetch_generation != generation {
+        return FoldAnswer::Bool(false);
+      }
       app.playlist_tracks_prefetch_in_flight.remove(&offset);
       if app.pending_playlist_open.as_deref() == Some(playlist_id.as_str()) {
         app.pending_playlist_open = None;
@@ -3473,27 +3663,70 @@ pub(crate) fn answer_query(
     FoldQuery::ClaimPlaylistTracksOffset {
       playlist_id,
       offset,
+      generation,
     } => {
       let claimed = rspotify::model::idtypes::PlaylistId::from_id(playlist_id.as_str())
         .ok()
         .map(|id| id.into_static())
         .is_some_and(|id| {
-          // The old saved-tracks generation check has no playlist-tracks
-          // counterpart (no generation exists there); the claim is
-          // table-active + not already in flight.
-          app.is_playlist_track_table_active_for(&id)
+          app.playlist_tracks_prefetch_generation == generation
+            && app.is_playlist_track_table_active_for(&id)
         })
         && !app.playlist_tracks_prefetch_in_flight.contains(&offset)
         && app.playlist_tracks_prefetch_in_flight.insert(offset);
       FoldAnswer::Bool(claimed)
     }
+    FoldQuery::PlaylistTracksGeneration => FoldAnswer::U64(app.playlist_tracks_prefetch_generation),
     FoldQuery::ReleasePlaylistTracksOffset {
       playlist_id: _,
       offset,
+      generation,
     } => {
+      if app.playlist_tracks_prefetch_generation != generation {
+        return FoldAnswer::Bool(false);
+      }
       app.playlist_tracks_prefetch_in_flight.remove(&offset);
       FoldAnswer::Bool(true)
     }
+    FoldQuery::LibraryGeneration { section } => {
+      let generation = library_generation_matches_value(app, section);
+      FoldAnswer::U64(generation)
+    }
+  }
+}
+
+fn library_generation_matches(
+  app: &App,
+  section: crate::core::catalog::LibrarySection,
+  generation: u64,
+) -> bool {
+  match section {
+    crate::core::catalog::LibrarySection::SavedTracks { .. } => {
+      app.saved_tracks_prefetch_generation == generation
+    }
+    crate::core::catalog::LibrarySection::SavedAlbums => {
+      app.saved_albums_prefetch_generation == generation
+    }
+    crate::core::catalog::LibrarySection::SavedShows => {
+      app.saved_shows_prefetch_generation == generation
+    }
+    crate::core::catalog::LibrarySection::SavedArtists => {
+      app.saved_artists_prefetch_generation == generation
+    }
+  }
+}
+
+fn library_generation_matches_value(
+  app: &App,
+  section: crate::core::catalog::LibrarySection,
+) -> u64 {
+  match section {
+    crate::core::catalog::LibrarySection::SavedTracks { .. } => {
+      app.saved_tracks_prefetch_generation
+    }
+    crate::core::catalog::LibrarySection::SavedAlbums => app.saved_albums_prefetch_generation,
+    crate::core::catalog::LibrarySection::SavedShows => app.saved_shows_prefetch_generation,
+    crate::core::catalog::LibrarySection::SavedArtists => app.saved_artists_prefetch_generation,
   }
 }
 
@@ -3694,6 +3927,10 @@ fn answer_decoded_query(
     #[cfg(feature = "subsonic")]
     Q::SubsonicRepeat(state) => {
       FoldAnswer::Decoded(A::SubsonicRepeat(app.set_decoded_repeat_from_state(state)))
+    }
+    #[cfg(feature = "youtube")]
+    Q::YouTubeOpenPlaylist => {
+      FoldAnswer::Decoded(A::YouTubeOpenPlaylist(app.youtube_open_playlist.clone()))
     }
     #[cfg(feature = "internet-radio")]
     Q::RadioPlayer => FoldAnswer::Decoded(A::RadioPlayer(
@@ -3909,6 +4146,161 @@ mod tests {
     assert_eq!(
       snapshots.borrow().library_target,
       Some(crate::core::action::LibraryTarget::Playlists)
+    );
+  }
+
+  #[tokio::test]
+  async fn catalog_search_request_ack_returns_fold_generation_atomically() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+
+    let request = || {
+      crate::runtime::engine::EngineEvent::Catalog(
+        crate::core::catalog::CatalogStateEvent::SearchRequested {
+          source: Source::YouTube,
+          query: "same query".into(),
+          scoped_loading: true,
+        },
+      )
+    };
+    let first = spine.emit_acked(request()).await.unwrap();
+    assert_eq!(first.catalog_generation, Some(0));
+    let second = spine.emit_acked(request()).await.unwrap();
+    assert_eq!(second.catalog_generation, Some(1));
+  }
+
+  #[test]
+  fn stale_playlist_release_does_not_clear_new_claim() {
+    let mut app = App::default();
+    app.playlist_tracks_prefetch_generation = 2;
+    app.playlist_tracks_prefetch_in_flight.insert(20);
+    let answer = answer_query(
+      &mut app,
+      crate::runtime::engine::FoldQuery::ReleasePlaylistTracksOffset {
+        playlist_id: "37i9dQZF1DXcBWIGoYBM5M".into(),
+        offset: 20,
+        generation: 1,
+      },
+    );
+    assert!(matches!(
+      answer,
+      crate::runtime::engine::FoldAnswer::Bool(false)
+    ));
+    assert!(app.playlist_tracks_prefetch_in_flight.contains(&20));
+  }
+
+  #[test]
+  fn stale_saved_tracks_claim_cannot_poison_new_generation() {
+    let mut app = App::default();
+    app.saved_tracks_prefetch_generation = 2;
+    let stale = answer_query(
+      &mut app,
+      crate::runtime::engine::FoldQuery::ClaimLibraryOffset {
+        section: crate::core::catalog::LibrarySection::SavedTracks { offset: 10 },
+        generation: 1,
+      },
+    );
+    assert!(matches!(
+      stale,
+      crate::runtime::engine::FoldAnswer::Bool(false)
+    ));
+    assert!(app.saved_tracks_prefetch_in_flight.is_empty());
+    let current = answer_query(
+      &mut app,
+      crate::runtime::engine::FoldQuery::ClaimLibraryOffset {
+        section: crate::core::catalog::LibrarySection::SavedTracks { offset: 10 },
+        generation: 2,
+      },
+    );
+    assert!(matches!(
+      current,
+      crate::runtime::engine::FoldAnswer::Bool(true)
+    ));
+  }
+
+  #[test]
+  fn stale_metadata_terminal_is_ignored_after_new_navigation() {
+    let mut app = App::default();
+    app.metadata_generation = 2;
+    apply_session_fact(
+      &mut app,
+      crate::runtime::engine::SessionFact::MetadataTerminal {
+        generation: 1,
+        message: Some("old response".into()),
+      },
+    );
+    assert!(app.api_error.is_empty());
+  }
+
+  #[test]
+  fn stale_artist_completion_cannot_replace_same_id_retry() {
+    let mut app = App::default();
+    app.metadata_generation = 2;
+    apply_session_fact(
+      &mut app,
+      crate::runtime::engine::SessionFact::ArtistView {
+        generation: 1,
+        artist: Box::new(crate::core::app::Artist {
+          artist_id: "artist".into(),
+          artist_name: "old".into(),
+          albums: crate::core::pagination::Paged::default(),
+          related_artists: vec![],
+          top_tracks: vec![],
+          selected_album_index: 0,
+          selected_related_artist_index: 0,
+          selected_top_track_index: 0,
+          artist_hovered_block: crate::core::app::ArtistBlock::TopTracks,
+          artist_selected_block: crate::core::app::ArtistBlock::TopTracks,
+        }),
+      },
+    );
+    assert!(app.artist.is_none());
+  }
+
+  #[test]
+  fn empty_search_completion_clears_loading_without_wiping_existing_rows() {
+    let mut app = App::default();
+    app.search_results.tracks = Some(crate::core::pagination::Paged {
+      items: vec![TrackInfo {
+        uri: Some("radio:cached".into()),
+        name: "cached".into(),
+        artists: vec![],
+        album: String::new(),
+        duration_ms: 1,
+        id: None,
+        album_id: None,
+        artist_refs: vec![],
+        is_playable: true,
+        is_local: false,
+        track_number: 0,
+        explicit: false,
+        image_url: None,
+      }],
+      total: 1,
+      ..Default::default()
+    });
+    crate::core::apply_catalog_state(
+      &mut app,
+      &crate::core::catalog::CatalogStateEvent::SearchRequested {
+        source: Source::Radio,
+        query: "broken".into(),
+        scoped_loading: true,
+      },
+    );
+    crate::core::apply_catalog_state(
+      &mut app,
+      &crate::core::catalog::CatalogStateEvent::SearchCompleted {
+        source: Source::Radio,
+        query: "broken".into(),
+        generation: 0,
+        pages: Box::default(),
+      },
+    );
+    assert!(!app.search_loading);
+    assert_eq!(
+      app.search_results.tracks.as_ref().unwrap().items[0].name,
+      "cached"
     );
   }
 

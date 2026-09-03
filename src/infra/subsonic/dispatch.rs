@@ -160,6 +160,18 @@ async fn status(spine: &Spine, message: impl Into<String>, ttl_secs: u64) {
   .await;
 }
 
+async fn search_failed(spine: &Spine, query: &str, generation: u64, message: String) {
+  spine
+    .emit(EngineEvent::Catalog(CatalogStateEvent::SearchCompleted {
+      source: Source::Subsonic,
+      query: query.to_string(),
+      generation,
+      pages: Box::default(),
+    }))
+    .await;
+  status(spine, message, 6).await;
+}
+
 // ---------------------------------------------------------------------------
 // Browse + search
 // ---------------------------------------------------------------------------
@@ -238,14 +250,25 @@ async fn load_subsonic_tracks(spine: &Spine, playlist_uri: &str) {
 /// by `core::catalog_apply` on the fold task, which enforces the
 /// stale-request contract.
 async fn run_subsonic_search(spine: &Spine, query: &str) {
-  spine
-    .emit(EngineEvent::Catalog(CatalogStateEvent::SearchRequested {
+  let generation = spine
+    .emit_acked(EngineEvent::Catalog(CatalogStateEvent::SearchRequested {
       source: Source::Subsonic,
       query: query.to_string(),
       scoped_loading: true,
     }))
-    .await;
+    .await
+    .and_then(|ack| ack.catalog_generation);
+  let Some(generation) = generation else {
+    return;
+  };
   let Some(source) = build_source(spine).await else {
+    search_failed(
+      spine,
+      query,
+      generation,
+      "Subsonic search unavailable: no server configured".to_string(),
+    )
+    .await;
     return;
   };
   match source.search(query).await {
@@ -255,6 +278,7 @@ async fn run_subsonic_search(spine: &Spine, query: &str) {
         .emit(EngineEvent::Catalog(CatalogStateEvent::SearchCompleted {
           source: Source::Subsonic,
           query: query.to_string(),
+          generation,
           pages: Box::new(crate::core::catalog::SearchCompletionPages {
             tracks: Some(Paged {
               items: results.tracks,
@@ -266,7 +290,15 @@ async fn run_subsonic_search(spine: &Spine, query: &str) {
         }))
         .await;
     }
-    Err(e) => status(spine, format!("Subsonic search failed: {e}"), 6).await,
+    Err(e) => {
+      search_failed(
+        spine,
+        query,
+        generation,
+        format!("Subsonic search failed: {e}"),
+      )
+      .await
+    }
   }
 }
 
@@ -648,6 +680,27 @@ mod tests {
     let table = vec![track("subsonic:track:a", "A")];
     let snap = snapshot_tracks(&table, None, &["subsonic:track:missing".to_string()]);
     assert!(snap.is_empty());
+  }
+
+  #[tokio::test]
+  async fn unconfigured_search_emits_empty_completion_and_clears_loading() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
+
+    assert!(
+      route_subsonic_event(
+        &spine,
+        &IoEvent::GetSubsonicSearchResults("jazz".to_string())
+      )
+      .await
+    );
+
+    let guard = app.lock().await;
+    assert!(!guard.search_loading);
+    assert!(guard
+      .status_message
+      .as_deref()
+      .is_some_and(|message| message.contains("no server configured")));
   }
 
   /// End-to-end dispatch test: drive `route_subsonic_event` exactly as the

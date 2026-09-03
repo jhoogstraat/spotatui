@@ -39,7 +39,12 @@ struct ShowSearchResponse {
 }
 
 pub trait SearchNetwork {
-  async fn get_search_results(&mut self, search_term: String, country: Option<Country>);
+  async fn get_search_results(
+    &mut self,
+    search_term: String,
+    country: Option<Country>,
+    generation: u64,
+  );
   async fn search_tracks_for_playlist(&mut self, search_term: String);
 }
 
@@ -47,13 +52,22 @@ impl Network {
   /// Ticket 15: mark a search as finished-with-error so the fold retires the
   /// loading flag even though no rows landed. Emits a completion carrying no
   /// rows; per-source error messages continue through `handle_error` unchanged.
-  async fn search_failed_spotify(&mut self, query: &str) {
+  async fn search_failed_spotify(
+    &mut self,
+    query: &str,
+    generation: u64,
+    tracks: Option<crate::core::pagination::Paged<TrackInfo>>,
+  ) {
     crate::runtime::engine::emit_catalog_event(
       &self.app,
       crate::core::catalog::CatalogStateEvent::SearchCompleted {
         source: crate::core::source::Source::Spotify,
         query: query.to_string(),
-        pages: Box::default(),
+        generation,
+        pages: Box::new(crate::core::catalog::SearchCompletionPages {
+          tracks,
+          ..Default::default()
+        }),
       },
     )
     .await;
@@ -61,7 +75,12 @@ impl Network {
 }
 
 impl SearchNetwork for Network {
-  async fn get_search_results(&mut self, search_term: String, country: Option<Country>) {
+  async fn get_search_results(
+    &mut self,
+    search_term: String,
+    country: Option<Country>,
+    generation: u64,
+  ) {
     // Don't pass market to search - when market is specified, Spotify doesn't return
     // available_markets field, but rspotify 0.14 models require it for tracks/albums.
     // We'll handle null playlist fields by searching playlists separately without requiring all fields.
@@ -98,14 +117,22 @@ impl SearchNetwork for Network {
     let track_result = match track_search {
       Ok(res) => Some(res.tracks),
       Err(e) => {
-        self.search_failed_spotify(&search_term).await;
+        self
+          .search_failed_spotify(&search_term, generation, None)
+          .await;
         self.handle_error(anyhow!(e)).await;
         return;
       }
     };
+    let track_page = track_result
+      .as_ref()
+      .map(|p| map_page(p, |t| TrackInfo::from(t)));
     let album_result = match album_search {
       Ok(res) => Some(res.albums),
       Err(e) => {
+        self
+          .search_failed_spotify(&search_term, generation, track_page)
+          .await;
         self.handle_error(anyhow!(e)).await;
         return;
       }
@@ -113,6 +140,9 @@ impl SearchNetwork for Network {
     let show_result = match show_search {
       Ok(res) => Some(res.shows),
       Err(e) => {
+        self
+          .search_failed_spotify(&search_term, generation, track_page)
+          .await;
         self.handle_error(anyhow!(e)).await;
         return;
       }
@@ -171,9 +201,7 @@ impl SearchNetwork for Network {
 
     // Convert rspotify pages to domain Paged<T> and publish the completion
     // (the ticket 15 event shape, extended in ticket 17 to carry every page).
-    let tracks_page = track_result
-      .as_ref()
-      .map(|p| map_page(p, |t| TrackInfo::from(t)));
+    let tracks_page = track_page;
     let search_term_snapshot = search_term.clone();
     let artists_page = artist_result
       .as_ref()
@@ -193,6 +221,7 @@ impl SearchNetwork for Network {
       crate::core::catalog::CatalogStateEvent::SearchCompleted {
         source: crate::core::source::Source::Spotify,
         query: search_term_snapshot,
+        generation,
         pages: Box::new(crate::core::catalog::SearchCompletionPages {
           tracks: tracks_page,
           artists: artists_page,

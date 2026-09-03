@@ -561,16 +561,20 @@ impl Network {
       IoEvent::GetSearchResults(search_term, country) => {
         // Ticket 15: register the request with the fold before fetching so a
         // later superseding request can drop this completion.
-        crate::runtime::engine::emit_catalog_event(
-          &self.app,
-          crate::core::catalog::CatalogStateEvent::SearchRequested {
+        let generation = self
+          .emit_catalog_acked(crate::core::catalog::CatalogStateEvent::SearchRequested {
             source: crate::core::source::Source::Spotify,
             query: search_term.clone(),
             scoped_loading: true,
-          },
-        )
-        .await;
-        self.get_search_results(search_term, country).await;
+          })
+          .await
+          .and_then(|ack| ack.catalog_generation);
+        let Some(generation) = generation else {
+          return;
+        };
+        self
+          .get_search_results(search_term, country, generation)
+          .await;
       }
 
       IoEvent::GetPlaylistItems(playlist_id, playlist_offset) => {
@@ -903,8 +907,10 @@ impl Network {
 
     {
       // Ticket 16: the end-of-handler reset is a fact; the fold clears the
-      // spinners (it owns `is_loading`/`search_loading` from here on).
-      self.emit_session(SessionFact::LoadingCleared).await;
+      // spinner (the catalog completion owns the generation-guarded search flag).
+      // Ack the terminal reset so callers cannot observe a stale spinner after
+      // an auth-gate rejection or handler completion.
+      self.emit_session_acked(SessionFact::LoadingCleared).await;
     }
   }
 
@@ -953,10 +959,12 @@ impl Network {
   async fn emit_loading_cleared(&self, pending_playlist_id: &Option<String>) {
     if let Some(id) = pending_playlist_id {
       self
-        .emit_session(SessionFact::ClearPendingPlaylistOpen(Some(id.clone())))
+        .emit_session_acked(SessionFact::ClearPendingPlaylistOpen(Some(id.clone())))
         .await;
     }
-    self.emit_session(SessionFact::LoadingCleared).await;
+    // Ack the terminal reset so callers cannot observe a stale spinner after
+    // an auth-gate rejection or handler completion.
+    self.emit_session_acked(SessionFact::LoadingCleared).await;
   }
 
   /// Route a handler failure through the fold as a fact (the old inline
@@ -1396,28 +1404,17 @@ mod tests {
       app.auth_refresh_in_progress = true;
     }
 
-    // Ticket 16: the handler emits facts; the fold reduces them. The test
-    // plays the fold: install the spine, run the handler, then drain the
-    // events through the same reducer the fold task uses.
-    // The trailing `_` (not a named binding) drops the query receiver at
-    // once, so a producer query fails fast with `SpineClosed` — there is no
-    // fold task here to answer it.
-    let (spine, mut events_rx, _) = crate::runtime::engine::Spine::open(Default::default());
+    // Ticket 16: the handler emits facts; the fold reduces them before the
+    // acked terminal reset releases the handler.
+    let (spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
     let mut network = Network::new(
       Some(spotify),
       ClientConfig::new(),
       &app,
       token_cache_path.clone(),
     );
-    network.spine = Some(spine);
+    network.spine = Some(spine.clone());
     network.handle_network_event(IoEvent::GetUser).await;
-
-    while let Ok(crate::runtime::engine::SpineMessage::Event(event)) = events_rx.try_recv() {
-      if let crate::runtime::engine::EngineEvent::Session(fact) = event {
-        let mut guard = app.lock().await;
-        crate::runtime::frontend::apply_session_fact(&mut guard, fact);
-      }
-    }
 
     let app = app.lock().await;
     assert!(!app.is_loading);
@@ -1435,23 +1432,20 @@ mod tests {
       Some(SystemTime::now()),
     )));
     app.lock().await.pending_playlist_open = Some("playlist-id".to_string());
-    // Same as above: drop the query receiver so queries fail fast.
-    let (spine, mut events_rx, _) = crate::runtime::engine::Spine::open(Default::default());
+    let (spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
     let mut network = Network::new(None, ClientConfig::new(), &app, temp_token_cache_path());
-    network.spine = Some(spine);
+    network.spine = Some(spine.clone());
 
     network
       .handle_network_event(IoEvent::GetPlaylistItems("playlist-id".to_string(), 0))
       .await;
 
-    // Fold half: reduce what the gate emitted.
-    while let Ok(crate::runtime::engine::SpineMessage::Event(event)) = events_rx.try_recv() {
-      if let crate::runtime::engine::EngineEvent::Session(fact) = event {
-        let mut guard = app.lock().await;
-        crate::runtime::frontend::apply_session_fact(&mut guard, fact);
-      }
-    }
-
+    // The terminal LoadingCleared fact is acked by the handler; one query
+    // additionally yields to the fold before inspecting the mirror.
+    spine
+      .query(crate::runtime::engine::FoldQuery::SpotifyConnected)
+      .await
+      .unwrap();
     assert!(app.lock().await.pending_playlist_open.is_none());
   }
 }

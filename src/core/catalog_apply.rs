@@ -28,6 +28,26 @@ fn clamp_selected_index(index: &mut Option<usize>, len: usize) {
 /// The fold's single write path for catalog facts.
 pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogOutcome {
   match event {
+    CatalogStateEvent::LibraryGenerationStarted { section } => {
+      match section {
+        crate::core::catalog::LibrarySection::SavedTracks { .. } => {
+          app.saved_tracks_prefetch_generation =
+            app.saved_tracks_prefetch_generation.wrapping_add(1)
+        }
+        crate::core::catalog::LibrarySection::SavedAlbums => {
+          app.saved_albums_prefetch_generation =
+            app.saved_albums_prefetch_generation.wrapping_add(1)
+        }
+        crate::core::catalog::LibrarySection::SavedShows => {
+          app.saved_shows_prefetch_generation = app.saved_shows_prefetch_generation.wrapping_add(1)
+        }
+        crate::core::catalog::LibrarySection::SavedArtists => {
+          app.saved_artists_prefetch_generation =
+            app.saved_artists_prefetch_generation.wrapping_add(1)
+        }
+      }
+      CatalogOutcome::default()
+    }
     CatalogStateEvent::SearchRequested {
       source,
       query,
@@ -47,6 +67,7 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
     CatalogStateEvent::SearchCompleted {
       source,
       query,
+      generation: _,
       pages,
     } => {
       let outcome = app.catalog_state.absorb(event);
@@ -56,6 +77,9 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         );
         return outcome;
       }
+      // Every accepted completion is terminal, including an explicit empty
+      // result emitted for a failed or unconfigured source search.
+      app.search_loading = false;
       // Ticket 17: the completion carries every page, so the fold is the
       // single writer of the visible search surface (the old handler wrote
       // the non-track pages directly under the lock).
@@ -212,6 +236,7 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
     }
     CatalogStateEvent::PlaylistTracksPageUpserted {
       playlist_id,
+      generation,
       page,
       track_ids_for_like_check,
     } => {
@@ -222,7 +247,7 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         .ok()
         .map(|id| id.into_static())
         .is_some_and(|id| app.is_playlist_track_table_active_for(&id));
-      if !active {
+      if !active || app.playlist_tracks_prefetch_generation != *generation {
         return CatalogOutcome {
           stale_event_dropped: true,
           ..CatalogOutcome::default()
@@ -243,7 +268,13 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         ..CatalogOutcome::default()
       }
     }
-    CatalogStateEvent::SavedAlbumsPageUpserted { page } => {
+    CatalogStateEvent::SavedAlbumsPageUpserted { generation, page } => {
+      if app.saved_albums_prefetch_generation != *generation {
+        return CatalogOutcome {
+          stale_event_dropped: true,
+          ..CatalogOutcome::default()
+        };
+      }
       if let Some(page) = page {
         app.library.saved_albums.add_pages(page.clone());
       }
@@ -252,7 +283,13 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         ..CatalogOutcome::default()
       }
     }
-    CatalogStateEvent::SavedShowsPageUpserted { page } => {
+    CatalogStateEvent::SavedShowsPageUpserted { generation, page } => {
+      if app.saved_shows_prefetch_generation != *generation {
+        return CatalogOutcome {
+          stale_event_dropped: true,
+          ..CatalogOutcome::default()
+        };
+      }
       if let Some(page) = page {
         app.library.saved_shows.add_pages(page.clone());
       }
@@ -261,7 +298,13 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         ..CatalogOutcome::default()
       }
     }
-    CatalogStateEvent::SavedArtistsPageUpserted { page } => {
+    CatalogStateEvent::SavedArtistsPageUpserted { generation, page } => {
+      if app.saved_artists_prefetch_generation != *generation {
+        return CatalogOutcome {
+          stale_event_dropped: true,
+          ..CatalogOutcome::default()
+        };
+      }
       if let Some(page) = page {
         app.library.saved_artists.add_pages(page.clone());
       }
@@ -348,6 +391,7 @@ mod tests {
       &CatalogStateEvent::SearchCompleted {
         source: Source::YouTube,
         query: "lofi".to_string(),
+        generation: 0,
         pages: Box::new(crate::core::catalog::SearchCompletionPages {
           tracks: Some(paged),
           ..Default::default()
@@ -391,6 +435,7 @@ mod tests {
       &CatalogStateEvent::SearchCompleted {
         source: Source::YouTube,
         query: "a".to_string(),
+        generation: 0,
         pages: Box::new(crate::core::catalog::SearchCompletionPages {
           tracks: Some(paged),
           ..Default::default()
@@ -514,15 +559,40 @@ mod tests {
   #[test]
   fn playlist_page_for_an_inactive_table_is_dropped() {
     let mut app = app_with_io();
+    let generation = app.playlist_tracks_prefetch_generation;
     let outcome = apply_catalog_state(
       &mut app,
       &CatalogStateEvent::PlaylistTracksPageUpserted {
         playlist_id: "not-open".to_string(),
+        generation,
         page: crate::core::pagination::Paged::default(),
         track_ids_for_like_check: vec![],
       },
     );
     assert!(outcome.stale_event_dropped);
+  }
+
+  #[test]
+  fn stale_page_for_same_playlist_reopen_is_dropped() {
+    let mut app = app_with_io();
+    let playlist_id = rspotify::model::idtypes::PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M")
+      .unwrap()
+      .into_static();
+    app.playlist_track_table_id = Some(playlist_id.clone());
+    app.track_table.context = Some(TrackTableContext::MyPlaylists);
+    let old_generation = app.playlist_tracks_prefetch_generation;
+    app.reset_playlist_tracks_view(playlist_id, TrackTableContext::MyPlaylists);
+    let outcome = apply_catalog_state(
+      &mut app,
+      &CatalogStateEvent::PlaylistTracksPageUpserted {
+        playlist_id: "37i9dQZF1DXcBWIGoYBM5M".into(),
+        generation: old_generation,
+        page: crate::core::pagination::Paged::default(),
+        track_ids_for_like_check: vec![],
+      },
+    );
+    assert!(outcome.stale_event_dropped);
+    assert!(app.playlist_track_pages.pages.is_empty());
   }
 
   #[test]

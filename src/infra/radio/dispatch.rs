@@ -132,6 +132,18 @@ async fn status(spine: &Spine, message: impl Into<String>, ttl_secs: u64) {
   .await;
 }
 
+async fn search_failed(spine: &Spine, query: &str, generation: u64, message: String) {
+  spine
+    .emit(EngineEvent::Catalog(CatalogStateEvent::SearchCompleted {
+      source: Source::Radio,
+      query: query.to_string(),
+      generation,
+      pages: Box::default(),
+    }))
+    .await;
+  status(spine, message, 6).await;
+}
+
 // ---------------------------------------------------------------------------
 // Browse + search
 // ---------------------------------------------------------------------------
@@ -164,13 +176,17 @@ async fn load_radio_stations(spine: &Spine) {
 /// Like the Subsonic search, only the songs block is populated — each row is a
 /// station; Enter on one dispatches its `radio:` URI back through this module.
 async fn run_radio_search(spine: &Spine, query: &str) {
-  spine
-    .emit(EngineEvent::Catalog(CatalogStateEvent::SearchRequested {
+  let generation = spine
+    .emit_acked(EngineEvent::Catalog(CatalogStateEvent::SearchRequested {
       source: Source::Radio,
       query: query.to_string(),
       scoped_loading: true,
     }))
-    .await;
+    .await
+    .and_then(|ack| ack.catalog_generation);
+  let Some(generation) = generation else {
+    return;
+  };
   let source = RadioSource::new();
   match source.search(query).await {
     Ok(results) => {
@@ -179,6 +195,7 @@ async fn run_radio_search(spine: &Spine, query: &str) {
         .emit(EngineEvent::Catalog(CatalogStateEvent::SearchCompleted {
           source: Source::Radio,
           query: query.to_string(),
+          generation,
           pages: Box::new(crate::core::catalog::SearchCompletionPages {
             tracks: Some(Paged {
               items: results.tracks,
@@ -190,7 +207,15 @@ async fn run_radio_search(spine: &Spine, query: &str) {
         }))
         .await;
     }
-    Err(e) => status(spine, format!("Radio search failed: {e}"), 6).await,
+    Err(e) => {
+      search_failed(
+        spine,
+        query,
+        generation,
+        format!("Radio search failed: {e}"),
+      )
+      .await
+    }
   }
 }
 

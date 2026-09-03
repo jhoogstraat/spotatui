@@ -119,7 +119,9 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
         // `handle_network_event` resets it, and we skipped that path, so clear
         // it here — otherwise selecting/loading Local, Subsonic, Radio, or
         // YouTube content leaves the UI stuck on the loading indicator.
-        network.app.lock().await.is_loading = false;
+        let _ = network
+          .emit_session_acked(crate::runtime::engine::SessionFact::LoadingCleared)
+          .await;
       }
     }
   }

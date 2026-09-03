@@ -27,6 +27,25 @@ use std::time::Duration;
 // request; anything larger fails with a 400 "Too many uris".
 const LIBRARY_CONTAINS_MAX_URIS: usize = 40;
 
+async fn library_generation(network: &Network, section: LibrarySection, reset: bool) -> u64 {
+  let Some(spine) = network.spine.as_ref() else {
+    return 0;
+  };
+  if reset {
+    return spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Catalog(
+        CatalogStateEvent::LibraryGenerationStarted { section },
+      ))
+      .await
+      .and_then(|ack| ack.library_generation)
+      .unwrap_or(0);
+  }
+  match spine.query(FoldQuery::LibraryGeneration { section }).await {
+    Ok(FoldAnswer::U64(generation)) => generation,
+    _ => 0,
+  }
+}
+
 #[cfg(test)]
 fn next_saved_tracks_offset(page: &Page<SavedTrack>) -> Option<u32> {
   page.next.as_ref().map(|_| page.offset + page.limit)
@@ -146,6 +165,7 @@ pub async fn run_saved_tracks_prefetch(
       let _ = spine
         .query(FoldQuery::ReleaseLibraryOffset {
           section: LibrarySection::SavedTracks { offset },
+          generation,
         })
         .await;
       return;
@@ -154,6 +174,7 @@ pub async fn run_saved_tracks_prefetch(
       let _ = spine
         .query(FoldQuery::ReleaseLibraryOffset {
           section: LibrarySection::SavedTracks { offset },
+          generation,
         })
         .await;
       return;
@@ -195,6 +216,7 @@ pub async fn prefetch_playlist_tracks_page_task(
   limit: u32,
   playlist_id: PlaylistId<'static>,
   offset: u32,
+  generation: u64,
 ) {
   let playlist_id_string = playlist_id.id().to_string();
   loop {
@@ -205,6 +227,7 @@ pub async fn prefetch_playlist_tracks_page_task(
         .query(FoldQuery::ClaimPlaylistTracksOffset {
           playlist_id: playlist_id_string.clone(),
           offset,
+          generation,
         })
         .await,
       Ok(FoldAnswer::Bool(true))
@@ -222,6 +245,7 @@ pub async fn prefetch_playlist_tracks_page_task(
         .query(FoldQuery::ReleasePlaylistTracksOffset {
           playlist_id: playlist_id_string.clone(),
           offset,
+          generation,
         })
         .await;
       return;
@@ -232,6 +256,7 @@ pub async fn prefetch_playlist_tracks_page_task(
         .query(FoldQuery::ReleasePlaylistTracksOffset {
           playlist_id: playlist_id_string.clone(),
           offset,
+          generation,
         })
         .await;
       return;
@@ -244,6 +269,7 @@ pub async fn prefetch_playlist_tracks_page_task(
       .emit_acked(crate::runtime::engine::EngineEvent::Catalog(
         CatalogStateEvent::PlaylistTracksPageUpserted {
           playlist_id: playlist_id_string.clone(),
+          generation,
           page: playlist_items_page(&page),
           track_ids_for_like_check: page
             .items
@@ -408,7 +434,7 @@ impl Network {
     &self,
     playlist_id: PlaylistId<'static>,
     offset: u32,
-    _generation: u64,
+    generation: u64,
   ) {
     // Ticket 16 batch 2: no App handle; the fold owns the claim set and the
     // cache. Without a spine (tests) nothing spawns.
@@ -426,6 +452,7 @@ impl Network {
         large_search_limit,
         playlist_id,
         offset,
+        generation,
       )
       .await;
     });
@@ -714,7 +741,7 @@ impl Network {
   }
 
   /// Emit one catalog fact and await the fold's ack (post-fold facts).
-  async fn emit_catalog_acked(&self, event: CatalogStateEvent) -> Option<FoldAck> {
+  pub(super) async fn emit_catalog_acked(&self, event: CatalogStateEvent) -> Option<FoldAck> {
     let spine = self.spine.as_ref()?;
     spine
       .emit_acked(crate::runtime::engine::EngineEvent::Catalog(event))
@@ -799,6 +826,13 @@ impl LibraryNetwork for Network {
   }
 
   async fn get_playlist_tracks(&mut self, playlist_id: PlaylistId<'static>, playlist_offset: u32) {
+    let generation = match self.spine.as_ref() {
+      Some(spine) => match spine.query(FoldQuery::PlaylistTracksGeneration).await {
+        Ok(FoldAnswer::U64(generation)) => generation,
+        _ => return,
+      },
+      None => 0,
+    };
     let path = format!("playlists/{}/items", playlist_id.id());
     match spotify_get_typed_for::<Page<PlaylistItem>>(
       self.spotify(),
@@ -819,6 +853,7 @@ impl LibraryNetwork for Network {
         let ack = self
           .emit_catalog_acked(CatalogStateEvent::PlaylistTracksPageUpserted {
             playlist_id: playlist_id.id().to_string(),
+            generation,
             page: playlist_items_page(&playlist_tracks),
             track_ids_for_like_check: playlist_tracks
               .items
@@ -835,7 +870,7 @@ impl LibraryNetwork for Network {
           ..
         }) = ack
         {
-          self.spawn_playlist_tracks_prefetch(playlist_id, next_offset, 0);
+          self.spawn_playlist_tracks_prefetch(playlist_id, next_offset, generation);
         }
       }
       Err(e) => {
@@ -844,6 +879,7 @@ impl LibraryNetwork for Network {
             .query(FoldQuery::ReleasePlaylistTracksPage {
               playlist_id: playlist_id.id().to_string(),
               offset: playlist_offset,
+              generation,
             })
             .await;
         }
@@ -976,6 +1012,7 @@ impl LibraryNetwork for Network {
             section: LibrarySection::SavedTracks {
               offset: requested_offset,
             },
+            generation,
           })
           .await;
         spine
@@ -988,6 +1025,7 @@ impl LibraryNetwork for Network {
   }
 
   async fn get_current_user_saved_albums(&mut self, offset: Option<u32>) {
+    let generation = library_generation(self, LibrarySection::SavedAlbums, offset.is_none()).await;
     let mut query = vec![("limit", self.large_search_limit.to_string())];
     if let Some(offset) = offset {
       query.push(("offset", offset.to_string()));
@@ -1011,7 +1049,7 @@ impl LibraryNetwork for Network {
         // Ticket 16 batch 2: the page (and the always-bump completion
         // signal) is one event; the fold writes the cache.
         self
-          .emit_catalog(CatalogStateEvent::SavedAlbumsPageUpserted { page })
+          .emit_catalog(CatalogStateEvent::SavedAlbumsPageUpserted { generation, page })
           .await;
       }
       Err(e) => {
@@ -1152,6 +1190,7 @@ impl LibraryNetwork for Network {
   }
 
   async fn get_current_user_saved_shows(&mut self, offset: Option<u32>) {
+    let generation = library_generation(self, LibrarySection::SavedShows, offset.is_none()).await;
     let mut query = vec![("limit", self.large_search_limit.to_string())];
     if let Some(offset) = offset {
       query.push(("offset", offset.to_string()));
@@ -1170,7 +1209,7 @@ impl LibraryNetwork for Network {
           crate::infra::network::mapping::map_page(&saved_shows, |s| ShowInfo::from(&s.show))
         });
         self
-          .emit_catalog(CatalogStateEvent::SavedShowsPageUpserted { page })
+          .emit_catalog(CatalogStateEvent::SavedShowsPageUpserted { generation, page })
           .await;
       }
       Err(e) => {

@@ -67,11 +67,17 @@ pub enum CatalogStateEvent {
   SearchCompleted {
     source: Source,
     query: String,
+    /// Request generation assigned by the fold when the search began.
+    /// Completions with an older generation are stale even when the query text
+    /// is identical (for example, a retry racing its first attempt).
+    generation: u64,
     /// All five pages: the fold is the single writer of the visible search
     /// surface (ticket 17). Boxed — five `Paged` payloads dwarf the enum's
     /// other variants.
     pages: Box<SearchCompletionPages>,
   },
+  /// Begin a fresh saved-library page-one request and invalidate older pages.
+  LibraryGenerationStarted { section: LibrarySection },
   /// A playlist/album listing landed in the shared browse table.
   TrackTableReplaced {
     tracks: Vec<TrackInfo>,
@@ -114,14 +120,17 @@ pub enum CatalogStateEvent {
   /// A saved-albums page landed (index-keyed cache; `None` = empty page —
   /// the completion bump still fires, plugin data waits on it).
   SavedAlbumsPageUpserted {
+    generation: u64,
     page: Option<crate::core::pagination::Paged<crate::core::plugin_api::SavedAlbumInfo>>,
   },
   /// A saved-shows page landed (same completion contract as albums).
   SavedShowsPageUpserted {
+    generation: u64,
     page: Option<crate::core::pagination::Paged<crate::core::plugin_api::ShowInfo>>,
   },
   /// A saved-albums page landed (same completion contract as albums).
   SavedArtistsPageUpserted {
+    generation: u64,
     page: Option<crate::core::pagination::CursorPaged<crate::core::plugin_api::ArtistInfo>>,
   },
   /// Merge membership changes into one of the saved-id sets (contains
@@ -137,6 +146,7 @@ pub enum CatalogStateEvent {
   /// path dispatched a contains-check for.
   PlaylistTracksPageUpserted {
     playlist_id: String,
+    generation: u64,
     page: crate::core::pagination::Paged<(u32, PlayableInfo)>,
     track_ids_for_like_check: Vec<String>,
   },
@@ -146,6 +156,9 @@ pub enum CatalogStateEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibrarySection {
   SavedTracks { offset: u32 },
+  SavedAlbums,
+  SavedShows,
+  SavedArtists,
 }
 
 /// Which saved-id set a membership merge applies to.
@@ -191,12 +204,19 @@ impl CatalogState {
   /// This is ticket 10's contract as enforcement. Two dispatchers completing
   /// out of order cannot clobber the newer request's rows because the fold
   /// refuses anything whose token predates the latest accepted request.
-  pub fn completes_latest(&self, incoming_source: &Source, incoming_query: &str) -> bool {
+  pub fn completes_latest(
+    &self,
+    incoming_source: &Source,
+    incoming_query: &str,
+    generation: u64,
+  ) -> bool {
     match &self.latest {
       // Nothing requested yet: a completion cannot be stale (defensive —
       // producers always emit Requested first).
       None => true,
-      Some((source, token)) => source == incoming_source && token.query == incoming_query,
+      Some((source, token)) => {
+        source == incoming_source && token.query == incoming_query && token.seq == generation
+      }
     }
   }
 
@@ -220,8 +240,13 @@ impl CatalogState {
           ..CatalogOutcome::default()
         }
       }
-      CatalogStateEvent::SearchCompleted { source, query, .. } => {
-        if self.completes_latest(source, query) {
+      CatalogStateEvent::SearchCompleted {
+        source,
+        query,
+        generation,
+        ..
+      } => {
+        if self.completes_latest(source, query, *generation) {
           CatalogOutcome {
             search_rows_replaced: true,
             ..CatalogOutcome::default()
@@ -258,9 +283,9 @@ mod catalog_domain_tests {
     state.accept_request(spotify(), "a".to_string());
     state.accept_request(youtube(), "b".to_string());
     // Spotify's late completion references the superseded request.
-    assert!(!state.completes_latest(&spotify(), "a"));
+    assert!(!state.completes_latest(&spotify(), "a", 0));
     // YouTube's is current.
-    assert!(state.completes_latest(&youtube(), "b"));
+    assert!(state.completes_latest(&youtube(), "b", 1));
   }
 
   #[test]
@@ -269,7 +294,7 @@ mod catalog_domain_tests {
     let mut state = CatalogState::default();
     state.accept_request(Source::Subsonic, "coltrane".to_string());
     state.accept_request(Source::Subsonic, "coltrane".to_string());
-    assert!(state.completes_latest(&Source::Subsonic, "coltrane"));
+    assert!(state.completes_latest(&Source::Subsonic, "coltrane", 1));
   }
 
   #[test]
@@ -279,7 +304,7 @@ mod catalog_domain_tests {
     let mut state = CatalogState::default();
     state.accept_request(Source::Subsonic, "radio hits".to_string());
     state.accept_request(youtube(), "radio hits".to_string());
-    assert!(!state.completes_latest(&Source::Subsonic, "radio hits"));
-    assert!(state.completes_latest(&youtube(), "radio hits"));
+    assert!(!state.completes_latest(&Source::Subsonic, "radio hits", 0));
+    assert!(state.completes_latest(&youtube(), "radio hits", 1));
   }
 }
