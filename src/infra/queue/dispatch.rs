@@ -668,8 +668,8 @@ async fn start_downloaded_queue(
   {
     return true;
   }
-  // Claim the lease before detached I/O. This is what prevents duplicate
-  // workers and lets QueueFetchCompleted reject superseded work.
+  // Claim the lease before I/O. This prevents duplicate fetches; awaiting the
+  // fetch here also makes pump shutdown cancel it with its owning task.
   let Some(claim) = spine
     .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
       crate::runtime::engine::DecodedSourceFact::QueueFetchClaimed { fetch_id },
@@ -679,45 +679,42 @@ async fn start_downloaded_queue(
   else {
     return true;
   };
-  let worker_spine = spine.clone();
-  tokio::spawn(async move {
-    let result: anyhow::Result<tempfile::NamedTempFile> = if youtube {
-      #[cfg(feature = "youtube")]
+  let result: anyhow::Result<tempfile::NamedTempFile> = if youtube {
+    #[cfg(feature = "youtube")]
+    {
+      let path = match spine
+        .query(crate::runtime::engine::FoldQuery::Decoded(
+          crate::runtime::engine::DecodedSourceQuery::YouTubeConfig,
+        ))
+        .await
+        .ok()
       {
-        let path = match worker_spine
-          .query(crate::runtime::engine::FoldQuery::Decoded(
-            crate::runtime::engine::DecodedSourceQuery::YouTubeConfig,
-          ))
-          .await
-          .ok()
-        {
-          Some(crate::runtime::engine::FoldAnswer::Decoded(
-            crate::runtime::engine::DecodedSourceAnswer::YouTubeConfig(path),
-          )) => path,
-          _ => None,
-        };
-        let source = crate::infra::youtube::YouTubeSource::new(path);
-        crate::infra::youtube::dispatch::download_for_queue(&source, &uri).await
+        Some(crate::runtime::engine::FoldAnswer::Decoded(
+          crate::runtime::engine::DecodedSourceAnswer::YouTubeConfig(path),
+        )) => path,
+        _ => None,
+      };
+      let source = crate::infra::youtube::YouTubeSource::new(path);
+      crate::infra::youtube::dispatch::download_for_queue(&source, &uri).await
+    }
+    #[cfg(not(feature = "youtube"))]
+    {
+      Err(anyhow!("youtube source unavailable"))
+    }
+  } else {
+    #[cfg(feature = "subsonic")]
+    {
+      match crate::infra::subsonic::dispatch::build_source(spine).await {
+        Some(source) => crate::infra::subsonic::dispatch::download_for_queue(&source, &uri).await,
+        None => Err(anyhow!("subsonic source unavailable")),
       }
-      #[cfg(not(feature = "youtube"))]
-      {
-        Err(anyhow!("youtube source unavailable"))
-      }
-    } else {
-      #[cfg(feature = "subsonic")]
-      {
-        match crate::infra::subsonic::dispatch::build_source(&worker_spine).await {
-          Some(source) => crate::infra::subsonic::dispatch::download_for_queue(&source, &uri).await,
-          None => Err(anyhow!("subsonic source unavailable")),
-        }
-      }
-      #[cfg(not(feature = "subsonic"))]
-      {
-        Err(anyhow!("subsonic source unavailable"))
-      }
-    };
-    finish_downloaded_queue(&worker_spine, fetch_id, claim, result).await;
-  });
+    }
+    #[cfg(not(feature = "subsonic"))]
+    {
+      Err(anyhow!("subsonic source unavailable"))
+    }
+  };
+  finish_downloaded_queue(spine, fetch_id, claim, result).await;
   true
 }
 

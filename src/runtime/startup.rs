@@ -1251,7 +1251,6 @@ async fn restore_controls(
   position_ms: u64,
   paused: bool,
   startup_behavior: StartupBehavior,
-  shuffle_on: bool,
   repeat: crate::infra::queue::RepeatMode,
 ) {
   let active = matches!(
@@ -1268,11 +1267,6 @@ async fn restore_controls(
     crate::infra::queue::RepeatMode::Track => RepeatSetting::Track,
     crate::infra::queue::RepeatMode::Context => RepeatSetting::Context,
   };
-  let _ = spine
-    .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
-      EngineAction::SetShuffle(shuffle_on),
-    )))
-    .await;
   let _ = spine
     .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
       EngineAction::SetRepeat(repeat),
@@ -1358,15 +1352,7 @@ async fn restore_playback_session(
           },
         ))
         .await;
-      restore_controls(
-        spine,
-        position_ms,
-        paused,
-        startup_behavior,
-        shuffle_on,
-        repeat,
-      )
-      .await;
+      restore_controls(spine, position_ms, paused, startup_behavior, repeat).await;
     }
     #[cfg(feature = "subsonic")]
     PersistedPlayback::Subsonic {
@@ -1404,15 +1390,7 @@ async fn restore_playback_session(
           },
         ))
         .await;
-      restore_controls(
-        spine,
-        position_ms,
-        paused,
-        startup_behavior,
-        shuffle_on,
-        repeat,
-      )
-      .await;
+      restore_controls(spine, position_ms, paused, startup_behavior, repeat).await;
     }
     #[cfg(feature = "youtube")]
     PersistedPlayback::YouTube {
@@ -1449,15 +1427,7 @@ async fn restore_playback_session(
           },
         ))
         .await;
-      restore_controls(
-        spine,
-        position_ms,
-        paused,
-        startup_behavior,
-        shuffle_on,
-        repeat,
-      )
-      .await;
+      restore_controls(spine, position_ms, paused, startup_behavior, repeat).await;
     }
     #[cfg(feature = "internet-radio")]
     PersistedPlayback::Radio { station, paused } => {
