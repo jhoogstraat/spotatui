@@ -109,7 +109,11 @@ pub(super) async fn start_tokio(
         && !handled_locally
         && !handled_subsonic
         && !handled_radio
-        && crate::infra::youtube::dispatch::route_youtube_event(&network.app, &io_event).await;
+        && if let Some(spine) = network.spine.as_ref() {
+          crate::infra::youtube::dispatch::route_youtube_event(spine, &io_event).await
+        } else {
+          false
+        };
       #[cfg(not(feature = "youtube"))]
       let handled_youtube = false;
       if !handled_queue

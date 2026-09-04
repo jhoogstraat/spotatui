@@ -54,94 +54,50 @@ enum Direction {
 ///
 /// Returns `true` if the event was handled (and must **not** be forwarded to
 /// the Spotify network), `false` to let the normal dispatch run.
-pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
+async fn route_youtube_event_impl(spine: &Spine, event: &IoEvent) -> bool {
   match event {
     IoEvent::GetYouTubeSearchResults(query) => {
-      if let Some(spine) = playback_spine(app).await {
-        run_youtube_search(app, &spine, query).await;
-      }
+      run_youtube_search(spine, query).await;
       true
     }
     IoEvent::GetYouTubePlaylists => {
-      if let Some(spine) = playback_spine(app).await {
-        load_playlists(&spine).await;
-      }
+      load_playlists(spine).await;
       true
     }
     IoEvent::GetYouTubeTracks(uri) => {
-      if let Some(spine) = playback_spine(app).await {
-        load_playlist_tracks(&spine, uri).await;
-      }
+      load_playlist_tracks(spine, uri).await;
       true
     }
     IoEvent::CreateYouTubePlaylist(name) => {
-      if let Some(spine) = playback_spine(app).await {
-        create_playlist(&spine, name).await;
-      }
+      create_playlist(spine, name).await;
       true
     }
     IoEvent::DeleteYouTubePlaylist(uri) => {
-      if let Some(spine) = playback_spine(app).await {
-        delete_playlist(&spine, uri).await;
-      }
+      delete_playlist(spine, uri).await;
       true
     }
     IoEvent::AddTrackToYouTubePlaylist(playlist_ref, video_ref) => {
-      if let Some(spine) = playback_spine(app).await {
-        add_track_to_playlist(&spine, playlist_ref, video_ref).await;
-      }
+      add_track_to_playlist(spine, playlist_ref, video_ref).await;
       true
     }
     IoEvent::RemoveTrackFromYouTubePlaylist(playlist_ref, video_ref) => {
-      if let Some(spine) = playback_spine(app).await {
-        remove_track_from_playlist(&spine, playlist_ref, video_ref).await;
-      }
+      remove_track_from_playlist(spine, playlist_ref, video_ref).await;
       true
     }
     // Start a queue of youtube videos: queue all and start at the offset.
     IoEvent::StartPlayback(None, Some(uris), offset)
       if uris.first().is_some_and(|u| is_youtube_uri(u)) =>
     {
-      if let Some(spine) = playback_spine(app).await {
-        start_youtube_queue(&spine, uris, offset.unwrap_or(0)).await;
-      } else {
-        #[cfg(test)]
-        if uris.iter().any(|uri| {
-          app
-            .try_lock()
-            .ok()
-            .and_then(|guard| {
-              guard
-                .search_results
-                .tracks
-                .as_ref()
-                .and_then(|rows| {
-                  rows
-                    .items
-                    .iter()
-                    .find(|row| row.uri.as_deref() == Some(uri))
-                })
-                .map(|row| row.duration_ms == 0)
-            })
-            .unwrap_or(false)
-        }) {
-          app
-            .lock()
-            .await
-            .set_status_message("Live streams aren't supported on the YouTube source yet", 6);
-        }
-      }
+      start_youtube_queue(spine, uris, offset.unwrap_or(0)).await;
       true
     }
     // A single youtube video with no surrounding list: a one-track queue.
     IoEvent::StartPlayback(Some(uri), _, _) if is_youtube_uri(uri) => {
-      if let Some(spine) = playback_spine(app).await {
-        start_youtube_queue(&spine, std::slice::from_ref(uri), 0).await;
-      }
+      start_youtube_queue(spine, std::slice::from_ref(uri), 0).await;
       true
     }
     // Bare "resume current" — ours only while YouTube owns the session.
-    IoEvent::StartPlayback(None, None, None) => match youtube_player(app).await {
+    IoEvent::StartPlayback(None, None, None) => match youtube_player(spine).await {
       Some(p) => {
         p.resume();
         true
@@ -151,72 +107,69 @@ pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool
     // Any other start is a local/Subsonic/radio/Spotify play: relinquish the
     // device, then let the normal dispatch run.
     IoEvent::StartPlayback(..) => {
-      if let Some(spine) = playback_spine(app).await {
-        teardown_youtube(&spine).await;
-      }
+      teardown_youtube(spine).await;
       false
     }
-    IoEvent::PausePlayback => match youtube_player(app).await {
+    IoEvent::PausePlayback => match youtube_player(spine).await {
       Some(p) => {
         p.pause();
         true
       }
       None => false,
     },
-    IoEvent::Seek(position_ms) => match youtube_player(app).await {
+    IoEvent::Seek(position_ms) => match youtube_player(spine).await {
       Some(p) => {
         let _ = p.seek(Duration::from_millis(*position_ms as u64));
         true
       }
       None => false,
     },
-    IoEvent::ChangeVolume(volume) => match youtube_player(app).await {
+    IoEvent::ChangeVolume(volume) => match youtube_player(spine).await {
       Some(p) => {
         p.set_volume(*volume as f32 / 100.0);
-        if let Some(spine) = playback_spine(app).await {
-          let _ = spine
-            .emit_acked(EngineEvent::Decoded(Fact::Volume(*volume)))
-            .await;
-        }
+        let _ = spine
+          .emit_acked(EngineEvent::Decoded(Fact::Volume(*volume)))
+          .await;
         true
       }
       None => false,
     },
-    IoEvent::NextTrack => match playback_spine(app).await {
-      Some(spine) => skip(&spine, Direction::Next).await,
-      None => false,
-    },
-    IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => match playback_spine(app).await {
-      Some(spine) => skip(&spine, Direction::Prev).await,
-      None => false,
-    },
+    IoEvent::NextTrack => skip(spine, Direction::Next).await,
+    IoEvent::PreviousTrack | IoEvent::ForcePreviousTrack => skip(spine, Direction::Prev).await,
     // Repeat-one auto-advance: replay the current video (dispatched by the runner
     // tick only while YouTube owns the session).
-    IoEvent::ReplayCurrentTrack => match playback_spine(app).await {
-      Some(spine) => replay_current(&spine).await,
-      None => false,
-    },
+    IoEvent::ReplayCurrentTrack => replay_current(spine).await,
     // Explicit repeat-mode set (e.g. a plugin's `set_repeat`): store it as the
     // decoded repeat mode while a queueable decoded source owns playback (the
     // method's ownership gate excludes a context suspended under the native
     // queue), so it never reaches the Spotify context.
-    IoEvent::Repeat(state) => match playback_spine(app).await {
-      Some(spine) => matches!(
-        decoded(&spine, Query::YouTubeRepeat(*state)).await,
-        Some(Answer::YouTubeRepeat(true))
-      ),
-      None => false,
-    },
+    IoEvent::Repeat(state) => matches!(
+      decoded(spine, Query::YouTubeRepeat(*state)).await,
+      Some(Answer::YouTubeRepeat(true))
+    ),
     _ => false,
   }
 }
 
-async fn playback_spine(app: &Arc<Mutex<App>>) -> Option<Spine> {
-  app.lock().await.spine.clone()
+/// Production routing receives only the immutable producer spine.
+#[cfg(not(test))]
+pub async fn route_youtube_event(spine: &Spine, event: &IoEvent) -> bool {
+  route_youtube_event_impl(spine, event).await
 }
 
-async fn youtube_player(app: &Arc<Mutex<App>>) -> Option<Arc<LocalPlayer>> {
-  let spine = playback_spine(app).await?;
+/// Compatibility wrapper for source-unit tests that construct an App directly.
+#[cfg(test)]
+pub async fn route_youtube_event(
+  app: &Arc<Mutex<App>>,
+  event: &IoEvent,
+) -> bool {
+  let Some(spine) = app.lock().await.spine.clone() else {
+    return false;
+  };
+  route_youtube_event_impl(&spine, event).await
+}
+
+async fn youtube_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
   match decoded(&spine, Query::YouTubePlayer).await? {
     Answer::YouTubePlayer(player) => player,
     _ => None,
@@ -259,7 +212,6 @@ pub(crate) async fn build_source(app: &Arc<Mutex<App>>) -> YouTubeSource {
 /// M2 search, only the songs block is populated — each row is a video; Enter
 /// dispatches the `youtube:` URIs back through this module.
 async fn run_youtube_search(
-  app: &Arc<Mutex<App>>,
   spine: &crate::runtime::engine::Spine,
   query: &str,
 ) {
@@ -276,7 +228,11 @@ async fn run_youtube_search(
   let Some(generation) = generation else {
     return;
   };
-  let source = build_source(app).await;
+  let ytdlp_path = match spine.query(FoldQuery::Decoded(Query::YouTubeConfig)).await.ok() {
+    Some(FoldAnswer::Decoded(Answer::YouTubeConfig(path))) => path,
+    _ => None,
+  };
+  let source = YouTubeSource::new(ytdlp_path);
   match source.search(query).await {
     Ok(results) => {
       let total = results.tracks.len() as u32;
