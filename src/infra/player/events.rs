@@ -1,9 +1,5 @@
 use crate::core::app::{self, NativeTrackKind};
 use crate::core::config::ClientConfig;
-#[cfg(all(feature = "macos-media", target_os = "macos"))]
-use crate::infra::macos_media;
-#[cfg(all(feature = "mpris", target_os = "linux"))]
-use crate::infra::mpris;
 use crate::infra::network::IoEvent;
 use crate::infra::player::{
   get_default_cache_path, PlayerEvent, SessionDisconnectReason, StreamingConfig,
@@ -74,12 +70,6 @@ pub struct PlayerEventContext {
   /// their only consumer and the single writer of the mirrored fields.
   pub spine: crate::runtime::engine::Spine,
   pub recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  pub mpris_manager: Option<Arc<mpris::MprisManager>>,
-  #[cfg(all(feature = "macos-media", target_os = "macos"))]
-  pub macos_media_manager: Option<Arc<macos_media::MacMediaManager>>,
-  #[cfg(all(feature = "windows-media", target_os = "windows"))]
-  pub windows_media_manager: Option<Arc<smtc_tokio::WindowsMediaManager>>,
 }
 
 pub struct StreamingRecoveryContext {
@@ -93,12 +83,6 @@ pub struct StreamingRecoveryContext {
   pub recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
   pub client_config: ClientConfig,
   pub redirect_uri: String,
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  pub mpris_manager: Option<Arc<mpris::MprisManager>>,
-  #[cfg(all(feature = "macos-media", target_os = "macos"))]
-  pub macos_media_manager: Option<Arc<macos_media::MacMediaManager>>,
-  #[cfg(all(feature = "windows-media", target_os = "windows"))]
-  pub windows_media_manager: Option<Arc<smtc_tokio::WindowsMediaManager>>,
 }
 
 pub fn spawn_streaming_recovery_handler(ctx: StreamingRecoveryContext) {
@@ -234,12 +218,6 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
           shared_is_playing: Arc::clone(&ctx.shared_is_playing),
           spine: ctx.spine.clone(),
           recovery_tx: ctx.recovery_tx.clone(),
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          mpris_manager: ctx.mpris_manager.clone(),
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          macos_media_manager: ctx.macos_media_manager.clone(),
-          #[cfg(all(feature = "windows-media", target_os = "windows"))]
-          windows_media_manager: ctx.windows_media_manager.clone(),
         });
 
         info!(
@@ -333,12 +311,6 @@ pub fn spawn_player_event_handler(ctx: PlayerEventContext) {
   let shared_is_playing = Arc::clone(&ctx.shared_is_playing);
   let spine = ctx.spine.clone();
   let recovery_tx = ctx.recovery_tx.clone();
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  let mpris_manager = ctx.mpris_manager.clone();
-  #[cfg(all(feature = "macos-media", target_os = "macos"))]
-  let macos_media_manager = ctx.macos_media_manager.clone();
-  #[cfg(all(feature = "windows-media", target_os = "windows"))]
-  let windows_media_manager = ctx.windows_media_manager.clone();
 
   tokio::spawn(async move {
     handle_player_events(
@@ -348,12 +320,6 @@ pub fn spawn_player_event_handler(ctx: PlayerEventContext) {
       shared_is_playing,
       spine,
       recovery_tx,
-      #[cfg(all(feature = "mpris", target_os = "linux"))]
-      mpris_manager,
-      #[cfg(all(feature = "macos-media", target_os = "macos"))]
-      macos_media_manager,
-      #[cfg(all(feature = "windows-media", target_os = "windows"))]
-      windows_media_manager,
     )
     .await;
   });
@@ -370,15 +336,6 @@ async fn handle_player_events(
   shared_is_playing: Arc<AtomicBool>,
   spine: crate::runtime::engine::Spine,
   recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
-  #[cfg(all(feature = "mpris", target_os = "linux"))] mpris_manager: Option<
-    Arc<mpris::MprisManager>,
-  >,
-  #[cfg(all(feature = "macos-media", target_os = "macos"))] macos_media_manager: Option<
-    Arc<macos_media::MacMediaManager>,
-  >,
-  #[cfg(all(feature = "windows-media", target_os = "windows"))] windows_media_manager: Option<
-    Arc<smtc_tokio::WindowsMediaManager>,
-  >,
 ) {
   // Count consecutive failed (Unavailable) loads so we can escalate the message
   // when an account is hit by the upstream Spotify audio-key block (#282). A
@@ -597,18 +554,6 @@ async fn handle_player_events(
         );
         if current {
           shared_is_playing.store(true, Ordering::Relaxed);
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = mpris_manager {
-            mpris.set_playback_status(true);
-          }
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          if let Some(ref macos_media) = macos_media_manager {
-            macos_media.set_playback_status(true);
-          }
-          #[cfg(all(feature = "windows-media", target_os = "windows"))]
-          if let Some(ref windows_media) = windows_media_manager {
-            windows_media.set_playback_status(true);
-          }
         }
       }
       PlayerEvent::Paused {
@@ -636,18 +581,6 @@ async fn handle_player_events(
         );
         if current {
           shared_is_playing.store(false, Ordering::Relaxed);
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = mpris_manager {
-            mpris.set_playback_status(false);
-          }
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          if let Some(ref macos_media) = macos_media_manager {
-            macos_media.set_playback_status(false);
-          }
-          #[cfg(all(feature = "windows-media", target_os = "windows"))]
-          if let Some(ref windows_media) = windows_media_manager {
-            windows_media.set_playback_status(false);
-          }
         }
       }
       PlayerEvent::Seeked {
@@ -664,16 +597,6 @@ async fn handle_player_events(
         if !current {
           continue;
         }
-        #[cfg(all(feature = "macos-media", target_os = "macos"))]
-        if let Some(ref macos_media) = macos_media_manager {
-          macos_media.set_position(position_ms as u64);
-        }
-
-        #[cfg(all(feature = "windows-media", target_os = "windows"))]
-        if let Some(ref windows_media) = windows_media_manager {
-          windows_media.set_position(position_ms as u64);
-        }
-
         // State fact only: `seek_ms` clear + recovery-position stamp ride the
         // event through the fold's mirror write.
       }
@@ -730,7 +653,7 @@ async fn handle_player_events(
             },
           ))
           .await;
-        let (current, reload_uri, transition_advanced) = match decision.and_then(|a| a.native) {
+        let (_current, reload_uri, transition_advanced) = match decision.and_then(|a| a.native) {
           Some(crate::runtime::engine::NativePlaybackAck::TrackChanged {
             current,
             reload_uri,
@@ -738,38 +661,6 @@ async fn handle_player_events(
           }) => (current, reload_uri, transition_advanced),
           _ => (false, None, false),
         };
-        if current {
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = mpris_manager {
-            mpris.set_metadata(
-              &audio_item.name,
-              &artists,
-              &album,
-              audio_item.duration_ms,
-              None,
-            );
-          }
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          if let Some(ref macos_media) = macos_media_manager {
-            macos_media.set_metadata(
-              &audio_item.name,
-              &artists,
-              &album,
-              audio_item.duration_ms,
-              None,
-            );
-          }
-          #[cfg(all(feature = "windows-media", target_os = "windows"))]
-          if let Some(ref windows_media) = windows_media_manager {
-            windows_media.set_metadata(
-              &audio_item.name,
-              &artists,
-              &album,
-              audio_item.duration_ms as u64,
-              None,
-            );
-          }
-        }
         if transition_advanced {
           pending_end_of_track = None;
         }
@@ -788,21 +679,6 @@ async fn handle_player_events(
         if !current {
           continue;
         }
-        #[cfg(all(feature = "mpris", target_os = "linux"))]
-        if let Some(ref mpris) = mpris_manager {
-          mpris.set_stopped();
-        }
-
-        #[cfg(all(feature = "macos-media", target_os = "macos"))]
-        if let Some(ref macos_media) = macos_media_manager {
-          macos_media.set_stopped();
-        }
-
-        #[cfg(all(feature = "windows-media", target_os = "windows"))]
-        if let Some(ref windows_media) = windows_media_manager {
-          windows_media.set_stopped();
-        }
-
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         spine
@@ -832,7 +708,7 @@ async fn handle_player_events(
             },
           ))
           .await;
-        let (current, should_ensure_playback, reissue_queue_slot) =
+        let (_current, should_ensure_playback, reissue_queue_slot) =
           match decision.and_then(|a| a.native) {
             Some(crate::runtime::engine::NativePlaybackAck::EndOfTrack {
               current,
@@ -842,21 +718,6 @@ async fn handle_player_events(
             }) => (current, should_ensure_playback, reissue_queue_slot),
             _ => (false, false, None),
           };
-        if current {
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = mpris_manager {
-            mpris.set_stopped();
-          }
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          if let Some(ref macos_media) = macos_media_manager {
-            macos_media.set_stopped();
-          }
-          #[cfg(all(feature = "windows-media", target_os = "windows"))]
-          if let Some(ref windows_media) = windows_media_manager {
-            windows_media.set_stopped();
-          }
-        }
-
         if let Some((uri, desired_playing)) = reissue_queue_slot {
           info!(
             "queue slot did not start before the previous track ended; reissuing {}",
@@ -888,15 +749,6 @@ async fn handle_player_events(
         if !current {
           continue;
         }
-        #[cfg(all(feature = "mpris", target_os = "linux"))]
-        if let Some(ref mpris) = mpris_manager {
-          mpris.set_volume(volume_percent);
-        }
-
-        #[cfg(all(feature = "macos-media", target_os = "macos"))]
-        if let Some(ref macos_media) = macos_media_manager {
-          macos_media.set_volume(volume_percent);
-        }
       }
       PlayerEvent::PositionChanged {
         play_request_id: _,
@@ -913,21 +765,6 @@ async fn handle_player_events(
           continue;
         }
         shared_position.store(position_ms as u64, Ordering::Relaxed);
-
-        #[cfg(all(feature = "mpris", target_os = "linux"))]
-        if let Some(ref mpris) = mpris_manager {
-          mpris.set_position(position_ms as u64);
-        }
-
-        #[cfg(all(feature = "macos-media", target_os = "macos"))]
-        if let Some(ref macos_media) = macos_media_manager {
-          macos_media.set_position(position_ms as u64);
-        }
-
-        #[cfg(all(feature = "windows-media", target_os = "windows"))]
-        if let Some(ref windows_media) = windows_media_manager {
-          windows_media.set_position(position_ms as u64);
-        }
       }
       PlayerEvent::SessionDisconnected { reason, .. } => {
         let recovery = session_disconnect_recovery(reason);
@@ -950,18 +787,6 @@ async fn handle_player_events(
         )
         .await
         {
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = mpris_manager {
-            mpris.set_stopped();
-          }
-          #[cfg(all(feature = "macos-media", target_os = "macos"))]
-          if let Some(ref macos_media) = macos_media_manager {
-            macos_media.set_stopped();
-          }
-          #[cfg(all(feature = "windows-media", target_os = "windows"))]
-          if let Some(ref windows_media) = windows_media_manager {
-            windows_media.set_stopped();
-          }
           if recovery == SessionDisconnectRecovery::Stop {
             // No rebuild follows a Stop; release the pending latch so later
             // requests can't park forever. (Presently unreachable: local

@@ -206,11 +206,6 @@ impl App {
         self.runtime_state.shuffle_enabled = new_shuffle_state;
         self.schedule_state_save(PersistedRuntimeState::shuffle_enabled(new_shuffle_state));
 
-        // Notify MPRIS clients of the change
-        #[cfg(all(feature = "mpris", target_os = "linux"))]
-        if let Some(ref mpris) = self.mpris_manager {
-          mpris.set_shuffle(new_shuffle_state);
-        }
         return;
       }
 
@@ -269,17 +264,6 @@ impl App {
             ctx.repeat_state = next_repeat_state;
           }
 
-          // Notify MPRIS clients of the change
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = self.mpris_manager {
-            use crate::infra::mpris::LoopStatusEvent;
-            let loop_status = match next_repeat_state {
-              RepeatState::Off => LoopStatusEvent::None,
-              RepeatState::Context => LoopStatusEvent::Playlist,
-              RepeatState::Track => LoopStatusEvent::Track,
-            };
-            mpris.set_loop_status(loop_status);
-          }
           return;
         }
       }

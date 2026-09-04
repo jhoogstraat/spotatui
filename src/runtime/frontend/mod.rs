@@ -1187,7 +1187,7 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
             queue_suspended: None,
           });
         }
-        _ => fold_one(app, &event),
+        _ => fold_one(app, event),
       }
       Some(FoldAck {
         catalog_generation: None,
@@ -1301,12 +1301,12 @@ fn event_catalog(event: &EngineEvent) -> &CatalogStateEvent {
 }
 
 /// Fold one event without publishing (shared by the acked and plain paths).
-fn fold_one(app: &mut App, event: &EngineEvent) {
+fn fold_one(app: &mut App, event: EngineEvent) {
   match event {
     EngineEvent::Streaming(streaming) => {
       #[cfg(feature = "streaming")]
       {
-        app.apply_streaming_state(streaming.clone());
+        app.apply_streaming_state(streaming);
       }
       #[cfg(not(feature = "streaming"))]
       {
@@ -1314,16 +1314,16 @@ fn fold_one(app: &mut App, event: &EngineEvent) {
       }
     }
     EngineEvent::Catalog(catalog) => {
-      crate::core::apply_catalog_state(app, catalog);
+      crate::core::apply_catalog_state(app, &catalog);
     }
-    EngineEvent::Session(fact) => apply_session_fact(app, fact.clone()),
+    EngineEvent::Session(fact) => apply_session_fact(app, fact),
     EngineEvent::Decoded(_) => {}
-    EngineEvent::History(fact) => apply_history_fact(app, fact.clone()),
+    EngineEvent::History(fact) => apply_history_fact(app, fact),
     #[cfg(feature = "streaming")]
     // Native facts are handled by the fold loop before this helper. Keep the
     // arm inert for exhaustiveness without moving out of a borrowed event.
     EngineEvent::Native(_) => {}
-    EngineEvent::Timer(fact) => apply_timer_fact(app, *fact),
+    EngineEvent::Timer(fact) => apply_timer_fact(app, fact),
   }
 }
 
@@ -1848,6 +1848,13 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
       } else {
         app.set_status_message(message, ttl_secs);
       }
+    }
+    SessionFact::RelativeSeek(offset_ms) => {
+      let current = crate::infra::media_metadata::current_playback_snapshot(app)
+        .map_or(0, |snapshot| snapshot.progress_ms)
+        .min(u32::MAX as u128) as i64;
+      let target = (current + offset_ms).max(0) as u32;
+      app.dispatch(IoEvent::Seek(target));
     }
     #[cfg(feature = "streaming")]
     SessionFact::NativeBackendPending(pending) => {
@@ -2939,6 +2946,7 @@ pub(crate) fn answer_query(
   use crate::core::catalog::LibrarySection;
   use crate::runtime::engine::{FoldAnswer, FoldQuery};
   match query {
+    FoldQuery::MediaKeysEnabled => FoldAnswer::Bool(app.user_config.behavior.enable_media_keys),
     FoldQuery::Decoded(query) => answer_decoded_query(app, query),
     FoldQuery::LibraryRequestLive { generation, .. } => {
       FoldAnswer::Bool(app.saved_tracks_prefetch_generation == generation)

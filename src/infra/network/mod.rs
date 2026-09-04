@@ -45,10 +45,8 @@ use self::utils::UtilsNetwork;
 // Most variants were constructed by TUI handlers (deleted, ticket 01); ticket
 // 02's event-spine work replaces this enum. Never `cfg` a variant out for
 // feature-gating - a build leg missing a feature would then compile clean
-// while the feature is silently absent. `Clone` so it can ride spine facts
-// (ticket 17: fold-dispatched membership checks); every payload is Clone.
+// while the feature is silently absent.
 #[allow(dead_code)]
-#[derive(Clone)]
 pub enum IoEvent {
   GetCurrentPlayback,
   /// After a track transition (e.g., EndOfTrack), ensure we don't end up paused on the next item.

@@ -667,7 +667,6 @@ pub enum SessionPersistenceOperation {
 /// same methods the old inline writes used, so behavior is byte-for-byte
 /// parity while the lock sites disappear. Debug and Clone are manual:
 /// `IoEvent` has no Debug and must not grow one.
-#[derive(Clone)]
 pub enum SessionFact {
   /// Reserve a metadata navigation generation before an async request.
   MetadataRequested,
@@ -699,6 +698,8 @@ pub enum SessionFact {
     ttl_secs: u64,
     is_error: bool,
   },
+  /// Apply a relative seek against the fold-owned current position.
+  RelativeSeek(i64),
   /// The deferred native startup window opened or closed.
   #[cfg(feature = "streaming")]
   NativeBackendPending(bool),
@@ -1056,6 +1057,7 @@ impl std::fmt::Debug for SessionFact {
         .field("ttl_secs", ttl_secs)
         .field("is_error", is_error)
         .finish(),
+      SessionFact::RelativeSeek(offset) => f.debug_tuple("RelativeSeek").field(offset).finish(),
       #[cfg(feature = "streaming")]
       SessionFact::NativeBackendPending(pending) => f
         .debug_tuple("NativeBackendPending")
@@ -1307,6 +1309,8 @@ pub use crate::core::action::LibraryTarget;
 /// never locks. Every variant names the exact decision it feeds, so the
 /// protocol stays auditable.
 pub enum FoldQuery {
+  /// Whether OS media-key integrations are currently enabled.
+  MediaKeysEnabled,
   /// Decoded-source read envelope; concrete variants are kept in the source
   /// domain so this central vocabulary stays compact.
   Decoded(DecodedSourceQuery),

@@ -316,12 +316,6 @@ impl App {
       self.last_native_seek = Some(Instant::now());
       self.pending_native_seek = None;
       self.set_native_recovery_position(position_ms);
-
-      // Notify MPRIS clients that position jumped
-      #[cfg(all(feature = "mpris", target_os = "linux"))]
-      if let Some(ref mpris) = self.mpris_manager {
-        mpris.emit_seeked(position_ms as u64);
-      }
     }
   }
 

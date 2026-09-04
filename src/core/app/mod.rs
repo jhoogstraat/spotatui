@@ -509,10 +509,6 @@ pub struct App {
   pub native_restore_pending: Option<NativePlaybackRestoreAttempt>,
   #[cfg(feature = "streaming")]
   native_playback_generation: u64,
-  /// Reference to MPRIS manager for emitting Seeked signals after native seeks
-  #[cfg(all(feature = "mpris", target_os = "linux"))]
-  pub mpris_manager: Option<Arc<crate::infra::mpris::MprisManager>>,
-
   // Create Playlist form state
   pub create_playlist_tracks: Vec<TrackInfo>,
   pub create_playlist_search_results: Vec<TrackInfo>,

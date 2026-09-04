@@ -69,13 +69,6 @@ impl App {
           self.schedule_state_save(PersistedRuntimeState::volume_percent(next_volume));
           self.pending_volume = Some(next_volume);
 
-          // Notify MPRIS clients of the change (VolumeChanged is never emitted by
-          // librespot for local mixer changes, so this is the only way the
-          // Volume D-Bus property stays in sync)
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = self.mpris_manager {
-            mpris.set_volume(next_volume);
-          }
           return;
         }
       }
@@ -125,13 +118,6 @@ impl App {
           self.schedule_state_save(PersistedRuntimeState::volume_percent(next_volume));
           self.pending_volume = Some(next_volume);
 
-          // Notify MPRIS clients of the change (VolumeChanged is never emitted by
-          // librespot for local mixer changes, so this is the only way the
-          // Volume D-Bus property stays in sync)
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = self.mpris_manager {
-            mpris.set_volume(next_volume);
-          }
           return;
         }
       }
@@ -186,13 +172,6 @@ impl App {
           self.schedule_state_save(PersistedRuntimeState::volume_percent(next_volume_u8));
           self.pending_volume = Some(next_volume_u8);
 
-          // Notify MPRIS clients of the change (VolumeChanged is never emitted by
-          // librespot for local mixer changes, so this is the only way the
-          // Volume D-Bus property stays in sync)
-          #[cfg(all(feature = "mpris", target_os = "linux"))]
-          if let Some(ref mpris) = self.mpris_manager {
-            mpris.set_volume(next_volume_u8);
-          }
           return;
         }
       }

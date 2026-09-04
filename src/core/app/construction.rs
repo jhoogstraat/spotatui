@@ -203,8 +203,6 @@ impl Default for App {
       native_restore_pending: None,
       #[cfg(feature = "streaming")]
       native_playback_generation: 0,
-      #[cfg(all(feature = "mpris", target_os = "linux"))]
-      mpris_manager: None,
       #[cfg(feature = "dj-core")]
       dj: crate::infra::dj::DjState::default(),
       create_playlist_tracks: Vec::new(),

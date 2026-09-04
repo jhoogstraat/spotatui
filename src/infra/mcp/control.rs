@@ -22,19 +22,19 @@
 
 use super::executor::AppExecutor;
 use super::server;
+#[cfg(test)]
+use crate::core::app::App;
 use crate::infra::network::IoEvent;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 #[cfg(test)]
-use crate::core::app::App;
-#[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use tokio::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(test)]
+use tokio::sync::Mutex;
 
 const HANDSHAKE_FILE: &str = "mcp.json";
 /// Overrides the handshake file location so a test does not write into the
@@ -185,8 +185,7 @@ pub async fn spawn_listener(
       let spine = spine.clone();
       let token = token.clone();
       tokio::spawn(async move {
-        if let Err(e) = serve_connection(stream, io_tx, spine, token, HANDSHAKE_TIMEOUT).await
-        {
+        if let Err(e) = serve_connection(stream, io_tx, spine, token, HANDSHAKE_TIMEOUT).await {
           log::debug!("MCP: connection ended: {e}");
         }
       });
