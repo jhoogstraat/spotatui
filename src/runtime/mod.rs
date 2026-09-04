@@ -145,12 +145,10 @@ pub async fn run_cli() -> Result<()> {
         .ok()
         .map(|url| url.to_string())
     }) {
-      Some(uri) => boot.app.lock().await.pending_play_file = Some(uri),
+      Some(uri) => boot.app.pending_play_file = Some(uri),
       None => {
         boot
           .app
-          .lock()
-          .await
           .set_status_message(format!("Cannot find local file: {path}"), 8);
       }
     }

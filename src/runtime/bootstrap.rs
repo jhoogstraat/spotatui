@@ -28,7 +28,6 @@ use std::{
   path::PathBuf,
   sync::Arc,
 };
-use tokio::sync::Mutex;
 
 #[cfg(all(target_os = "linux", feature = "streaming"))]
 mod alsa_silence {
@@ -338,7 +337,7 @@ fn apply_configured_runtime_defaults(
 /// consumer; each `cfg_attr` allowance names the build that leaves the field
 /// unread.
 pub(super) struct Boot {
-  pub(super) app: Arc<Mutex<App>>,
+  pub(super) app: App,
   /// Consumed by the IoEvent pump. CLI mode holds it (unread) for the length
   /// of the command so an `App::dispatch` during CLI handling is silently
   /// queued rather than logged as a send error.
@@ -646,13 +645,13 @@ pub(super) async fn boot(options: &BootOptions, onboarding: Arc<dyn Onboarding>)
   info!("app state initialized");
 
   // Initialise app state
-  let app = Arc::new(Mutex::new(App::new_with_state(
+  let app = App::new_with_state(
     sync_io_tx,
     user_config.clone(),
     runtime_state.clone(),
     state_path.clone(),
     token_expiry,
-  )));
+  );
 
   // `--play-file <PATH>` is resolved by the CLI caller after boot; the
   // frontend-neutral bootstrap has no command line to read.

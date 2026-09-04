@@ -69,20 +69,28 @@ pub(super) async fn run_subcommand(boot: Boot, cmd: &str, matches: &ArgMatches) 
   let app = boot.app;
   // Held (unread) for the length of the command; see the field doc on `Boot`.
   let _sync_io_rx = boot.sync_io_rx;
-  // Both `Network::new` variants share one signature, so the same call
-  // compiles with or without `streaming`. CLI mode never uses streaming.
+  let (spine, events_rx, queries) = crate::runtime::engine::Spine::open(Default::default());
+  let folds = queries.take().await;
+  let (snapshot_tx, _snapshot_rx) = tokio::sync::watch::channel(crate::runtime::frontend::Snapshot::default());
+  let (deadline_tx, _deadline_rx) = tokio::sync::watch::channel(0u64);
+  let fold_spine = spine.clone();
+  tokio::spawn(crate::runtime::frontend::fold_loop(
+    app,
+    snapshot_tx,
+    events_rx,
+    folds,
+    deadline_tx,
+    fold_spine,
+  ));
+  // CLI mode never uses native streaming, but shares the same spine-owned
+  // network constructor as the embedded runtime.
   let mut network = Network::new(
     boot.spotify,
     boot.client_config,
-    None,
+    Some(spine.clone()),
     boot.user_config.behavior.ytdlp_path.clone(),
     boot.token_cache_path,
   );
-  // Ticket 17: the CLI is a command surface reading fold-published state,
-  // so it runs its own fold for the subcommand lifetime. Snapshot
-  // publication has no subscriber here; the fold task ends when this
-  // function drops the watch receiver and the spine.
-  let (spine, _snapshot_rx) = crate::runtime::frontend::spawn_fold(&app).await;
   network.spine = Some(spine.clone());
   let cli_result = cli::handle_matches(matches, cmd.to_string(), network, boot.user_config).await;
   // End-of-command persistence flush through the fold (it owns the state).

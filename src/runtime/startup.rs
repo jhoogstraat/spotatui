@@ -669,7 +669,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) -> Opti
 /// them. Every frontend consumes the same handles; the windowed `frontend`
 /// module drives its own loop on top.
 pub(super) struct Services {
-  pub app: Arc<Mutex<App>>,
+  pub app: App,
   /// The engine's event spine, opened by `start_services` so every producer
   /// (player events, recovery teardown, catalog dispatchers) shares one
   /// channel; the frontend's fold task takes the receiving half.
