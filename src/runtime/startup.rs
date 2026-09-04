@@ -16,7 +16,7 @@ use crate::infra::macos_media;
 #[cfg(all(feature = "mpris", target_os = "linux"))]
 use crate::infra::mpris;
 #[cfg(feature = "streaming")]
-use crate::infra::network::requests::spotify_get_typed_compat_for_with_refresh;
+use crate::infra::network::requests::spotify_get_typed_for;
 use crate::infra::network::{IoEvent, Network};
 #[cfg(feature = "streaming")]
 use crate::infra::player;
@@ -246,18 +246,11 @@ async fn account_supports_native_streaming(
   spotify: &AuthCodePkceSpotify,
   cached_me: Option<PrivateUser>,
   token_cache_path: &Path,
-  app: &Arc<Mutex<App>>,
 ) -> (bool, Option<&'static str>) {
   let user_result = match cached_me {
     Some(user) => Ok(user),
     None => {
-      spotify_get_typed_compat_for_with_refresh::<PrivateUser>(
-        spotify,
-        "me",
-        &[],
-        token_cache_path,
-        app,
-      )
+      spotify_get_typed_for::<PrivateUser>(spotify, "me", &[], token_cache_path)
       .await
     }
   };
@@ -424,7 +417,6 @@ fn startup_device_decision(
 /// run it all on a background task after the UI is already up.
 #[cfg(feature = "streaming")]
 struct DeferredStreamingContext {
-  app: Arc<Mutex<App>>,
   spotify: AuthCodePkceSpotify,
   cached_me: Option<PrivateUser>,
   token_cache_path: PathBuf,
@@ -486,7 +478,7 @@ fn deferred_streaming_startup(ctx: DeferredStreamingContext) -> tokio::task::Joi
 #[cfg(feature = "streaming")]
 async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) -> Option<tokio::task::JoinHandle<()>> {
   let (supported, status_message) =
-    account_supports_native_streaming(&ctx.spotify, ctx.cached_me, &ctx.token_cache_path, &ctx.app)
+    account_supports_native_streaming(&ctx.spotify, ctx.cached_me, &ctx.token_cache_path)
       .await;
   if let Some(message) = status_message {
     let _ = ctx
@@ -622,12 +614,11 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) -> Opti
   let saved_device_id = ctx.client_config.device_id.clone();
   let mut devices_snapshot = None;
   if let Ok(devices) =
-    spotify_get_typed_compat_for_with_refresh::<rspotify::model::device::DevicePayload>(
+    spotify_get_typed_for::<rspotify::model::device::DevicePayload>(
       &ctx.spotify,
       "me/player/devices",
       &[],
       &ctx.token_cache_path,
-      &ctx.app,
     )
     .await
   {
@@ -742,7 +733,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         spotify,
         cached_me.clone(),
         &final_token_cache_path,
-        &app,
       )
       .await;
       if let Some(message) = status_message {
@@ -1129,7 +1119,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       ))
       .await;
     producer_tasks.push(deferred_streaming_startup(DeferredStreamingContext {
-      app: Arc::clone(&app),
       spotify: spotify
         .clone()
         .expect("streaming_attempted implies a Spotify session"),
