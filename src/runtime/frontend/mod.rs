@@ -329,6 +329,26 @@ impl Runtime {
           abort.abort();
         }
       }
+      #[cfg(feature = "streaming")]
+      if let Ok(crate::runtime::engine::FoldAnswer::StreamingPlayer(Some(player))) =
+        spine.query(crate::runtime::engine::FoldQuery::StreamingPlayerHandle).await
+      {
+        let playing = matches!(
+          spine
+            .query(crate::runtime::engine::FoldQuery::NativePlayerState { player: player.clone() })
+            .await,
+          Ok(crate::runtime::engine::FoldAnswer::NativePlayerState(state)) if state.current && state.desired_playing
+        );
+        if playing {
+          player.pause();
+          let _ = spine
+            .emit(crate::runtime::engine::EngineEvent::Session(
+              crate::runtime::engine::SessionFact::NativePauseMirrored,
+            ))
+            .await;
+          tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+      }
       // Emit an acked fact so the final flush is ordered in the fold event
       // stream, rather than racing a direct App lock.
       let _ = spine
