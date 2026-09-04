@@ -710,6 +710,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let spotify = boot.spotify;
   let final_token_cache_path = boot.token_cache_path;
   let restore_playback = boot.restore_playback;
+  let restore_requested = restore_playback.is_some();
   #[cfg(feature = "streaming")]
   let restore_queue = boot.restore_queue;
   let initial_shuffle_enabled = boot.initial_shuffle_enabled;
@@ -1123,7 +1124,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       device_startup_behavior,
       // A restored non-Spotify session owns the startup play/pause decision;
       // otherwise the deferred task fires it once the device is selected.
-      spotify_startup_behavior: if restore_playback.is_some() {
+      spotify_startup_behavior: if restore_requested {
         None
       } else {
         Some(initial_startup_behavior)
@@ -1148,6 +1149,15 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       client_config: client_config.clone(),
       redirect_uri: selected_redirect_uri.clone(),
       shutdown_rx: shutdown_tx.subscribe(),
+    }));
+  }
+
+  // Restore is a producer too: track it so shutdown can quiesce an in-flight
+  // source download before the fold's final persistence barrier.
+  if let Some(session) = restore_playback {
+    let restore_spine = spine_for_events.clone();
+    producer_tasks.push(tokio::spawn(async move {
+      restore_playback_session(&restore_spine, session, initial_startup_behavior).await;
     }));
   }
 
@@ -1182,21 +1192,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         ))
         .await;
     }
-    if let Some(session) = restore_playback {
-      // Resume off the event pump: a slow source (yt-dlp download, remote
-      // fetch) must not stall the Spotify startup events the UI's first render
-      // queues (user, playlists, current playback). The restore drives the
-      // source's own Spine path and never retains the fold's App owner.
-      let restore_spine = network_spine.clone();
-      tokio::spawn(async move {
-        restore_playback_session(
-          &restore_spine,
-          session,
-          initial_startup_behavior,
-        )
-        .await;
-      });
-    } else if network.spotify.is_some() {
+    if !restore_requested && network.spotify.is_some() {
       // Spotify startup play/pause only applies with a Spotify session; a
       // free-source launch has nothing to activate here. When native
       // streaming init is deferred, `deferred_streaming_startup` fires this
