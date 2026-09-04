@@ -946,7 +946,7 @@ mod in_tui {
         Err(e) => Err(format!("{e}")),
       };
       self
-        .emit_session(SessionFact::DjTurnFinished {
+        .emit_session_acked(SessionFact::DjTurnFinished {
           turn_seq: request.turn_seq,
           outcome,
           vibe_on_success: request.vibe_on_success,
@@ -1061,6 +1061,9 @@ mod in_tui {
         None,
         std::env::temp_dir().join("spotatui-dj-turn-test-cache.json"),
       );
+      let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
+      let mut network = network;
+      network.spine = Some(spine);
       (network, app)
     }
 
