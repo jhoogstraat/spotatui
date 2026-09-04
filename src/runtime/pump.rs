@@ -29,6 +29,7 @@ pub(super) async fn start_tokio(
       Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
     }
   });
+  let mut service_tasks = tokio::task::JoinSet::new();
 
   loop {
     let io_event = tokio::select! {
@@ -52,7 +53,7 @@ pub(super) async fn start_tokio(
         network.ytdlp_path.clone(),
         network.token_cache_path.clone(),
       );
-      tokio::spawn(async move {
+      service_tasks.spawn(async move {
         service_network.handle_network_event(io_event).await;
       });
       continue;
@@ -145,6 +146,8 @@ pub(super) async fn start_tokio(
       }
     }
   }
+  service_tasks.abort_all();
+  while service_tasks.join_next().await.is_some() {}
   // Do not leave a blocking bridge thread behind after the async pump exits.
   let _ = bridge_thread.join();
 }
