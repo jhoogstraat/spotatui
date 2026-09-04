@@ -96,9 +96,15 @@ pub fn spawn_streaming_recovery_handler(
 ) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
     let mut shutdown_rx = ctx.shutdown_rx.clone();
+    let player_tasks = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     tokio::select! {
       _ = shutdown_rx.changed() => {}
-      _ = handle_streaming_recovery(ctx) => {}
+      _ = handle_streaming_recovery(ctx, Arc::clone(&player_tasks)) => {}
+    }
+    let mut tasks = player_tasks.lock().await;
+    for task in tasks.drain(..) {
+      task.abort();
+      let _ = task.await;
     }
   })
 }
@@ -131,7 +137,10 @@ fn merge_recovery_requests(request: &mut StreamingRecoveryRequest, next: Streami
   }
 }
 
-async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
+async fn handle_streaming_recovery(
+  mut ctx: StreamingRecoveryContext,
+  player_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+) {
   while let Some(mut request) = ctx.recovery_rx.recv().await {
     while let Ok(next_request) = ctx.recovery_rx.try_recv() {
       merge_recovery_requests(&mut request, next_request);
@@ -224,7 +233,7 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
           }
         }
 
-        spawn_player_event_handler(PlayerEventContext {
+        let player_task = spawn_player_event_handler(PlayerEventContext {
           player: Arc::clone(&recovered_player),
           shared_position: Arc::clone(&ctx.shared_position),
           shared_is_playing: Arc::clone(&ctx.shared_is_playing),
@@ -232,6 +241,7 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
           recovery_tx: ctx.recovery_tx.clone(),
           shutdown_rx: ctx.shutdown_rx.clone(),
         });
+        player_tasks.lock().await.push(player_task);
 
         info!(
           "recovery rebuilt the backend: restore={} reselect={} continue_after={:?}",

@@ -238,6 +238,9 @@ pub enum DecodedSourceFact {
     feature = "youtube"
   ))]
   QueueSlotCleared,
+  /// Revoke queue worker I/O without changing persisted queue/session state.
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  QueueIoQuiesced,
   /// Ordered teardown of every decoded backend except `keep`. The ack carries
   /// the claimed handles so the caller can stop them without another query.
   #[cfg(any(
@@ -562,6 +565,8 @@ impl std::fmt::Debug for DecodedSourceFact {
         feature = "youtube"
       ))]
       Self::QueueSlotCleared => "QueueSlotCleared",
+      #[cfg(any(feature = "subsonic", feature = "youtube"))]
+      Self::QueueIoQuiesced => "QueueIoQuiesced",
       #[cfg(any(
         feature = "local-files",
         feature = "subsonic",

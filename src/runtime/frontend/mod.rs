@@ -334,6 +334,10 @@ impl Runtime {
       // fold performs its final persistence barrier, so no late completion can
       // resurrect state after the flush.
       let _ = shutdown_tx.send(true);
+      if let Some(task) = deadline_task.take() {
+        task.abort();
+        let _ = task.await;
+      }
       let mut producer_tasks = producer_tasks;
       if tokio::time::timeout(
         Duration::from_secs(2),
@@ -353,6 +357,12 @@ impl Runtime {
           }
         }
       }
+      #[cfg(any(feature = "subsonic", feature = "youtube"))]
+      let _ = spine
+        .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+          crate::runtime::engine::DecodedSourceFact::QueueIoQuiesced,
+        ))
+        .await;
       #[cfg(feature = "streaming")]
       if let Ok(crate::runtime::engine::FoldAnswer::StreamingPlayer(Some(player))) =
         spine.query(crate::runtime::engine::FoldQuery::StreamingPlayerHandle).await
@@ -392,7 +402,6 @@ impl Runtime {
       // Closing the ingress spine after the flush lets the fold observe EOF;
       // joining it makes shutdown ordering deterministic.
       drop(spine);
-      if let Some(task) = deadline_task.take() { task.abort(); let _ = task.await; }
       if let Some(task) = fold_task.take() { let _ = task.await; }
     });
     Ok(())
@@ -1771,6 +1780,13 @@ pub(crate) fn apply_decoded_source_fact(
         }
         #[cfg(not(any(feature = "subsonic", feature = "youtube")))]
         let _ = slot;
+      }
+    }
+    #[cfg(any(feature = "subsonic", feature = "youtube"))]
+    DecodedSourceFact::QueueIoQuiesced => {
+      if let Some(crate::infra::queue::QueueNowPlaying::Decoded(decoded)) = app.queue_now.as_ref() {
+        decoded.lease.revoke();
+        decoded.player.stop();
       }
     }
     #[cfg(any(
@@ -4994,6 +5010,48 @@ mod tests {
     )
     .expect("acked claim returns a decision");
     assert!(ack.queue_fetch_claim.is_none());
+  }
+
+  #[cfg(any(feature = "subsonic", feature = "youtube"))]
+  #[test]
+  fn queue_io_quiesce_revokes_worker_without_dropping_persisted_slot() {
+    use crate::infra::audio::LocalPlayer;
+    use crate::infra::queue::{DecodedQueuePlayback, QueueNowPlaying};
+
+    let lease = std::sync::Arc::new(crate::runtime::engine::QueueFetchLease::new());
+    let player = std::sync::Arc::new(LocalPlayer::silent_for_test());
+    let mut app = App::default();
+    app.queue_now = Some(QueueNowPlaying::Decoded(DecodedQueuePlayback {
+      player: std::sync::Arc::clone(&player),
+      track: crate::core::plugin_api::TrackInfo {
+        uri: Some("subsonic:track:shutdown".to_string()),
+        name: "Shutdown".to_string(),
+        artists: Vec::new(),
+        album: String::new(),
+        duration_ms: 0,
+        id: None,
+        album_id: None,
+        artist_refs: Vec::new(),
+        is_playable: true,
+        is_local: false,
+        track_number: 0,
+        explicit: false,
+        image_url: None,
+      },
+      advancing: true,
+      fetch_id: 18,
+      lease: std::sync::Arc::clone(&lease),
+      tempfile: None,
+    }));
+
+    apply_decoded_source_fact(
+      &mut app,
+      crate::runtime::engine::DecodedSourceFact::QueueIoQuiesced,
+    );
+
+    assert!(app.queue_now.is_some());
+    assert!(lease.with_valid(|| ()).is_none());
+    assert!(player.is_finished());
   }
 
   #[cfg(any(feature = "subsonic", feature = "youtube"))]
