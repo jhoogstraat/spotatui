@@ -1,6 +1,6 @@
 //! The engine's event spine and command vocabulary (ADR 0016, stage 2).
 //!
-//! The tick loop is gone. Every runtime mutation now travels one path:
+//! Runtime mutations travel one ordered path:
 //!
 //! ```text
 //! producer (apply arms, streaming player events, Web API results,
@@ -35,7 +35,7 @@ use crate::core::streaming::StreamingStateEvent;
 ///
 /// Deliberately small in this ticket: playback/collection lifecycle changes
 /// are latched by the fold task as "state moved" pokes that trigger a snapshot
-/// rebuild, mirroring today's change-bell but with real typing and no lock
+/// rebuild, with real typing and no lock
 /// convoy. Later stages replace the coarse pokes with payload-carrying events
 /// as each domain extracts (tickets 08–11).
 #[derive(Debug)]
