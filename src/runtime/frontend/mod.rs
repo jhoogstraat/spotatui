@@ -3247,6 +3247,10 @@ pub(crate) fn answer_query(
     FoldQuery::QueueDecodedPlayer => {
       FoldAnswer::QueueDecodedPlayer(app.queue_now_decoded_player().map(std::sync::Arc::clone))
     }
+    #[cfg(feature = "streaming")]
+    FoldQuery::QueueSlotActive => FoldAnswer::Bool(app.queue_owns_playback()),
+    #[cfg(feature = "streaming")]
+    FoldQuery::QueueSlotGeneration => FoldAnswer::U64(app.queue_slot_generation),
     #[cfg(feature = "dj-core")]
     FoldQuery::DjGeneration => FoldAnswer::U64(app.dj.generation),
     FoldQuery::AnnouncementSources { seen_ids } => FoldAnswer::AnnouncementSources {

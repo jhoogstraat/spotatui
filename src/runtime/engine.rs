@@ -1319,6 +1319,12 @@ pub enum FoldQuery {
   /// Snapshot the decoded queue player without changing ownership.
   #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
   QueueDecodedPlayer,
+  /// Whether the native queue slot currently owns playback.
+  #[cfg(feature = "streaming")]
+  QueueSlotActive,
+  /// Generation stamp for the current native queue slot.
+  #[cfg(feature = "streaming")]
+  QueueSlotGeneration,
   /// Was this library request superseded before it even fetched? The
   /// detached prefetch workers check their generation against the fold's
   /// (the old `app.saved_tracks_prefetch_generation == generation` read).
