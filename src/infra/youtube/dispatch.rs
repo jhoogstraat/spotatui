@@ -27,10 +27,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tempfile::NamedTempFile;
-use tokio::sync::Mutex;
 
 use super::{is_youtube_uri, video_id_from_uri, YouTubePlaybackState, YouTubeSource};
+#[cfg(test)]
 use crate::core::app::App;
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Mutex;
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
@@ -152,8 +155,7 @@ async fn route_youtube_event_impl(spine: &Spine, event: &IoEvent) -> bool {
 }
 
 /// Production routing receives only the immutable producer spine.
-#[cfg(not(test))]
-pub async fn route_youtube_event(spine: &Spine, event: &IoEvent) -> bool {
+pub async fn route_youtube_event_spine(spine: &Spine, event: &IoEvent) -> bool {
   route_youtube_event_impl(spine, event).await
 }
 
@@ -167,6 +169,13 @@ pub async fn route_youtube_event(
     return false;
   };
   route_youtube_event_impl(&spine, event).await
+}
+
+/// Legacy source-construction helper for queue tests and the decoded queue
+/// router. Runtime workers use the fold's `YouTubeConfig` query instead.
+pub(crate) async fn build_source(app: &Arc<Mutex<crate::core::app::App>>) -> YouTubeSource {
+  let ytdlp_path = app.lock().await.user_config.behavior.ytdlp_path.clone();
+  YouTubeSource::new(ytdlp_path)
 }
 
 async fn youtube_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
@@ -198,15 +207,6 @@ async fn emit(spine: &Spine, fact: Fact) {
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
-
-/// Build a [`YouTubeSource`] from the user config (`behavior.ytdlp_path`
-/// override, else `yt-dlp` on `$PATH`). Unlike Subsonic there is nothing that
-/// can be "unconfigured" — a missing binary surfaces as an actionable error
-/// from the first search instead.
-pub(crate) async fn build_source(app: &Arc<Mutex<App>>) -> YouTubeSource {
-  let ytdlp_path = app.lock().await.user_config.behavior.ytdlp_path.clone();
-  YouTubeSource::new(ytdlp_path)
-}
 
 /// Run a YouTube search and populate `app.search_results`. Like the Subsonic
 /// M2 search, only the songs block is populated — each row is a video; Enter
@@ -849,14 +849,6 @@ async fn set_error_spine(spine: &crate::runtime::engine::Spine, message: String)
       },
     ))
     .await;
-}
-
-async fn set_error(app: &Arc<Mutex<App>>, message: String) {
-  if let Some(spine) = playback_spine(app).await {
-    set_error_spine(&spine, message).await;
-  } else {
-    log::warn!("YouTube operation failed without an engine spine: {message}");
-  }
 }
 
 async fn set_status(

@@ -110,7 +110,7 @@ pub(super) async fn start_tokio(
         && !handled_subsonic
         && !handled_radio
         && if let Some(spine) = network.spine.as_ref() {
-          crate::infra::youtube::dispatch::route_youtube_event(spine, &io_event).await
+          crate::infra::youtube::dispatch::route_youtube_event_spine(spine, &io_event).await
         } else {
           false
         };

@@ -1432,8 +1432,8 @@ async fn restore_playback_session(
         return;
       }
       app.lock().await.track_table.tracks = tracks;
-      crate::infra::youtube::dispatch::route_youtube_event(
-        app,
+      crate::infra::youtube::dispatch::route_youtube_event_spine(
+        spine,
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
