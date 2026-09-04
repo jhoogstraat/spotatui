@@ -55,8 +55,10 @@ pub(super) async fn start_tokio(
       // the queue slot's transport controls, and relinquishes the slot on an
       // unrelated `StartPlayback` (returning false so the per-source
       // teardowns/starts still run). Compiled unconditionally.
-      let handled_queue =
-        crate::infra::queue::dispatch::route_queue_event(&network.app, &io_event).await;
+      let handled_queue = match network.spine.as_ref() {
+        Some(spine) => crate::infra::queue::dispatch::route_queue_event(spine, &io_event).await,
+        None => false,
+      };
       // Local-file playback is intercepted before the Spotify network so the
       // network stays Spotify-only (see infra::local::dispatch).
       #[cfg(feature = "local-files")]
