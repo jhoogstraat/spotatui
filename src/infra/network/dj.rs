@@ -566,7 +566,7 @@ impl Network {
     #[cfg(feature = "youtube")]
     {
       Some(resolve::YouTubeResolver::from_path(
-        self.client_config.ytdlp_path.clone(),
+        self.ytdlp_path.clone(),
       ))
     }
     #[cfg(not(feature = "youtube"))]
