@@ -298,14 +298,13 @@ mod tests {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
-    let app = Arc::new(Mutex::new(App::default()));
-    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let _app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&_app).await;
 
     let server = tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
       serve_connection(
         stream,
-        app,
         io_tx,
         spine,
         "correct-token".to_string(),
@@ -332,14 +331,13 @@ mod tests {
     let port = listener.local_addr().unwrap().port();
     // Keep the receiver alive so app-only calls are not reported as shut down.
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
-    let app = Arc::new(Mutex::new(App::default()));
-    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let _app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&_app).await;
 
     tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
       let _ = serve_connection(
         stream,
-        app,
         io_tx,
         spine,
         "correct-token".to_string(),
@@ -389,8 +387,8 @@ mod tests {
     unsafe { std::env::set_var(HANDSHAKE_PATH_ENV, &path) };
 
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
-    let app = Arc::new(Mutex::new(App::default()));
-    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let _app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&_app).await;
     let port = spawn_listener(io_tx, spine)
       .await
       .expect("listener should bind");
@@ -433,7 +431,6 @@ mod tests {
       let (stream, _) = listener.accept().await.unwrap();
       serve_connection(
         stream,
-        app,
         io_tx,
         spine,
         "t".to_string(),
@@ -462,14 +459,13 @@ mod tests {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
-    let app = Arc::new(Mutex::new(App::default()));
-    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&app).await;
+    let _app = Arc::new(Mutex::new(App::default()));
+    let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&_app).await;
 
     let server = tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
       serve_connection(
         stream,
-        app,
         io_tx,
         spine,
         "t".to_string(),

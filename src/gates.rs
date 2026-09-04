@@ -42,6 +42,16 @@ fn read_source(path: &Path) -> String {
   fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
 }
 
+/// Return the production half of a module for structural ownership checks.
+/// Repository test modules are conventionally a single tail item gated by
+/// `#[cfg(test)]`; compatibility fixtures may keep App handles there without
+/// weakening the runtime ownership boundary.
+fn production_source(source: &str) -> &str {
+  source
+    .find("#[cfg(test)]")
+    .map_or(source, |end| &source[..end])
+}
+
 /// Sums non-overlapping occurrences of `needle` across every `.rs` file under
 /// `dirs` (recursive) plus the standalone `files`.
 fn count_occurrences(dirs: &[&str], files: &[&str], needle: &str) -> usize {
@@ -300,6 +310,32 @@ fn ratchet_counters_match_the_checked_in_baselines() {
     ));
   }
   assert!(report.is_empty(), "\nratchet violations:\n{report}");
+}
+
+#[test]
+fn production_has_no_app_mutex_handles() {
+  let root = repo_root();
+  let mut files = Vec::new();
+  collect_rs_files(&root.join("src"), &mut files);
+  let forbidden = ["Arc<Mutex<App", "Arc<tokio::sync::Mutex<App", "Mutex<App>"];
+  let mut violations = Vec::new();
+  for path in files {
+    if path == root.join("src").join("gates.rs") {
+      continue;
+    }
+    let source = read_source(&path);
+    let production = production_source(&source);
+    for needle in forbidden {
+      if production.contains(needle) {
+        violations.push(format!("{} contains {needle}", path.display()));
+      }
+    }
+  }
+  assert!(
+    violations.is_empty(),
+    "production App mutex handles are forbidden; test-only fixtures must be cfg(test):\n{}",
+    violations.join("\n")
+  );
 }
 
 #[test]
