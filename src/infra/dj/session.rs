@@ -18,14 +18,11 @@ use super::brain::{
 };
 use super::brief::{self, TasteBrief};
 use super::{DjLine, DjSpeaker};
-use crate::core::app::App;
 use crate::core::user_config::BehaviorConfig;
 use crate::infra::history::RecapPeriod;
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Environment variable that wins over `behavior.dj_api_key` at request time.
 ///
@@ -283,24 +280,7 @@ fn resolve_agent_command(behavior: &BehaviorConfig) -> (Vec<String>, PromptDeliv
   )
 }
 
-/// Build the taste brief, off the async runtime and off the `App` lock.
-pub async fn build_taste_brief(app: &Arc<Mutex<App>>, period: RecapPeriod) -> Result<TasteBrief> {
-  // `load_listens` is blocking and reads the whole (unbounded, append-only) file.
-  let listens = tokio::task::spawn_blocking(crate::infra::history::load_listens)
-    .await
-    .map_err(|e| anyhow!("listening-history task failed: {e}"))?
-    .map_err(|e| anyhow!("could not read listening history: {e}"))?;
-
-  let mut summary = brief::build_brief(&listens, period);
-  {
-    let app = app.lock().await;
-    summary.now_playing = super::current_track_label(&app);
-    summary.vibe = app.dj.vibe.clone();
-  }
-  Ok(summary)
-}
-
-/// Everything a brain call needs, snapshotted off the `App` lock.
+/// Everything a brain call needs, snapshotted from fold-owned inputs.
 pub struct TurnContext {
   pub brief: TasteBrief,
   pub history: Vec<(String, String)>,
@@ -327,7 +307,7 @@ const HISTORY_LINES: usize = 24;
 
 /// Turn the transcript into `(speaker, text)` pairs for the brain, oldest last.
 ///
-/// Pure and separate from [`turn_context`] so the mapping is unit-testable: the
+/// Pure and separate from [`turn_context_from_fold`] so the mapping is unit-testable: the
 /// async path pulls in the taste brief, which reads the user's real listening
 /// history file.
 ///
@@ -355,32 +335,6 @@ fn history_from_transcript(transcript: &[DjLine], extra: Option<&str>) -> Vec<(S
     history.push(("Listener".to_string(), line.to_string()));
   }
   history
-}
-
-/// Snapshot the conversation and settings for one turn.
-pub async fn turn_context(
-  app: &Arc<Mutex<App>>,
-  extra_instruction: Option<&str>,
-) -> Result<TurnContext> {
-  let (period, want, history, avoid_library) = {
-    let app = app.lock().await;
-    let behavior = &app.user_config.behavior;
-    (
-      period_from_config(&behavior.dj_history_period),
-      behavior.dj_batch_size,
-      history_from_transcript(&app.dj.transcript, extra_instruction),
-      // The live toggle, not the config default: the config only seeds it.
-      app.dj.avoid_library,
-    )
-  };
-
-  let brief = build_taste_brief(app, period).await?;
-  Ok(TurnContext {
-    brief,
-    history,
-    want,
-    avoid_library,
-  })
 }
 
 /// Build one DJ turn context from fold-owned immutable inputs. Workers use this
