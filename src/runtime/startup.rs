@@ -1252,7 +1252,7 @@ async fn restore_controls(
   paused: bool,
   startup_behavior: StartupBehavior,
   shuffle_on: bool,
-  repeat: rspotify::model::enums::RepeatState,
+  repeat: crate::infra::queue::RepeatMode,
 ) {
   let active = matches!(
     spine.query(crate::runtime::engine::FoldQuery::MediaSnapshot).await,
@@ -1262,9 +1262,9 @@ async fn restore_controls(
     return;
   }
   let repeat = match repeat {
-    rspotify::model::enums::RepeatState::Off => RepeatSetting::Off,
-    rspotify::model::enums::RepeatState::Track => RepeatSetting::Track,
-    rspotify::model::enums::RepeatState::Context => RepeatSetting::Context,
+    crate::infra::queue::RepeatMode::Off => RepeatSetting::Off,
+    crate::infra::queue::RepeatMode::Track => RepeatSetting::Track,
+    crate::infra::queue::RepeatMode::Context => RepeatSetting::Context,
   };
   let _ = spine
     .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(

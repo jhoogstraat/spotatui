@@ -31,7 +31,6 @@ use tempfile::NamedTempFile;
 use super::{is_youtube_uri, video_id_from_uri, YouTubePlaybackState, YouTubeSource};
 #[cfg(test)]
 use crate::core::app::App;
-use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Mutex;
 use crate::core::catalog::CatalogStateEvent;

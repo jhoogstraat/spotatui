@@ -660,6 +660,7 @@ mod tests {
   // Batch 2 removed App/Arc/Mutex from the parent's imports; the tests still
   // build an App directly (they drive the spine without a full boot).
   use crate::core::app::App;
+  use crate::infra::history::RecapPeriod;
   use std::sync::Arc;
   use tokio::sync::Mutex;
 
@@ -937,7 +938,8 @@ mod tests {
     // A default `App` has no playback context and no native track, so the
     // snapshot is `None` — the branch that used to drop `is_live`.
     let app = Arc::new(Mutex::new(App::default()));
-    let outcome = execute_app_only(&app, &DjToolCall::GetNowPlaying)
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
+    let outcome = execute_app_only(&spine, &DjToolCall::GetNowPlaying)
       .await
       .expect("get_now_playing is answered without the network");
     let data = outcome
@@ -955,8 +957,9 @@ mod tests {
   #[tokio::test]
   async fn setting_a_vibe_says_whether_anything_will_act_on_it() {
     let app = Arc::new(Mutex::new(App::default()));
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
     let outcome = execute_app_only(
-      &app,
+      &spine,
       &DjToolCall::SetDjVibe {
         vibe: Some("mellow instrumental".into()),
       },
@@ -997,7 +1000,8 @@ mod tests {
   async fn clearing_a_vibe_stays_terse() {
     // Nothing was set, so there is no expectation to correct.
     let app = Arc::new(Mutex::new(App::default()));
-    let outcome = execute_app_only(&app, &DjToolCall::SetDjVibe { vibe: None })
+    let (spine, _) = crate::runtime::frontend::spawn_fold(&app).await;
+    let outcome = execute_app_only(&spine, &DjToolCall::SetDjVibe { vibe: None })
       .await
       .unwrap();
     assert_eq!(outcome.text, "DJ vibe cleared");
