@@ -3364,7 +3364,8 @@ mod tests {
     let mut network = Network::new(
       None,
       ClientConfig::new(),
-      &app,
+      None,
+      None,
       std::env::temp_dir().join("spotatui_resume_context_test.json"),
     );
     network.spine = Some(spine);
