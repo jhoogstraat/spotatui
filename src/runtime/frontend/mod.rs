@@ -4256,7 +4256,12 @@ mod tests {
     ));
     snapshots.changed().await.unwrap();
     assert!(snapshots.borrow().spotify_connected);
-    drop(spine);
+    spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Session(
+        crate::runtime::engine::SessionFact::FlushPersistence,
+      ))
+      .await
+      .expect("flush should stop the owned fold");
     task.await.unwrap();
   }
 
