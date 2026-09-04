@@ -11,6 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::infra::network::IoEvent;
+#[cfg(any(feature = "subsonic", feature = "youtube"))]
+use anyhow::anyhow;
 
 #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
 use crate::infra::audio::LocalPlayer;
@@ -32,78 +34,6 @@ pub trait QueueRuntime {
 /// Route one IoEvent through the queue domain before source dispatchers.
 pub async fn route_queue_event<R: QueueRuntime + ?Sized>(runtime: &R, event: &IoEvent) -> bool {
   runtime.route_queue_event(event).await
-}
-
-#[cfg(feature = "local-files")]
-async fn play_local_queue(spine: &crate::runtime::engine::Spine) -> bool {
-  let track = match spine
-    .query(crate::runtime::engine::FoldQuery::QueueTracks)
-    .await
-  {
-    Ok(crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks)) => tracks.drain(..).next(),
-    _ => None,
-  };
-  let Some(track) = track else { return true };
-  let Some(uri) = track.uri.clone() else {
-    let _ = spine
-      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-        crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped { track },
-      ))
-      .await;
-    return true;
-  };
-  if crate::core::queue::queue_item_source(&uri) != crate::core::queue::QueueItemSource::LocalFile {
-    return false;
-  }
-  let _ = spine
-    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-      crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
-        track: track.clone(),
-      },
-    ))
-    .await;
-  let player = spine
-    .query(crate::runtime::engine::FoldQuery::QueueDecodedPlayer)
-    .await
-    .ok()
-    .and_then(|answer| match answer {
-      crate::runtime::engine::FoldAnswer::QueueDecodedPlayer(player) => player,
-      _ => None,
-    });
-  let player = match player {
-    Some(player) => player,
-    None => match tokio::task::spawn_blocking(LocalPlayer::new).await {
-      Ok(Ok(player)) => Arc::new(player),
-      _ => return true,
-    },
-  };
-  let fetch_id = QUEUE_FETCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-  let _ = spine
-    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-      crate::runtime::engine::DecodedSourceFact::QueuePendingDecoded {
-        player: Arc::clone(&player),
-        track,
-        fetch_id,
-      },
-    ))
-    .await;
-  if crate::infra::local::dispatch::play_single_file(&player, &uri)
-    .await
-    .is_ok()
-  {
-    let _ = spine
-      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-        crate::runtime::engine::DecodedSourceFact::QueueDecodedLocalReady { fetch_id },
-      ))
-      .await;
-  } else {
-    let _ = spine
-      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-        crate::runtime::engine::DecodedSourceFact::QueuePlaybackCleared,
-      ))
-      .await;
-  }
-  true
 }
 
 /// Engine-spine implementation. The query is deliberately performed before
@@ -166,209 +96,14 @@ impl QueueRuntime for crate::runtime::engine::Spine {
       // crosses this seam; if no queue slot owns the device, normal source
       // routing remains responsible for the event.
       match event {
-        #[cfg(all(
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
           feature = "subsonic",
-          not(feature = "streaming"),
-          not(feature = "local-files")
+          feature = "youtube"
         ))]
         IoEvent::AdvanceNativeQueue | IoEvent::NextTrack => {
-          play_downloaded_queue(self, false).await
-        }
-        #[cfg(all(
-          feature = "youtube",
-          not(feature = "streaming"),
-          not(feature = "local-files")
-        ))]
-        IoEvent::AdvanceNativeQueue | IoEvent::NextTrack => play_downloaded_queue(self, true).await,
-        #[cfg(all(feature = "local-files", not(feature = "streaming")))]
-        IoEvent::AdvanceNativeQueue | IoEvent::NextTrack => {
-          let track = match self
-            .query(crate::runtime::engine::FoldQuery::QueueTracks)
-            .await
-          {
-            Ok(crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks)) => {
-              tracks.drain(..).next()
-            }
-            _ => None,
-          };
-          let Some(track) = track else { return true };
-          let Some(uri) = track.uri.clone() else {
-            let _ = self
-              .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-                crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
-                  track: track.clone(),
-                },
-              ))
-              .await;
-            return true;
-          };
-          if crate::core::queue::queue_item_source(&uri)
-            != crate::core::queue::QueueItemSource::LocalFile
-          {
-            return true;
-          }
-          self
-            .emit(crate::runtime::engine::EngineEvent::Decoded(
-              crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
-                track: track.clone(),
-              },
-            ))
-            .await;
-          let player = self
-            .query(crate::runtime::engine::FoldQuery::QueueDecodedPlayer)
-            .await
-            .ok()
-            .and_then(|answer| match answer {
-              crate::runtime::engine::FoldAnswer::QueueDecodedPlayer(player) => player,
-              _ => None,
-            });
-          let player = match player {
-            Some(player) => Some(player),
-            None => tokio::task::spawn_blocking(LocalPlayer::new)
-              .await
-              .ok()
-              .and_then(Result::ok)
-              .map(Arc::new),
-          };
-          let Some(player) = player else { return true };
-          if let Ok(crate::runtime::engine::FoldAnswer::Decoded(
-            crate::runtime::engine::DecodedSourceAnswer::Volume(volume),
-          )) = self
-            .query(crate::runtime::engine::FoldQuery::Decoded(
-              crate::runtime::engine::DecodedSourceQuery::Volume,
-            ))
-            .await
-          {
-            player.set_volume(volume as f32 / 100.0);
-          }
-          let fetch_id = QUEUE_FETCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-          let _ = self
-            .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-              crate::runtime::engine::DecodedSourceFact::QueuePendingDecoded {
-                player: Arc::clone(&player),
-                track: track.clone(),
-                fetch_id,
-              },
-            ))
-            .await;
-          if crate::infra::local::dispatch::play_single_file(&player, &uri)
-            .await
-            .is_ok()
-          {
-            let _ = self
-              .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-                crate::runtime::engine::DecodedSourceFact::QueueDecodedLocalReady { fetch_id },
-              ))
-              .await;
-          } else {
-            let _ = self
-              .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-                crate::runtime::engine::DecodedSourceFact::QueuePlaybackCleared,
-              ))
-              .await;
-          }
-          true
-        }
-        #[cfg(feature = "streaming")]
-        IoEvent::AdvanceNativeQueue | IoEvent::NextTrack => {
-          // In an all-feature build the native queue can contain every
-          // queueable source. Dispatch by URI before the Spotify fast path;
-          // otherwise this arm would consume decoded entries and report them
-          // as unavailable.
-          let source = self
-            .query(crate::runtime::engine::FoldQuery::QueueTracks)
-            .await
-            .ok()
-            .and_then(|answer| match answer {
-              crate::runtime::engine::FoldAnswer::QueueTracks(tracks) => tracks
-                .first()
-                .and_then(|track| track.uri.as_deref())
-                .map(crate::core::queue::queue_item_source),
-              _ => None,
-            });
-          #[cfg(feature = "local-files")]
-          if source == Some(crate::core::queue::QueueItemSource::LocalFile) {
-            return play_local_queue(self).await;
-          }
-          #[cfg(feature = "subsonic")]
-          if source == Some(crate::core::queue::QueueItemSource::Subsonic) {
-            let spine = self.clone();
-            tokio::spawn(async move {
-              play_downloaded_queue(&spine, false).await;
-            });
-            return true;
-          }
-          #[cfg(feature = "youtube")]
-          if source == Some(crate::core::queue::QueueItemSource::YouTube) {
-            let spine = self.clone();
-            tokio::spawn(async move {
-              play_downloaded_queue(&spine, true).await;
-            });
-            return true;
-          }
-          let track = match self
-            .query(crate::runtime::engine::FoldQuery::QueueTracks)
-            .await
-          {
-            Ok(crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks)) => {
-              tracks.drain(..).next()
-            }
-            _ => None,
-          };
-          let Some(track) = track else {
-            resume_suspended(self).await;
-            return true;
-          };
-          let Some(uri) = track.uri.clone() else {
-            let _ = self
-              .emit_acked(crate::runtime::engine::EngineEvent::Session(
-                crate::runtime::engine::SessionFact::TransientStatus {
-                  message: "Skipped a queued track with no URI".to_string(),
-                  ttl_secs: 4,
-                },
-              ))
-              .await;
-            return true;
-          };
-          let popped = self
-            .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-              crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
-                track: track.clone(),
-              },
-            ))
-            .await
-            .and_then(|ack| ack.queue_track);
-          let Some(track) = popped else {
-            return true;
-          };
-          if crate::core::queue::queue_item_source(&uri)
-            != crate::core::queue::QueueItemSource::Spotify
-          {
-            let _ = self
-              .emit_acked(crate::runtime::engine::EngineEvent::Session(
-                crate::runtime::engine::SessionFact::TransientStatus {
-                  message: "Queued source isn't available in this build".to_string(),
-                  ttl_secs: 4,
-                },
-              ))
-              .await;
-            return true;
-          }
-          let Ok(crate::runtime::engine::FoldAnswer::StreamingPlayer(Some(player))) = self
-            .query(crate::runtime::engine::FoldQuery::StreamingPlayerHandle)
-            .await
-          else {
-            return true;
-          };
-          player.activate();
-          if player.play_uri(&uri).await.is_ok() {
-            let _ = self
-              .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-                crate::runtime::engine::DecodedSourceFact::QueueSpotifyPublished(track),
-              ))
-              .await;
-          }
-          true
+          advance_queue(self, matches!(event, IoEvent::NextTrack)).await
         }
         #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
         IoEvent::PausePlayback
@@ -597,22 +332,207 @@ async fn resume_suspended(spine: &crate::runtime::engine::Spine) {
   let _ = tx.send(event);
 }
 
-#[cfg(any(feature = "subsonic", feature = "youtube"))]
-async fn play_downloaded_queue(spine: &crate::runtime::engine::Spine, youtube: bool) -> bool {
-  let track = match spine
+#[cfg(any(
+  feature = "streaming",
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube"
+))]
+async fn queue_status(spine: &crate::runtime::engine::Spine, message: &str) {
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Session(
+      crate::runtime::engine::SessionFact::TransientStatus {
+        message: message.to_string(),
+        ttl_secs: 4,
+      },
+    ))
+    .await;
+}
+
+/// Atomically claim the queue head before doing any source I/O. This is the
+/// linearization point for queue workers: a second Advance cannot start a
+/// duplicate download, and a stale/mismatched producer cannot consume a later
+/// item.
+#[cfg(any(
+  feature = "streaming",
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube"
+))]
+async fn claim_queue_head(
+  spine: &crate::runtime::engine::Spine,
+) -> Option<crate::core::plugin_api::TrackInfo> {
+  let head = match spine
     .query(crate::runtime::engine::FoldQuery::QueueTracks)
     .await
+    .ok()?
   {
-    Ok(crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks)) => tracks.drain(..).next(),
+    crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks) => tracks.drain(..).next(),
     _ => None,
-  };
-  let Some(track) = track else { return true };
-  let Some(uri) = track.uri.clone() else {
+  }?;
+  spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped { track: head },
+    ))
+    .await
+    .and_then(|ack| ack.queue_track)
+}
+
+#[cfg(any(
+  feature = "streaming",
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube"
+))]
+async fn advance_queue(spine: &crate::runtime::engine::Spine, explicit_next: bool) -> bool {
+  if explicit_next {
+    let has_upcoming = matches!(
+      spine.query(crate::runtime::engine::FoldQuery::QueueTracks).await,
+      Ok(crate::runtime::engine::FoldAnswer::QueueTracks(ref tracks)) if !tracks.is_empty()
+    );
+    if !has_upcoming {
+      let mut has_slot = false;
+      #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
+      {
+        has_slot = spine
+          .query(crate::runtime::engine::FoldQuery::QueueDecodedPlayer)
+          .await
+          .ok()
+          .is_some_and(|answer| {
+            matches!(
+              answer,
+              crate::runtime::engine::FoldAnswer::QueueDecodedPlayer(Some(_))
+            )
+          });
+      }
+      #[cfg(feature = "streaming")]
+      {
+        has_slot |= matches!(
+          spine
+            .query(crate::runtime::engine::FoldQuery::QueueSlotActive)
+            .await,
+          Ok(crate::runtime::engine::FoldAnswer::Bool(true))
+        );
+      }
+      if !has_slot {
+        return false;
+      }
+    }
+  }
+  let Some(track) = claim_queue_head(spine).await else {
     let _ = spine
       .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-        crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped { track },
+        crate::runtime::engine::DecodedSourceFact::QueueSlotCleared,
       ))
       .await;
+    resume_suspended(spine).await;
+    return true;
+  };
+  let Some(uri) = track.uri.clone() else {
+    queue_status(spine, "Skipped a queued track with no URI").await;
+    return true;
+  };
+  match crate::core::queue::queue_item_source(&uri) {
+    #[cfg(feature = "local-files")]
+    crate::core::queue::QueueItemSource::LocalFile => play_local_claimed(spine, track, uri).await,
+    #[cfg(feature = "subsonic")]
+    crate::core::queue::QueueItemSource::Subsonic => {
+      start_downloaded_queue(spine, track, false).await
+    }
+    #[cfg(feature = "youtube")]
+    crate::core::queue::QueueItemSource::YouTube => {
+      start_downloaded_queue(spine, track, true).await
+    }
+    #[cfg(feature = "streaming")]
+    crate::core::queue::QueueItemSource::Spotify => play_spotify_claimed(spine, track, uri).await,
+    _ => {
+      queue_status(spine, "Queued source isn't available in this build").await;
+      true
+    }
+  }
+}
+
+#[cfg(feature = "local-files")]
+async fn play_local_claimed(
+  spine: &crate::runtime::engine::Spine,
+  track: crate::core::plugin_api::TrackInfo,
+  uri: String,
+) -> bool {
+  let player = spine
+    .query(crate::runtime::engine::FoldQuery::QueueDecodedPlayer)
+    .await
+    .ok()
+    .and_then(|answer| match answer {
+      crate::runtime::engine::FoldAnswer::QueueDecodedPlayer(player) => player,
+      _ => None,
+    })
+    .or_else(|| None);
+  let player = match player {
+    Some(player) => player,
+    None => match tokio::task::spawn_blocking(LocalPlayer::new).await {
+      Ok(Ok(player)) => Arc::new(player),
+      _ => return true,
+    },
+  };
+  let fetch_id = QUEUE_FETCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  let _ = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::QueuePendingDecoded {
+        player: Arc::clone(&player),
+        track,
+        fetch_id,
+      },
+    ))
+    .await;
+  if crate::infra::local::dispatch::play_single_file(&player, &uri)
+    .await
+    .is_ok()
+  {
+    let _ = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueueDecodedLocalReady { fetch_id },
+      ))
+      .await;
+  } else {
+    let _ = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueuePlaybackCleared,
+      ))
+      .await;
+  }
+  true
+}
+
+#[cfg(feature = "streaming")]
+async fn play_spotify_claimed(
+  spine: &crate::runtime::engine::Spine,
+  track: crate::core::plugin_api::TrackInfo,
+  uri: String,
+) -> bool {
+  let Ok(crate::runtime::engine::FoldAnswer::StreamingPlayer(Some(player))) = spine
+    .query(crate::runtime::engine::FoldQuery::StreamingPlayerHandle)
+    .await
+  else {
+    return true;
+  };
+  player.activate();
+  if player.play_uri(&uri).await.is_ok() {
+    let _ = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueueSpotifyPublished(track),
+      ))
+      .await;
+  }
+  true
+}
+
+#[cfg(any(feature = "subsonic", feature = "youtube"))]
+async fn start_downloaded_queue(
+  spine: &crate::runtime::engine::Spine,
+  track: crate::core::plugin_api::TrackInfo,
+  youtube: bool,
+) -> bool {
+  let Some(uri) = track.uri.clone() else {
     return true;
   };
   let expected = if youtube {
@@ -621,15 +541,11 @@ async fn play_downloaded_queue(spine: &crate::runtime::engine::Spine, youtube: b
     crate::core::queue::QueueItemSource::Subsonic
   };
   if crate::core::queue::queue_item_source(&uri) != expected {
+    queue_status(spine, "Queued source isn't available in this build").await;
     return true;
   }
-  spine
-    .emit(crate::runtime::engine::EngineEvent::Decoded(
-      crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
-        track: track.clone(),
-      },
-    ))
-    .await;
+  // Reuse the suspended source sink where available. Pausing it before the
+  // pending fact prevents two players from writing the same output device.
   let player = spine
     .query(crate::runtime::engine::FoldQuery::QueueDecodedPlayer)
     .await
@@ -638,61 +554,121 @@ async fn play_downloaded_queue(spine: &crate::runtime::engine::Spine, youtube: b
       crate::runtime::engine::FoldAnswer::QueueDecodedPlayer(player) => player,
       _ => None,
     });
-  let player = match player {
-    Some(player) => Some(player),
-    None => tokio::task::spawn_blocking(LocalPlayer::new)
-      .await
-      .ok()
-      .and_then(Result::ok)
-      .map(Arc::new),
-  };
-  let Some(player) = player else { return true };
-  let fetch_id = QUEUE_FETCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-  spine
-    .emit(crate::runtime::engine::EngineEvent::Decoded(
-      crate::runtime::engine::DecodedSourceFact::QueuePendingDecoded {
-        player,
-        track,
-        fetch_id,
-      },
-    ))
-    .await;
-  let result = if youtube {
+  let player = if player.is_some() {
+    player
+  } else if youtube {
     #[cfg(feature = "youtube")]
     {
-      let path = match spine
+      spine
         .query(crate::runtime::engine::FoldQuery::Decoded(
-          crate::runtime::engine::DecodedSourceQuery::YouTubeConfig,
+          crate::runtime::engine::DecodedSourceQuery::YouTubePlayer,
         ))
         .await
         .ok()
-      {
-        Some(crate::runtime::engine::FoldAnswer::Decoded(
-          crate::runtime::engine::DecodedSourceAnswer::YouTubeConfig(path),
-        )) => path,
-        _ => None,
-      };
-      let source = crate::infra::youtube::YouTubeSource::new(path);
-      crate::infra::youtube::dispatch::download_for_queue(&source, &uri).await
+        .and_then(|answer| match answer {
+          crate::runtime::engine::FoldAnswer::Decoded(
+            crate::runtime::engine::DecodedSourceAnswer::YouTubePlayer(player),
+          ) => player,
+          _ => None,
+        })
     }
     #[cfg(not(feature = "youtube"))]
     {
-      return true;
+      None
     }
   } else {
     #[cfg(feature = "subsonic")]
     {
-      let Some(source) = crate::infra::subsonic::dispatch::build_source(spine).await else {
-        return true;
-      };
-      crate::infra::subsonic::dispatch::download_for_queue(&source, &uri).await
+      spine
+        .query(crate::runtime::engine::FoldQuery::Decoded(
+          crate::runtime::engine::DecodedSourceQuery::SubsonicPlayer,
+        ))
+        .await
+        .ok()
+        .and_then(|answer| match answer {
+          crate::runtime::engine::FoldAnswer::Decoded(
+            crate::runtime::engine::DecodedSourceAnswer::SubsonicPlayer(player),
+          ) => player,
+          _ => None,
+        })
     }
     #[cfg(not(feature = "subsonic"))]
     {
-      return true;
+      None
     }
   };
-  finish_downloaded_queue(spine, fetch_id, result).await;
+  let player = match player {
+    Some(player) => player,
+    None => match tokio::task::spawn_blocking(LocalPlayer::new).await {
+      Ok(Ok(player)) => Arc::new(player),
+      _ => return true,
+    },
+  };
+  player.pause();
+  let fetch_id = QUEUE_FETCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  if spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::QueuePendingDecoded {
+        player: Arc::clone(&player),
+        track,
+        fetch_id,
+      },
+    ))
+    .await
+    .is_none()
+  {
+    return true;
+  }
+  // Claim the lease before detached I/O. This is what prevents duplicate
+  // workers and lets QueueFetchCompleted reject superseded work.
+  let Some(claim) = spine
+    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+      crate::runtime::engine::DecodedSourceFact::QueueFetchClaimed { fetch_id },
+    ))
+    .await
+    .and_then(|ack| ack.queue_fetch_claim)
+  else {
+    return true;
+  };
+  let worker_spine = spine.clone();
+  tokio::spawn(async move {
+    let result: anyhow::Result<tempfile::NamedTempFile> = if youtube {
+      #[cfg(feature = "youtube")]
+      {
+        let path = match worker_spine
+          .query(crate::runtime::engine::FoldQuery::Decoded(
+            crate::runtime::engine::DecodedSourceQuery::YouTubeConfig,
+          ))
+          .await
+          .ok()
+        {
+          Some(crate::runtime::engine::FoldAnswer::Decoded(
+            crate::runtime::engine::DecodedSourceAnswer::YouTubeConfig(path),
+          )) => path,
+          _ => None,
+        };
+        let source = crate::infra::youtube::YouTubeSource::new(path);
+        crate::infra::youtube::dispatch::download_for_queue(&source, &uri).await
+      }
+      #[cfg(not(feature = "youtube"))]
+      {
+        Err(anyhow!("youtube source unavailable"))
+      }
+    } else {
+      #[cfg(feature = "subsonic")]
+      {
+        match crate::infra::subsonic::dispatch::build_source(&worker_spine).await {
+          Some(source) => crate::infra::subsonic::dispatch::download_for_queue(&source, &uri).await,
+          None => Err(anyhow!("subsonic source unavailable")),
+        }
+      }
+      #[cfg(not(feature = "subsonic"))]
+      {
+        Err(anyhow!("subsonic source unavailable"))
+      }
+    };
+    finish_downloaded_queue(&worker_spine, fetch_id, claim, result).await;
+  });
   true
 }
 
@@ -700,6 +676,7 @@ async fn play_downloaded_queue(spine: &crate::runtime::engine::Spine, youtube: b
 async fn finish_downloaded_queue(
   spine: &crate::runtime::engine::Spine,
   fetch_id: u64,
+  claim: crate::runtime::engine::QueueFetchClaim,
   result: anyhow::Result<tempfile::NamedTempFile>,
 ) {
   let Ok(tmp) = result else {
@@ -713,15 +690,17 @@ async fn finish_downloaded_queue(
       .await;
     return;
   };
-  let Some(claim) = spine
-    .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-      crate::runtime::engine::DecodedSourceFact::QueueFetchClaimed { fetch_id },
-    ))
-    .await
-    .and_then(|ack| ack.queue_fetch_claim)
-  else {
+  if tmp.path().metadata().map(|m| m.len() == 0).unwrap_or(true) {
+    let _ = spine
+      .emit(crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueueFetchCompleted {
+          fetch_id,
+          result: crate::runtime::engine::QueueFetchResult::Empty,
+        },
+      ))
+      .await;
     return;
-  };
+  }
   let path = tmp.path().to_path_buf();
   let player = Arc::clone(&claim.player);
   let lease = Arc::clone(&claim.lease);
