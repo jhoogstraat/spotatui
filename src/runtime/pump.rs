@@ -14,11 +14,19 @@ pub(super) async fn start_tokio(
   // await, replacing the old try_recv() + 5ms sleep poll (which added 0-5ms
   // latency to every event and busy-woke the task while idle).
   let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel::<IoEvent>();
-  std::thread::spawn(move || {
-    while let Ok(io_event) = io_rx.recv() {
-      if bridge_tx.send(io_event).is_err() {
-        break;
+  let bridge_shutdown = shutdown_rx.clone();
+  let bridge_thread = std::thread::spawn(move || loop {
+    if *bridge_shutdown.borrow() {
+      break;
+    }
+    match io_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+      Ok(io_event) => {
+        if bridge_tx.send(io_event).is_err() {
+          break;
+        }
       }
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
     }
   });
 
@@ -137,4 +145,6 @@ pub(super) async fn start_tokio(
       }
     }
   }
+  // Do not leave a blocking bridge thread behind after the async pump exits.
+  let _ = bridge_thread.join();
 }
