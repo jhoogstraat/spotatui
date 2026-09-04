@@ -69,6 +69,25 @@ pub struct LocalPlaybackState {
 }
 
 impl LocalPlaybackState {
+  /// Restore the persisted permutation without randomizing a second time.
+  pub fn restore_shuffle(
+    &mut self,
+    shuffle_on: bool,
+    backup: Option<crate::infra::queue::ShuffleBackup>,
+  ) {
+    self.shuffle_backup = backup;
+    if !shuffle_on {
+      crate::infra::queue::toggle_shuffle(
+        &mut self.queue,
+        &mut self.index,
+        &mut self.shuffle_backup,
+        false,
+      );
+    }
+  }
+}
+
+impl LocalPlaybackState {
   /// Turn in-place shuffle on or off for this session — see
   /// [`toggle_shuffle`](crate::infra::queue::toggle_shuffle) for the shared
   /// semantics (current track stays playing at the front; un-shuffle restores

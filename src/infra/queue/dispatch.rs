@@ -465,16 +465,39 @@ async fn play_local_claimed(
     .and_then(|answer| match answer {
       crate::runtime::engine::FoldAnswer::QueueDecodedPlayer(player) => player,
       _ => None,
-    })
-    .or_else(|| None);
+    });
+  let player = if player.is_some() {
+    player
+  } else {
+    spine
+      .query(crate::runtime::engine::FoldQuery::Decoded(
+        crate::runtime::engine::DecodedSourceQuery::LocalPlayer,
+      ))
+      .await
+      .ok()
+      .and_then(|answer| match answer {
+        crate::runtime::engine::FoldAnswer::Decoded(
+          crate::runtime::engine::DecodedSourceAnswer::LocalPlayer(player),
+        ) => player,
+        _ => None,
+      })
+  };
   let player = match player {
     Some(player) => player,
     None => match tokio::task::spawn_blocking(LocalPlayer::new).await {
       Ok(Ok(player)) => Arc::new(player),
-      _ => return true,
+      _ => {
+        queue_status(
+          spine,
+          "Cannot play queued local track: audio output unavailable",
+        )
+        .await;
+        return true;
+      }
     },
   };
   let fetch_id = QUEUE_FETCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  player.pause();
   let _ = spine
     .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
       crate::runtime::engine::DecodedSourceFact::QueuePendingDecoded {
@@ -601,7 +624,10 @@ async fn start_downloaded_queue(
     Some(player) => player,
     None => match tokio::task::spawn_blocking(LocalPlayer::new).await {
       Ok(Ok(player)) => Arc::new(player),
-      _ => return true,
+      _ => {
+        queue_status(spine, "Cannot play queued track: audio output unavailable").await;
+        return true;
+      }
     },
   };
   player.pause();

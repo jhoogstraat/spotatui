@@ -103,6 +103,23 @@ pub struct YouTubePlaybackState {
 }
 
 impl YouTubePlaybackState {
+  /// Restore the persisted permutation without randomizing a second time.
+  pub fn restore_shuffle(
+    &mut self,
+    shuffle_on: bool,
+    backup: Option<crate::infra::queue::ShuffleBackup>,
+  ) {
+    self.shuffle_backup = backup;
+    if !shuffle_on {
+      crate::infra::queue::toggle_shuffle(
+        &mut self.tracks,
+        &mut self.index,
+        &mut self.shuffle_backup,
+        false,
+      );
+    }
+  }
+
   /// The currently playing video, if `index` is in range.
   /// (Reader died with the terminal UI; kept for the upcoming
   /// `queue_now`-style snapshot accessor. Drop at ticket 18 if still unused.)

@@ -107,6 +107,23 @@ pub struct SubsonicPlaybackState {
 }
 
 impl SubsonicPlaybackState {
+  /// Restore the persisted permutation without randomizing a second time.
+  pub fn restore_shuffle(
+    &mut self,
+    shuffle_on: bool,
+    backup: Option<crate::infra::queue::ShuffleBackup>,
+  ) {
+    self.shuffle_backup = backup;
+    if !shuffle_on {
+      crate::infra::queue::toggle_shuffle(
+        &mut self.tracks,
+        &mut self.index,
+        &mut self.shuffle_backup,
+        false,
+      );
+    }
+  }
+
   /// The currently playing track, if `index` is in range.
   pub fn current(&self) -> Option<&TrackInfo> {
     self.tracks.get(self.index)
