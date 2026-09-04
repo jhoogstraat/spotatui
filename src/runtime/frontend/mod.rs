@@ -1109,7 +1109,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         queue_suspended: None,
       })
     }
-    #[cfg(feature = "streaming")]
+    #[cfg(any(
+      feature = "streaming",
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube"
+    ))]
     EngineEvent::Decoded(crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
       track,
     }) => {
@@ -1644,7 +1649,12 @@ pub(crate) fn apply_decoded_source_fact(
         app.native_is_playing = Some(false);
       }
     }
-    #[cfg(feature = "streaming")]
+    #[cfg(any(
+      feature = "streaming",
+      feature = "local-files",
+      feature = "subsonic",
+      feature = "youtube"
+    ))]
     DecodedSourceFact::QueueNativeTrackPopped { track } => {
       let _ = pop_native_queue(app, &track);
     }

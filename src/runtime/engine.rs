@@ -215,7 +215,12 @@ pub enum DecodedSourceFact {
   QueueTransportIntent { generation: u64, is_playing: bool },
   #[cfg(feature = "streaming")]
   QueueSpotifyPausedRestored { generation: u64 },
-  #[cfg(feature = "streaming")]
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube"
+  ))]
   QueueNativeTrackPopped {
     track: crate::core::plugin_api::TrackInfo,
   },
