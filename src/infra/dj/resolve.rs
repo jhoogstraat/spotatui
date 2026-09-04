@@ -347,21 +347,13 @@ fn artist_key(name: &str) -> String {
 /// YouTube fallback for tracks Spotify does not have (or cannot license).
 ///
 /// Holds a built source rather than building one per lookup, because
-/// `YouTubeSource::search` shells out to `yt-dlp` and the config read behind
-/// `build_source` needs the `App` lock.
+/// `YouTubeSource::search` shells out to `yt-dlp`.
 pub struct YouTubeResolver {
   #[cfg(feature = "youtube")]
   source: crate::infra::youtube::YouTubeSource,
 }
 
 impl YouTubeResolver {
-  #[cfg(feature = "youtube")]
-  pub async fn new(app: &std::sync::Arc<tokio::sync::Mutex<crate::core::app::App>>) -> Self {
-    Self {
-      source: crate::infra::youtube::dispatch::build_source(app).await,
-    }
-  }
-
   #[cfg(feature = "youtube")]
   pub fn from_path(ytdlp_path: Option<String>) -> Self {
     Self {

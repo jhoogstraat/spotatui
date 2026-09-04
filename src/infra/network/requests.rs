@@ -1,5 +1,5 @@
 use super::Network;
-use crate::core::{app::App, auth};
+use crate::core::auth;
 use anyhow::anyhow;
 use log::warn;
 use reqwest::header::CONTENT_LENGTH;
@@ -545,33 +545,7 @@ pub fn is_transient_network_error(e: &anyhow::Error) -> bool {
     || text.contains("dns")
 }
 
-/// Transition-period wrapper for callers not yet migrated (ticket 17/18
-/// finish the job): same GET, but the token-refresh mirror writes into App
-/// happen here instead of at the caller. Deleted with the mega-mutex.
-#[cfg_attr(not(feature = "streaming"), allow(dead_code))]
-pub async fn spotify_get_typed_compat_for_with_refresh<T: DeserializeOwned>(
-  spotify: &AuthCodePkceSpotify,
-  path: &str,
-  query: &[(&str, String)],
-  token_cache_path: &Path,
-  _app: &Arc<Mutex<App>>,
-) -> anyhow::Result<T> {
-  let mut value = spotify_api_request_json_for_with_refresh(
-    spotify,
-    Method::GET,
-    path,
-    query,
-    None,
-    token_cache_path,
-  )
-  .await?;
-  normalize_spotify_payload(&mut value);
-  Ok(serde_json::from_value(value)?)
-}
-
-/// One Spotify Web API GET with the shared refresh/retry machinery, without
-/// an `App` handle (ticket 16). Migrated callers use this; the compat
-/// wrapper above dies with ticket 17.
+/// One Spotify Web API GET with the shared refresh/retry machinery.
 pub async fn spotify_get_typed_for<T: DeserializeOwned>(
   spotify: &AuthCodePkceSpotify,
   path: &str,
