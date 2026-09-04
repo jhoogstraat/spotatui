@@ -985,6 +985,7 @@ mod tests {
   #[tokio::test]
   async fn youtube_start_with_no_rows_is_consumed_without_session() {
     let app = Arc::new(Mutex::new(test_app()));
+    let (_spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
     assert!(
       route_youtube_event(
         &app,
