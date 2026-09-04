@@ -17,7 +17,7 @@
 //! (non-`streaming`) CI build still compiles and runs their tests.
 
 #[cfg(feature = "streaming")]
-use super::requests::spotify_get_typed_compat_for_with_refresh;
+use super::requests::spotify_get_typed_for;
 #[cfg(feature = "streaming")]
 use super::Network;
 #[cfg(feature = "streaming")]
@@ -52,7 +52,6 @@ use std::sync::Arc;
 #[cfg(feature = "streaming")]
 use std::time::Instant;
 #[cfg(feature = "streaming")]
-use tokio::sync::Mutex;
 
 /// Full-context fetch cap. Beyond this the shuffle covers the first
 /// `MAX_NATIVE_SHUFFLE_TRACKS` tracks of the context (with a status message)
@@ -555,7 +554,6 @@ impl Network {
   #[cfg(feature = "streaming")]
   fn spawn_full_context_fetch(&self, kind: FullFetch, generation: u64) {
     let spotify = self.spotify().clone();
-    let app = Arc::clone(&self.app);
     let token_cache_path = self.token_cache_path.clone();
     let spine = self.spine.clone();
     tokio::spawn(async move {
@@ -567,9 +565,9 @@ impl Network {
       let result = loop {
         let result = match &kind {
           FullFetch::Playlist(id) => {
-            fetch_playlist_uris(&spotify, &token_cache_path, &app, id).await
+            fetch_playlist_uris(&spotify, &token_cache_path, id).await
           }
-          FullFetch::SavedTracks => fetch_saved_track_uris(&spotify, &token_cache_path, &app).await,
+          FullFetch::SavedTracks => fetch_saved_track_uris(&spotify, &token_cache_path).await,
         };
         attempt += 1;
         match result {
@@ -630,7 +628,6 @@ async fn finish_full_context_fetch(
 async fn paginate_uris<Item>(
   spotify: &AuthCodePkceSpotify,
   token_cache_path: &Path,
-  app: &Arc<Mutex<App>>,
   path: &str,
   extract: impl Fn(&Item) -> Option<String>,
 ) -> anyhow::Result<(Vec<String>, bool)>
@@ -641,12 +638,11 @@ where
   let mut offset = 0u32;
   let mut uris = Vec::new();
   loop {
-    let page = spotify_get_typed_compat_for_with_refresh::<Page<Item>>(
+    let page = spotify_get_typed_for::<Page<Item>>(
       spotify,
       path,
       &[("limit", limit.to_string()), ("offset", offset.to_string())],
       token_cache_path,
-      app,
     )
     .await?;
     let has_next = page.next.is_some();
@@ -675,14 +671,12 @@ where
 async fn fetch_playlist_uris(
   spotify: &AuthCodePkceSpotify,
   token_cache_path: &Path,
-  app: &Arc<Mutex<App>>,
   playlist_id: &PlaylistId<'static>,
 ) -> anyhow::Result<(Vec<String>, bool)> {
   let path = format!("playlists/{}/items", playlist_id.id());
   paginate_uris(
     spotify,
     token_cache_path,
-    app,
     &path,
     |item: &PlaylistItem| match item.item.as_ref() {
       Some(PlayableItem::Track(track)) => track.id.as_ref().map(|id| id.uri()),
@@ -698,12 +692,10 @@ async fn fetch_playlist_uris(
 async fn fetch_saved_track_uris(
   spotify: &AuthCodePkceSpotify,
   token_cache_path: &Path,
-  app: &Arc<Mutex<App>>,
 ) -> anyhow::Result<(Vec<String>, bool)> {
   paginate_uris(
     spotify,
     token_cache_path,
-    app,
     "me/tracks",
     |item: &SavedTrack| item.track.id.as_ref().map(|id| id.uri()),
   )
