@@ -170,6 +170,7 @@ pub struct Runtime {
   shutdown_tx: watch::Sender<bool>,
   spine: Spine,
   history_collector: Option<crate::infra::history::HistoryCollectorHandle>,
+  producer_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Runtime {
@@ -207,7 +208,7 @@ impl Runtime {
 
     let app = Arc::clone(&services.app);
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
-    let (shutdown_tx, _) = watch::channel(false);
+    let shutdown_tx = services.shutdown_tx.clone();
     // The event spine is opened by `start_services` so every producer shares
     // one channel; this side receives events, the fold reduces them.
     let events_rx = services.spine_rx;
@@ -255,6 +256,7 @@ impl Runtime {
       shutdown_tx,
       spine,
       history_collector: Some(services.history_collector),
+      producer_tasks: services.producer_tasks,
     })
   }
 
@@ -320,7 +322,13 @@ impl Runtime {
   /// this runtime started. Blocks until the quit sequence finishes.
   pub fn shutdown(self) -> Result<()> {
     self.rt.block_on(async {
+      // Quiesce producer loops first. This closes the ingress path before the
+      // fold performs its final persistence barrier, so no late completion can
+      // resurrect state after the flush.
       let _ = self.shutdown_tx.send(true);
+      for task in self.producer_tasks {
+        let _ = task.await;
+      }
       // Emit an acked fact so the final flush is ordered in the fold event
       // stream, rather than racing a direct App lock.
       let _ = self

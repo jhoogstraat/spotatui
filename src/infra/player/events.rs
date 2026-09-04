@@ -85,10 +85,10 @@ pub struct StreamingRecoveryContext {
   pub redirect_uri: String,
 }
 
-pub fn spawn_streaming_recovery_handler(ctx: StreamingRecoveryContext) {
+pub fn spawn_streaming_recovery_handler(ctx: StreamingRecoveryContext) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
     handle_streaming_recovery(ctx).await;
-  });
+  })
 }
 
 /// Intent ORs across coalesced transport-drop requests, but a handoff
@@ -302,7 +302,7 @@ async fn apply_streaming_facts(
   applied
 }
 
-pub fn spawn_player_event_handler(ctx: PlayerEventContext) {
+pub fn spawn_player_event_handler(ctx: PlayerEventContext) -> tokio::task::JoinHandle<()> {
   let event_rx = ctx.player.get_event_channel();
   info!("spawning native player event handler");
 
@@ -322,7 +322,7 @@ pub fn spawn_player_event_handler(ctx: PlayerEventContext) {
       recovery_tx,
     )
     .await;
-  });
+  })
 }
 
 #[allow(clippy::too_many_arguments)]

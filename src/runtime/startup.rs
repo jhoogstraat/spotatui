@@ -679,6 +679,10 @@ pub(super) struct Services {
   #[allow(dead_code)] // TEMPORARY (ticket 01): only the deleted TUI runner read it.
   pub discord_rpc_manager: DiscordRpcHandle,
   pub history_collector: crate::infra::history::HistoryCollectorHandle,
+  /// Handles for the long-lived producer tasks. Shutdown cancels the pump and
+  /// joins these before asking the fold to flush durable state.
+  pub producer_tasks: Vec<tokio::task::JoinHandle<()>>,
+  pub shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// Start every service a frontend shares: OS media integrations, the
@@ -694,6 +698,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // account/credential notices use typed facts rather than App lock writes.
   let (spine_for_events, spine_rx, spine_queries) =
     crate::runtime::engine::Spine::open(Default::default());
+  let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
   app.lock().await.spine = Some(spine_for_events.clone());
   let sync_io_rx = boot.sync_io_rx;
   let user_config = boot.user_config;
@@ -1151,7 +1156,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let network_app = Arc::clone(&app);
   let network_spine = spine_for_events.clone();
   info!("spawning spotify network event handler");
-  tokio::spawn(async move {
+  let network_shutdown_rx = shutdown_tx.subscribe();
+  let network_task = tokio::spawn(async move {
     let mut network = Network::new(spotify, client_config, &network_app, final_token_cache_path);
     network.spine = Some(network_spine.clone());
 
@@ -1218,7 +1224,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       }
     }
 
-    start_tokio(sync_io_rx, &mut network).await;
+    start_tokio(sync_io_rx, &mut network, network_shutdown_rx).await;
   });
 
   Ok(Services {
@@ -1229,6 +1235,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     user_config,
     discord_rpc_manager,
     history_collector,
+    producer_tasks: vec![network_task],
+    shutdown_tx,
   })
 }
 

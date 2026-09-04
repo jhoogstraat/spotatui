@@ -4,7 +4,11 @@ use crate::infra::network::{IoEvent, Network};
 
 // CLI mode never starts the pump; only a frontend launch does.
 #[allow(dead_code)] // TEMPORARY (ticket 01): the windowed frontend still drives this pump.
-pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Network) {
+pub(super) async fn start_tokio(
+  io_rx: std::sync::mpsc::Receiver<IoEvent>,
+  network: &mut Network,
+  mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
   // Bridge the sync dispatch channel onto the async runtime: a dedicated
   // thread does blocking recv() and forwards into a tokio channel the pump can
   // await, replacing the old try_recv() + 5ms sleep poll (which added 0-5ms
@@ -20,6 +24,7 @@ pub(super) async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, netwo
 
   loop {
     let io_event = tokio::select! {
+      _ = shutdown_rx.changed() => break,
       maybe_event = bridge_rx.recv() => match maybe_event {
         Some(io_event) => io_event,
         None => break,
