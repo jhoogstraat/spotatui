@@ -4,6 +4,7 @@
 
 use super::bootstrap::Boot;
 use super::pump::start_tokio;
+use crate::core::action::{EngineAction, RepeatSetting};
 use crate::core::app::App;
 #[cfg(feature = "streaming")]
 use crate::core::config::ClientConfig;
@@ -43,7 +44,6 @@ use std::sync::Arc;
   feature = "youtube"
 ))]
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Queue an OS-originated control through the fold's ordered event spine.
 /// Integrations do not mutate `App` or bypass producer ordering.
@@ -697,13 +697,13 @@ pub(super) struct Services {
 /// Split out of the former single `launch_ui` at the handoff to the terminal
 /// runner so a second frontend boots through exactly the same sequence.
 pub(super) async fn start_services(boot: Boot) -> Result<Services> {
-  let app = boot.app;
+  let mut app = boot.app;
   // Open the fold spine before any asynchronous startup work so even
   // account/credential notices use typed facts rather than App lock writes.
   let (spine_for_events, spine_rx, spine_queries) =
     crate::runtime::engine::Spine::open(Default::default());
   let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-  app.lock().await.spine = Some(spine_for_events.clone());
+  app.spine = Some(spine_for_events.clone());
   let sync_io_rx = boot.sync_io_rx;
   let user_config = boot.user_config;
   let client_config = boot.client_config;
@@ -782,9 +782,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // message's TTL before the first frame ever renders. Never displaces a
   // message something else just set (they are more urgent than this notice).
   if let Some(message) = client_id_notice_message {
-    let mut app_mut = app.lock().await;
-    if app_mut.status_message.is_none() {
-      app_mut.set_status_message(message, 15);
+    if app.status_message.is_none() {
+      app.set_status_message(message, 15);
     }
   }
 
@@ -793,13 +792,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // since the player is perfectly usable without it.
   #[cfg(feature = "mcp-server")]
   {
-    let (enabled, io_tx) = {
-      let app_ref = app.lock().await;
-      (
-        app_ref.user_config.behavior.mcp_enabled,
-        app_ref.io_tx_clone(),
-      )
-    };
+    let enabled = app.user_config.behavior.mcp_enabled;
+    let io_tx = app.io_tx_clone();
     if enabled {
       match io_tx {
         Some(io_tx) => {
@@ -863,8 +857,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let mut producer_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
   #[cfg(feature = "streaming")]
   {
-    let mut app_mut = app.lock().await;
-    app_mut.streaming_recovery_tx = Some(streaming_recovery_tx.clone());
+    app.streaming_recovery_tx = Some(streaming_recovery_tx.clone());
   }
 
   // Initialize MPRIS D-Bus integration for desktop media control
@@ -1160,7 +1153,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
 
   let network_spine = spine_for_events.clone();
   let network_ytdlp_path = user_config.behavior.ytdlp_path.clone();
-  let restore_app_for_network = Arc::clone(&app);
   info!("spawning spotify network event handler");
   let network_shutdown_rx = shutdown_tx.subscribe();
   let network_task = tokio::spawn(async move {
@@ -1194,13 +1186,10 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       // Resume off the event pump: a slow source (yt-dlp download, remote
       // fetch) must not stall the Spotify startup events the UI's first render
       // queues (user, playlists, current playback). The restore drives the
-      // source's own start path, which serializes on the `App` lock like every
-      // other event, so running it concurrently is safe.
-      let restore_app = Arc::clone(&restore_app_for_network);
+      // source's own Spine path and never retains the fold's App owner.
       let restore_spine = network_spine.clone();
       tokio::spawn(async move {
         restore_playback_session(
-          &restore_app,
           &restore_spine,
           session,
           initial_startup_behavior,
@@ -1254,43 +1243,55 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   })
 }
 
-/// Pause native playback on the way out so the Connect device does not keep
-/// reporting this session as playing after the process exits. Shared by the
-/// terminal runner and the `frontend` module.
-#[cfg(feature = "streaming")]
-pub(crate) async fn pause_native_playback_before_exit(app: &Arc<Mutex<App>>) {
-  let player = {
-    let mut app = app.lock().await;
-    if !app.is_streaming_active {
-      return;
-    }
-
-    let Some(player) = app.streaming_player.clone() else {
-      return;
-    };
-
-    let is_playing = app.native_is_playing.unwrap_or_else(|| {
-      app
-        .current_playback_context
-        .as_ref()
-        .map(|context| context.is_playing)
-        .unwrap_or(false)
-    });
-
-    if !is_playing {
-      return;
-    }
-
-    app.native_is_playing = Some(false);
-    if let Some(context) = app.current_playback_context.as_mut() {
-      context.is_playing = false;
-    }
-
-    player
+/// Apply persisted transport settings through the ordered fold path. A failed
+/// source start has no media snapshot, so restore controls are ignored rather
+/// than mutating global decoded settings with no active owner.
+async fn restore_controls(
+  spine: &crate::runtime::engine::Spine,
+  position_ms: u64,
+  paused: bool,
+  startup_behavior: StartupBehavior,
+  shuffle_on: bool,
+  repeat: rspotify::model::enums::RepeatState,
+) {
+  let active = matches!(
+    spine.query(crate::runtime::engine::FoldQuery::MediaSnapshot).await,
+    Ok(crate::runtime::engine::FoldAnswer::Media(Some(_)))
+  );
+  if !active {
+    return;
+  }
+  let repeat = match repeat {
+    rspotify::model::enums::RepeatState::Off => RepeatSetting::Off,
+    rspotify::model::enums::RepeatState::Track => RepeatSetting::Track,
+    rspotify::model::enums::RepeatState::Context => RepeatSetting::Context,
   };
-
-  player.pause();
-  tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+  let _ = spine
+    .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+      EngineAction::SetShuffle(shuffle_on),
+    )))
+    .await;
+  let _ = spine
+    .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+      EngineAction::SetRepeat(repeat),
+    )))
+    .await;
+  if position_ms > 0 {
+    let _ = spine
+      .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+        EngineAction::SeekTo(position_ms.min(u32::MAX as u64) as u32),
+      )))
+      .await;
+  }
+  if matches!(startup_behavior, StartupBehavior::Pause)
+    || matches!(startup_behavior, StartupBehavior::Continue) && paused
+  {
+    let _ = spine
+      .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+        EngineAction::Pause,
+      )))
+      .await;
+  }
 }
 
 /// Resume a persisted non-Spotify playback session at launch.
@@ -1308,7 +1309,6 @@ pub(crate) async fn pause_native_playback_before_exit(app: &Arc<Mutex<App>>) {
 /// whose source feature is disabled in this build is a no-op.
 #[allow(unused_variables)]
 async fn restore_playback_session(
-  app: &Arc<Mutex<App>>,
   spine: &crate::runtime::engine::Spine,
   session: crate::core::persisted_playback::PersistedPlayback,
   startup_behavior: StartupBehavior,
@@ -1348,27 +1348,7 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(queue), Some(index)),
       )
       .await;
-      let mut guard = app.lock().await;
-      // Only adopt the persisted modes if the source actually started; a decode
-      // failure would otherwise leave the player-global flags set with no source.
-      // Trust the persisted intent (`shuffle_on`) for the flag and restore the
-      // backup as-is (the start path above did not re-shuffle because
-      // `decoded_shuffle` is still off). When the two disagree — a toggle deferred
-      // at exit — the driver's `reconcile_decoded_shuffle` re-syncs the queue
-      // order to the flag on the next tick.
-      if guard.local_playback.is_some() {
-        guard.decoded_repeat = repeat;
-        guard.decoded_shuffle = shuffle_on;
-      }
-      if let Some(s) = guard.local_playback.as_mut() {
-        if position_ms > 0 {
-          let _ = s.player.seek(Duration::from_millis(position_ms));
-        }
-        if resolve_paused(paused) {
-          s.player.pause();
-        }
-        s.shuffle_backup = shuffle;
-      }
+      restore_controls(spine, position_ms, paused, startup_behavior, shuffle_on, repeat).await;
     }
     #[cfg(feature = "subsonic")]
     PersistedPlayback::Subsonic {
@@ -1385,26 +1365,20 @@ async fn restore_playback_session(
         return;
       }
       // Seed the browse table so the start path's snapshot resolves metadata.
-      app.lock().await.track_table.tracks = tracks;
+      let _ = spine
+        .emit_acked(EngineEvent::Catalog(
+          crate::core::catalog::CatalogStateEvent::TrackTableReplaced {
+            tracks: tracks.clone(),
+            context_label: "restored playback",
+          },
+        ))
+        .await;
       crate::infra::subsonic::dispatch::route_subsonic_event(
         spine,
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
-      let mut guard = app.lock().await;
-      if guard.subsonic_playback.is_some() {
-        guard.decoded_repeat = repeat;
-        guard.decoded_shuffle = shuffle_on;
-      }
-      if let Some(s) = guard.subsonic_playback.as_mut() {
-        if position_ms > 0 {
-          let _ = s.player.seek(Duration::from_millis(position_ms));
-        }
-        if resolve_paused(paused) {
-          s.player.pause();
-        }
-        s.shuffle_backup = shuffle;
-      }
+      restore_controls(spine, position_ms, paused, startup_behavior, shuffle_on, repeat).await;
     }
     #[cfg(feature = "youtube")]
     PersistedPlayback::YouTube {
@@ -1420,26 +1394,20 @@ async fn restore_playback_session(
       if uris.is_empty() {
         return;
       }
-      app.lock().await.track_table.tracks = tracks;
+      let _ = spine
+        .emit_acked(EngineEvent::Catalog(
+          crate::core::catalog::CatalogStateEvent::TrackTableReplaced {
+            tracks: tracks.clone(),
+            context_label: "restored playback",
+          },
+        ))
+        .await;
       crate::infra::youtube::dispatch::route_youtube_event_spine(
         spine,
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
-      let mut guard = app.lock().await;
-      if guard.youtube_playback.is_some() {
-        guard.decoded_repeat = repeat;
-        guard.decoded_shuffle = shuffle_on;
-      }
-      if let Some(s) = guard.youtube_playback.as_mut() {
-        if position_ms > 0 {
-          let _ = s.player.seek(Duration::from_millis(position_ms));
-        }
-        if resolve_paused(paused) {
-          s.player.pause();
-        }
-        s.shuffle_backup = shuffle;
-      }
+      restore_controls(spine, position_ms, paused, startup_behavior, shuffle_on, repeat).await;
     }
     #[cfg(feature = "internet-radio")]
     PersistedPlayback::Radio { station, paused } => {
@@ -1447,18 +1415,26 @@ async fn restore_playback_session(
         return;
       };
       // Seed the browse table so the start path's station snapshot resolves.
-      app.lock().await.track_table.tracks = vec![station];
+      let _ = spine
+        .emit_acked(EngineEvent::Catalog(
+          crate::core::catalog::CatalogStateEvent::TrackTableReplaced {
+            tracks: vec![station],
+            context_label: "restored playback",
+          },
+        ))
+        .await;
       crate::infra::radio::dispatch::route_radio_event(
         spine,
         &IoEvent::StartPlayback(Some(uri), None, None),
       )
       .await;
       // A live stream has no seekable position; only apply the pause decision.
-      let guard = app.lock().await;
-      if let Some(s) = guard.radio_playback.as_ref() {
-        if resolve_paused(paused) {
-          s.player.pause();
-        }
+      if resolve_paused(paused) {
+        spine
+          .emit_acked(EngineEvent::Session(SessionFact::ApplyAction(
+            EngineAction::Pause,
+          )))
+          .await;
       }
     }
     // Any variant whose source feature is disabled in this build.

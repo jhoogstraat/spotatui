@@ -28,8 +28,10 @@ use rspotify::model::{
 use rspotify::clients::OAuthClient;
 use rspotify::AuthCodePkceSpotify;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 // Re-export traits

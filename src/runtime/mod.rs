@@ -124,7 +124,7 @@ pub async fn run_cli() -> Result<()> {
 
   let onboarding: Arc<dyn crate::core::onboarding::Onboarding> = Arc::new(HeadlessOnboarding);
 
-  let boot = bootstrap::boot(
+  let mut boot = bootstrap::boot(
     &bootstrap::BootOptions {
       config_path: matches.get_one::<String>("config").map(PathBuf::from),
       reconfigure_auth: matches.get_flag("reconfigure-auth"),
