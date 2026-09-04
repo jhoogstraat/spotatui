@@ -45,6 +45,11 @@ async fn play_local_queue(spine: &crate::runtime::engine::Spine) -> bool {
   };
   let Some(track) = track else { return true };
   let Some(uri) = track.uri.clone() else {
+    let _ = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped { track },
+      ))
+      .await;
     return true;
   };
   if crate::core::queue::queue_item_source(&uri) != crate::core::queue::QueueItemSource::LocalFile {
@@ -188,6 +193,13 @@ impl QueueRuntime for crate::runtime::engine::Spine {
           };
           let Some(track) = track else { return true };
           let Some(uri) = track.uri.clone() else {
+            let _ = self
+              .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+                crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped {
+                  track: track.clone(),
+                },
+              ))
+              .await;
             return true;
           };
           if crate::core::queue::queue_item_source(&uri)
@@ -596,6 +608,11 @@ async fn play_downloaded_queue(spine: &crate::runtime::engine::Spine, youtube: b
   };
   let Some(track) = track else { return true };
   let Some(uri) = track.uri.clone() else {
+    let _ = spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+        crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped { track },
+      ))
+      .await;
     return true;
   };
   let expected = if youtube {
