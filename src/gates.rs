@@ -47,9 +47,132 @@ fn read_source(path: &Path) -> String {
 /// `#[cfg(test)]`; compatibility fixtures may keep App handles there without
 /// weakening the runtime ownership boundary.
 fn production_source(source: &str) -> &str {
+  let mut search_from = 0;
+  let markers = ["#[cfg(test)]", "#[cfg(all(test"];
+  while let Some((relative, marker_text)) = markers
+    .iter()
+    .filter_map(|marker| source[search_from..].find(marker).map(|at| (at, *marker)))
+    .min_by_key(|(at, _)| *at)
+  {
+    let marker = search_from + relative;
+    let marker_end = cfg_marker_end(source, marker, marker_text);
+    let mut rest = &source[marker_end..];
+    // Attributes may decorate the test module (for example allow(dead_code)).
+    loop {
+      let trimmed = rest.trim_start();
+      if let Some(after_attr) = trimmed.strip_prefix("#") {
+        if let Some(line_end) = after_attr.find('\n') {
+          rest = &after_attr[line_end + 1..];
+          continue;
+        }
+      }
+      if let Some(after_comment) = trimmed.strip_prefix("//") {
+        if let Some(line_end) = after_comment.find('\n') {
+          rest = &after_comment[line_end + 1..];
+          continue;
+        }
+      }
+      rest = trimmed;
+      break;
+    }
+    if rest.starts_with("mod tests")
+      || rest.starts_with("pub mod tests")
+      || rest.starts_with("mod test_")
+      || rest.starts_with("pub mod test_")
+    {
+      return &source[..marker];
+    }
+    search_from = marker_end;
+  }
   source
-    .find("#[cfg(test)]")
-    .map_or(source, |end| &source[..end])
+}
+
+fn cfg_marker_end(source: &str, marker: usize, marker_text: &str) -> usize {
+  let start = marker + marker_text.len();
+  if marker_text.contains("all(test") {
+    source[start..]
+      .find(")]")
+      .map(|offset| start + offset + 2)
+      .unwrap_or(start)
+  } else {
+    start
+  }
+}
+
+/// Remove individual `#[cfg(test)]` function items while retaining production
+/// code that follows them. Test helpers occasionally live beside the runtime
+/// (rather than in the conventional tail module), so truncating at the first
+/// gated function would hide later production violations.
+fn strip_cfg_test_functions(source: &str) -> String {
+  let mut out = String::with_capacity(source.len());
+  let mut cursor = 0;
+  let markers = ["#[cfg(test)]", "#[cfg(all(test"];
+  while let Some((relative, marker_text)) = markers
+    .iter()
+    .filter_map(|marker| source[cursor..].find(marker).map(|at| (at, *marker)))
+    .min_by_key(|(at, _)| *at)
+  {
+    let marker = cursor + relative;
+    let marker_end = cfg_marker_end(source, marker, marker_text);
+    let mut rest = &source[marker_end..];
+    loop {
+      let trimmed = rest.trim_start();
+      if let Some(after_attr) = trimmed.strip_prefix("#") {
+        if let Some(line_end) = after_attr.find('\n') {
+          rest = &after_attr[line_end + 1..];
+          continue;
+        }
+      }
+      if let Some(after_comment) = trimmed.strip_prefix("//") {
+        if let Some(line_end) = after_comment.find('\n') {
+          rest = &after_comment[line_end + 1..];
+          continue;
+        }
+      }
+      rest = trimmed;
+      break;
+    }
+    let is_fn = rest.starts_with("fn ")
+      || rest.starts_with("pub fn ")
+      || rest.starts_with("pub(crate) fn ")
+      || rest.starts_with("async fn ")
+      || rest.starts_with("pub async fn ")
+      || rest.starts_with("pub(crate) async fn ");
+    if !is_fn {
+      cursor = marker_end;
+      continue;
+    }
+    let item_start = source.len() - rest.len();
+    let Some(open_rel) = source[item_start..].find('{') else {
+      cursor = marker_end;
+      continue;
+    };
+    let open = item_start + open_rel;
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut end = open;
+    for (index, byte) in bytes.iter().enumerate().skip(open) {
+      match byte {
+        b'{' => depth += 1,
+        b'}' => {
+          depth = depth.saturating_sub(1);
+          if depth == 0 {
+            end = index + 1;
+            break;
+          }
+        }
+        _ => {}
+      }
+    }
+    if end == open {
+      cursor = marker_end;
+      continue;
+    }
+    out.push_str(&source[cursor..marker]);
+    cursor = end;
+  }
+  out.push_str(&source[cursor..]);
+  out
 }
 
 /// Sums non-overlapping occurrences of `needle` across every `.rs` file under
@@ -317,16 +440,24 @@ fn production_has_no_app_mutex_handles() {
   let root = repo_root();
   let mut files = Vec::new();
   collect_rs_files(&root.join("src"), &mut files);
-  let forbidden = ["Arc<Mutex<App", "Arc<tokio::sync::Mutex<App", "Mutex<App>"];
+  let forbidden = [
+    "Arc<Mutex<App",
+    "Arc<tokio::sync::Mutex<App",
+    "Mutex<App>",
+    "Mutex<crate::core::app::App",
+  ];
   let mut violations = Vec::new();
   for path in files {
     if path == root.join("src").join("gates.rs") {
       continue;
     }
     let source = read_source(&path);
-    let production = production_source(&source);
+    let production = strip_cfg_test_functions(production_source(&source));
+    // Formatting and qualification are immaterial to ownership: compact
+    // whitespace so `Mutex < crate::core::app::App >` is checked too.
+    let compact: String = production.split_whitespace().collect();
     for needle in forbidden {
-      if production.contains(needle) {
+      if production.contains(needle) || compact.contains(needle) {
         violations.push(format!("{} contains {needle}", path.display()));
       }
     }
@@ -336,6 +467,99 @@ fn production_has_no_app_mutex_handles() {
     "production App mutex handles are forbidden; test-only fixtures must be cfg(test):\n{}",
     violations.join("\n")
   );
+}
+
+#[test]
+fn production_app_field_writes_are_fold_owned() {
+  let root = repo_root();
+  let mut files = Vec::new();
+  collect_rs_files(&root.join("src"), &mut files);
+  let runtime_frontend = root
+    .join("src")
+    .join("runtime")
+    .join("frontend")
+    .join("mod.rs");
+  let runtime_mod = root.join("src").join("runtime").join("mod.rs");
+  let runtime_startup = root.join("src").join("runtime").join("startup.rs");
+  // Fold-invoked reducer helpers live in these modules. Their `&mut App`
+  // writes are atomic fold transitions; producer paths remain scanned.
+  let reducer_modules = [
+    root
+      .join("src")
+      .join("infra")
+      .join("network")
+      .join("library.rs"),
+    root
+      .join("src")
+      .join("infra")
+      .join("network")
+      .join("playback.rs"),
+    root
+      .join("src")
+      .join("infra")
+      .join("network")
+      .join("native_shuffle.rs"),
+  ];
+  let mut violations = Vec::new();
+  for path in files {
+    if path == root.join("src").join("gates.rs")
+      || path.starts_with(root.join("src").join("core"))
+      || path == runtime_frontend
+      || path == runtime_mod
+      || path == runtime_startup
+      || reducer_modules.iter().any(|allowed| path == *allowed)
+    {
+      continue;
+    }
+    let source = read_source(&path);
+    let production = strip_cfg_test_functions(production_source(&source));
+    let writes = count_app_field_writes(&production);
+    if writes != 0 {
+      violations.push(format!(
+        "{} has {writes} direct App field write(s)",
+        path.display()
+      ));
+    }
+  }
+  assert!(
+    violations.is_empty(),
+    "direct App field writes outside fold/startup are forbidden:\n{}",
+    violations.join("\n")
+  );
+}
+
+#[test]
+fn production_scan_keeps_code_after_cfg_test_imports() {
+  let source = "#[cfg(test)]\nuse std::sync::Mutex;\n\nfn worker() { let _ = Arc<Mutex<App>>::new(); }\n#[cfg(test)]\nmod tests {}";
+  let production = production_source(source);
+  assert!(production.contains("Arc<Mutex<App>>"));
+}
+
+#[test]
+fn production_scan_keeps_code_after_cfg_test_functions() {
+  let source = "#[cfg(test)]\nfn fixture() { let _ = Arc<Mutex<App>>::new(); }\n\
+               fn worker() { let _ = Arc<Mutex<App>>::new(); }\n\
+               #[cfg(test)]\nmod tests {}";
+  let production = production_source(source);
+  assert!(production.contains("fn worker"));
+  let filtered = strip_cfg_test_functions(production);
+  assert!(!filtered.contains("fn fixture"));
+  assert!(filtered.contains("fn worker"));
+}
+
+#[test]
+fn production_scan_handles_cfg_all_test_tail_attributes() {
+  let source = "fn worker() {}\n#[cfg(all(test, feature = \"fixture\"))]\nmod tests {}";
+  assert!(production_source(source).contains("fn worker"));
+  assert!(!production_source(source).contains("mod tests"));
+}
+
+#[test]
+fn mutex_gate_normalizes_qualified_whitespace() {
+  let source = "type Handle = std :: sync :: Arc < tokio :: sync :: Mutex < crate :: core :: app :: App > >;\n#[cfg(test)]\nmod tests {}";
+  let production = strip_cfg_test_functions(production_source(source));
+  let compact: String = production.split_whitespace().collect();
+  assert!(compact.contains("Mutex<crate::core::app::App"));
 }
 
 #[test]

@@ -83,7 +83,7 @@ units under `src/`:
 
 | Unit | Role |
 |------|------|
-| `core/` | Centralized state (`App`), the frontend-neutral tick scheduler (`driver/`), the shared action vocabulary (`action/`), config/state persistence, and the rspotify-free domain types (`plugin_api`, `pagination`, `source`) |
+| `core/` | Fold-owned state (`App`), the shared action vocabulary (`action/`), config/state persistence, and the rspotify-free domain types (`plugin_api`, `pagination`, `source`) |
 | `cli/` | clap subcommands: playback control, listening history, self-update, MCP relay, plugin management |
 | `runtime/` | `mod.rs::run_cli` (entry point + CLI dispatch), `bootstrap.rs::boot` (frontend-neutral config/auth/`App` construction, `run_cli` its sole caller), `cli.rs` (clap assembly + self-update), `pump.rs::start_tokio` (the IoEvent pump), `startup.rs` (shared service startup), `frontend/` (the embedded runtime seam) |
 
@@ -91,19 +91,19 @@ units under `src/`:
 
 ```text
 frontend (runtime/frontend/) — the windowed GPUI app applies Actions and subscribes
-  to snapshots; the embedded tick loop drives driver::Driver
+  to snapshots; named deadlines emit typed timer facts
   → app.apply(Action)      - shared action vocabulary (see core/action/)
   → app.dispatch(IoEvent)  - hands async work to the pump in runtime/pump.rs
        → source routers by URI scheme, then infra/network/ (Spotify)
-       → mutates App state; change_notify bells → snapshot publisher → watch channel
+       → emits typed facts; the fold reduces App state → snapshot publisher → watch channel
 ```
 
-Everything on a timer lives in `core/driver/` (`Driver::tick`): the playback tick +
-debounced flushes, OAuth refresh, Discord/MPRIS presence sync, native-queue and
-decoded-source auto-advance, and `last_session.yml` persistence. The terminal
-runner that used to drive all of this from crossterm keystrokes was deleted in
-ticket 01 of ADR 0016; the windowed `runtime/frontend/` drives the driver on its
-own tick, which stages 2–5 of ADR 0016 replace with an event spine.
+Timer work is owned by the runtime deadline scheduler and emits typed timer
+facts onto the event spine. The fold is the sole owner of `App`; producers query
+the fold and publish facts rather than retaining an application handle. The
+terminal runner that used to drive this work from crossterm keystrokes was
+deleted in ticket 01 of ADR 0016; `runtime/frontend/` now drives the fold and
+deadline scheduler through the spine.
 
 ### The IoEvent pump: source routing, two lanes, an auth gate
 

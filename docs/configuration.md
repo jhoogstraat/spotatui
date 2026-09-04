@@ -17,7 +17,7 @@ Machine-managed runtime state lives separately in `$XDG_STATE_HOME/spotatui/stat
 
 A typo in `config.yml` never prevents the app from starting. Structural mistakes (an unknown sort field, a bad template placeholder, an invalid column id, an icon that is too wide) are logged as warnings and the affected value falls back to its built-in default. Warnings go to the log file whose path is printed at startup, a `spotatui_logs/spotatuilog<pid>` file inside your system temp directory (`%TEMP%` on Windows, `$TMPDIR` where set, otherwise `/tmp`). The startup line reports the resolved path, so copy it from there rather than guessing.
 
-Only two kinds of errors are fatal: YAML syntax errors (the file cannot be parsed at all) and a handful of out-of-range numeric values that bypass the warn-and-fallback policy: `volume_increment` outside 0–100, a tick rate (or animation tick rate) outside 1–999ms, an unparseable `auto_update_delay`, `playback_poll_seconds` below 1, and `like_animation_frames` below 1.
+Only two kinds of errors are fatal: YAML syntax errors (the file cannot be parsed at all) and a handful of out-of-range numeric values that bypass the warn-and-fallback policy: `volume_increment` outside 0–100, an unparseable `auto_update_delay`, `playback_poll_seconds` below 1, and `like_animation_frames` below 1.
 
 ## Behavior
 
@@ -27,10 +27,6 @@ Only two kinds of errors are fatal: YAML syntax errors (the file cannot be parse
 behavior:
   # Timing
   seek_milliseconds: 5000          # seek step for < / >
-  tick_rate_milliseconds: 250      # UI event-loop cadence (1..=999, fatal if outside)
-  animation_tick_rate_milliseconds: 16
-                                   # animation-only cadence, e.g. the like-heart burst
-                                   #   (1..=999, fatal if outside)
   playback_poll_seconds: 5         # how often playback state is polled (min 1, fatal if 0;
                                    #   near track end the app polls faster regardless)
   status_message_ttl_percent: 100  # scales how long status messages stay visible

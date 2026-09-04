@@ -70,6 +70,9 @@ pub struct PlayerEventContext {
   /// their only consumer and the single writer of the mirrored fields.
   pub spine: crate::runtime::engine::Spine,
   pub recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
+  /// Runtime shutdown signal. End-of-track recovery continuations must stop
+  /// before they can publish a late `EnsurePlaybackContinues` event.
+  pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 pub struct StreamingRecoveryContext {
@@ -227,6 +230,7 @@ async fn handle_streaming_recovery(mut ctx: StreamingRecoveryContext) {
           shared_is_playing: Arc::clone(&ctx.shared_is_playing),
           spine: ctx.spine.clone(),
           recovery_tx: ctx.recovery_tx.clone(),
+          shutdown_rx: ctx.shutdown_rx.clone(),
         });
 
         info!(
@@ -320,6 +324,7 @@ pub fn spawn_player_event_handler(ctx: PlayerEventContext) -> tokio::task::JoinH
   let shared_is_playing = Arc::clone(&ctx.shared_is_playing);
   let spine = ctx.spine.clone();
   let recovery_tx = ctx.recovery_tx.clone();
+  let shutdown_rx = ctx.shutdown_rx.clone();
 
   tokio::spawn(async move {
     handle_player_events(
@@ -329,6 +334,7 @@ pub fn spawn_player_event_handler(ctx: PlayerEventContext) -> tokio::task::JoinH
       shared_is_playing,
       spine,
       recovery_tx,
+      shutdown_rx,
     )
     .await;
   })
@@ -345,6 +351,7 @@ async fn handle_player_events(
   shared_is_playing: Arc<AtomicBool>,
   spine: crate::runtime::engine::Spine,
   recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
+  mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
   // Count consecutive failed (Unavailable) loads so we can escalate the message
   // when an account is hit by the upstream Spotify audio-key block (#282). A
@@ -461,6 +468,12 @@ async fn handle_player_events(
             pending_end_of_track.clone(),
           )
           .await;
+          return;
+        }
+        continue;
+      }
+      changed = shutdown_rx.changed() => {
+        if changed.is_err() || *shutdown_rx.borrow() {
           return;
         }
         continue;
@@ -744,6 +757,7 @@ async fn handle_player_events(
             Arc::clone(&player),
             previous_track_id,
             Arc::clone(&playback_transition_generation),
+            shutdown_rx.clone(),
           );
         }
       }
@@ -1009,11 +1023,15 @@ fn spawn_end_of_track_continuation(
   player: Arc<StreamingPlayer>,
   previous_track_id: String,
   playback_transition_generation: Arc<AtomicU64>,
+  mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
   let observed_transition_generation = playback_transition_generation.load(Ordering::Relaxed);
   let mut connection_state_rx = player.connection_state_receiver();
 
   tokio::spawn(async move {
+    if *shutdown_rx.borrow() {
+      return;
+    }
     let wait_for_stable_connection = async {
       loop {
         let connection_state = *connection_state_rx.borrow_and_update();
@@ -1041,10 +1059,11 @@ fn spawn_end_of_track_continuation(
       }
     };
 
-    if !tokio::time::timeout(END_OF_TRACK_RECONNECT_TIMEOUT, wait_for_stable_connection)
-      .await
-      .unwrap_or(false)
-    {
+    let stable = tokio::select! {
+      _ = shutdown_rx.changed() => false,
+      stable = tokio::time::timeout(END_OF_TRACK_RECONNECT_TIMEOUT, wait_for_stable_connection) => stable.unwrap_or(false),
+    };
+    if !stable {
       warn!(
         "end-of-track continuation for {} abandoned: no stable connection within {}s",
         previous_track_id,
@@ -1058,6 +1077,7 @@ fn spawn_end_of_track_continuation(
     // alone is not sufficient: a dead connection can stall after that event.
     if playback_transition_generation.load(Ordering::Relaxed) != observed_transition_generation
       || !is_current_streaming_player(&spine, &player).await
+      || *shutdown_rx.borrow()
     {
       return;
     }

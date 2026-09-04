@@ -267,6 +267,11 @@ pub enum DecodedSourceFact {
   LocalPlayback(crate::infra::local::LocalPlaybackState),
   #[cfg(feature = "local-files")]
   LocalPlaybackCleared,
+  #[cfg(feature = "local-files")]
+  LocalShuffleRestored {
+    shuffle_on: bool,
+    backup: Option<crate::infra::queue::ShuffleBackup>,
+  },
   #[cfg(feature = "subsonic")]
   SubsonicPlaylists(Vec<crate::core::plugin_api::PlaylistInfo>),
   #[cfg(feature = "subsonic")]
@@ -275,6 +280,11 @@ pub enum DecodedSourceFact {
   SubsonicPlayback(crate::infra::subsonic::SubsonicPlaybackState),
   #[cfg(feature = "subsonic")]
   SubsonicPlaybackCleared,
+  #[cfg(feature = "subsonic")]
+  SubsonicShuffleRestored {
+    shuffle_on: bool,
+    backup: Option<crate::infra::queue::ShuffleBackup>,
+  },
   #[cfg(feature = "internet-radio")]
   RadioStations(Vec<crate::core::plugin_api::TrackInfo>),
   #[cfg(feature = "internet-radio")]
@@ -297,6 +307,11 @@ pub enum DecodedSourceFact {
   YouTubePlayback(crate::infra::youtube::YouTubePlaybackState),
   #[cfg(feature = "youtube")]
   YouTubePlaybackCleared,
+  #[cfg(feature = "youtube")]
+  YouTubeShuffleRestored {
+    shuffle_on: bool,
+    backup: Option<crate::infra::queue::ShuffleBackup>,
+  },
   #[cfg(feature = "youtube")]
   YouTubeStatus { message: String, ttl_secs: u64 },
   #[cfg(feature = "youtube")]
@@ -526,7 +541,12 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::QueueTransportIntent { .. } => "QueueTransportIntent",
       #[cfg(feature = "streaming")]
       Self::QueueSpotifyPausedRestored { .. } => "QueueSpotifyPausedRestored",
-      #[cfg(feature = "streaming")]
+      #[cfg(any(
+        feature = "streaming",
+        feature = "local-files",
+        feature = "subsonic",
+        feature = "youtube"
+      ))]
       Self::QueueNativeTrackPopped { .. } => "QueueNativeTrackPopped",
       #[cfg(any(
         feature = "streaming",
@@ -567,6 +587,8 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::LocalPlayback(_) => "LocalPlayback",
       #[cfg(feature = "local-files")]
       Self::LocalPlaybackCleared => "LocalPlaybackCleared",
+      #[cfg(feature = "local-files")]
+      Self::LocalShuffleRestored { .. } => "LocalShuffleRestored",
       #[cfg(feature = "subsonic")]
       Self::SubsonicPlaylists(_) => "SubsonicPlaylists",
       #[cfg(feature = "subsonic")]
@@ -575,6 +597,8 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::SubsonicPlayback(_) => "SubsonicPlayback",
       #[cfg(feature = "subsonic")]
       Self::SubsonicPlaybackCleared => "SubsonicPlaybackCleared",
+      #[cfg(feature = "subsonic")]
+      Self::SubsonicShuffleRestored { .. } => "SubsonicShuffleRestored",
       #[cfg(feature = "internet-radio")]
       Self::RadioStations(_) => "RadioStations",
       #[cfg(feature = "internet-radio")]
@@ -595,6 +619,8 @@ impl std::fmt::Debug for DecodedSourceFact {
       Self::YouTubePlayback(_) => "YouTubePlayback",
       #[cfg(feature = "youtube")]
       Self::YouTubePlaybackCleared => "YouTubePlaybackCleared",
+      #[cfg(feature = "youtube")]
+      Self::YouTubeShuffleRestored { .. } => "YouTubeShuffleRestored",
       #[cfg(feature = "youtube")]
       Self::YouTubeStatus { .. } => "YouTubeStatus",
       #[cfg(feature = "youtube")]
@@ -1530,7 +1556,7 @@ pub enum FoldQuery {
   #[cfg(feature = "dj-core")]
   DjVibe,
   /// Immutable DJ turn inputs sampled by the fold before a worker starts.
-  #[cfg(feature = "dj-core")]
+  #[cfg(feature = "ai-dj")]
   DjContext,
   /// The announcement-surface sources: whether the feature is enabled, the
   /// configured feed URL, and the seen-announcement dedup set.
@@ -1762,7 +1788,7 @@ pub enum FoldAnswer {
     auto_queue: bool,
   },
   /// Conversation/configuration inputs for one DJ worker turn.
-  #[cfg(feature = "dj-core")]
+  #[cfg(feature = "ai-dj")]
   DjContext {
     period: crate::infra::history::RecapPeriod,
     want: usize,
@@ -1899,7 +1925,7 @@ impl std::fmt::Debug for FoldAnswer {
         .field("vibe", vibe)
         .field("auto_queue", auto_queue)
         .finish(),
-      #[cfg(feature = "dj-core")]
+      #[cfg(feature = "ai-dj")]
       FoldAnswer::DjContext {
         period,
         want,
@@ -2205,7 +2231,12 @@ pub struct FoldAck {
   #[cfg(feature = "streaming")]
   pub native: Option<NativePlaybackAck>,
   /// Track atomically removed by a native-queue pop fact.
-  #[cfg(feature = "streaming")]
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube"
+  ))]
   pub queue_track: Option<crate::core::plugin_api::TrackInfo>,
   /// Handles removed by an ordered backend-ownership claim.
   #[cfg(any(
@@ -2406,6 +2437,10 @@ pub struct Spine {
   events_tx: mpsc::Sender<SpineMessage>,
   queries_tx: mpsc::Sender<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
   activity_tx: watch::Sender<u64>,
+  /// Linearizes shutdown with producer sends. A final flush takes the write
+  /// lock, so all sends already in flight finish first and later emissions are
+  /// rejected without touching the fold.
+  closed: Arc<tokio::sync::RwLock<bool>>,
 }
 
 /// One FIFO envelope consumed by the fold. Acked commands share this queue
@@ -2442,6 +2477,7 @@ impl Spine {
         events_tx,
         queries_tx,
         activity_tx,
+        closed: Arc::new(tokio::sync::RwLock::new(false)),
       },
       events_rx,
       QueryReceiver {
@@ -2452,11 +2488,21 @@ impl Spine {
 
   /// Push an event, waiting for bounded capacity so unique facts are not lost.
   pub async fn emit(&self, event: EngineEvent) {
+    let closed = self.closed.read().await;
+    if *closed {
+      return;
+    }
     let _ = self.events_tx.send(SpineMessage::Event(event)).await;
   }
   /// Synchronous fire-and-forget for contexts holding no async reactor
   /// (blocking threads, drop paths). Same lossy-on-overflow contract.
   pub fn emit_now(&self, event: EngineEvent) {
+    let Ok(closed) = self.closed.try_read() else {
+      return;
+    };
+    if *closed {
+      return;
+    }
     let _ = self.events_tx.try_send(SpineMessage::Event(event));
   }
 
@@ -2466,6 +2512,10 @@ impl Spine {
   /// the fold's queue order, so the answer reflects every event queued
   /// before this one — stream order is preserved, no lock needed.
   pub async fn emit_acked(&self, event: EngineEvent) -> Option<FoldAck> {
+    let closed = self.closed.read().await;
+    if *closed {
+      return None;
+    }
     let (tx, rx) = oneshot::channel();
     self
       .events_tx
@@ -2497,6 +2547,10 @@ impl Spine {
   /// Ask the fold for the state a decision needs, awaiting the answer.
   /// Errors only when the fold task is gone (boot ordering or shutdown).
   pub async fn query(&self, query: FoldQuery) -> Result<FoldAnswer, SpineClosed> {
+    let closed = self.closed.read().await;
+    if *closed {
+      return Err(SpineClosed);
+    }
     let (tx, rx) = oneshot::channel();
     self
       .queries_tx
@@ -2504,6 +2558,25 @@ impl Spine {
       .await
       .map_err(|_| SpineClosed)?;
     rx.await.map_err(|_| SpineClosed)?
+  }
+
+  /// Close producer ingress and enqueue the one ordered final flush. The write
+  /// lock waits for every in-flight producer send/query to release its read
+  /// guard, then rejects all late emissions while allowing this flush through.
+  pub async fn final_flush(&self) -> Option<FoldAck> {
+    let mut closed = self.closed.write().await;
+    *closed = true;
+    let (tx, rx) = oneshot::channel();
+    self
+      .events_tx
+      .send(SpineMessage::Ack {
+        event: EngineEvent::Session(SessionFact::FlushPersistence),
+        responder: tx,
+      })
+      .await
+      .ok()?;
+    drop(closed);
+    rx.await.ok().flatten()
   }
 
   /// Resolve once the receiving end is up, for boot ordering asserts.
@@ -2680,5 +2753,32 @@ mod tests {
     revoker.join().unwrap();
     assert!(done.try_recv().is_ok());
     assert!(lease.with_valid(|| ()).is_none(), "stale start is rejected");
+  }
+
+  #[tokio::test]
+  async fn final_flush_closes_late_producers_after_ordered_barrier() {
+    let (spine, mut events, _) = Spine::open(Default::default());
+    let flush = tokio::spawn({
+      let spine = spine.clone();
+      async move { spine.final_flush().await }
+    });
+    let Some(SpineMessage::Ack { event, responder }) = events.recv().await else {
+      panic!("final flush should enqueue an ack");
+    };
+    assert!(matches!(
+      event,
+      EngineEvent::Session(SessionFact::FlushPersistence)
+    ));
+    let _ = responder.send(None);
+    assert!(flush.await.unwrap().is_none());
+    assert!(spine
+      .emit_acked(EngineEvent::Session(SessionFact::Status {
+        message: "late".into(),
+        ttl_secs: 1,
+        is_error: false,
+      }))
+      .await
+      .is_none());
+    assert!(spine.query(FoldQuery::NextDeadline).await.is_err());
   }
 }

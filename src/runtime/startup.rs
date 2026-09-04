@@ -603,6 +603,7 @@ async fn deferred_streaming_startup_inner(
     shared_is_playing: ctx.shared_is_playing,
     spine: ctx.spine.clone(),
     recovery_tx: ctx.recovery_tx,
+    shutdown_rx: ctx.shutdown_rx.clone(),
   });
 
   // Auto-select the saved playback device when available (fallback to native
@@ -700,6 +701,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let (spine_for_events, spine_rx, spine_queries) =
     crate::runtime::engine::Spine::open(Default::default());
   let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+  let mut producer_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
   app.spine = Some(spine_for_events.clone());
   let sync_io_rx = boot.sync_io_rx;
   let user_config = boot.user_config;
@@ -792,8 +794,15 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     if enabled {
       match io_tx {
         Some(io_tx) => {
-          match crate::infra::mcp::spawn_listener(io_tx, spine_for_events.clone()).await {
-            Ok(port) => {
+          match crate::infra::mcp::spawn_listener(
+            io_tx,
+            spine_for_events.clone(),
+            shutdown_tx.subscribe(),
+          )
+          .await
+          {
+            Ok((port, task)) => {
+              producer_tasks.push(task);
               let _ = spine_for_events
                 .emit(crate::runtime::engine::EngineEvent::Session(
                   crate::runtime::engine::SessionFact::Status {
@@ -849,7 +858,6 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // catalog (dispatchers, network layer). The fold task in `frontend` takes
   // the receiving half via Services.
   let history_collector = crate::infra::history::spawn_history_collector(spine_for_events.clone());
-  let mut producer_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
   #[cfg(feature = "streaming")]
   {
     app.streaming_recovery_tx = Some(streaming_recovery_tx.clone());
@@ -941,7 +949,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     let discord = discord.clone();
     let spine_for_discord = spine_for_events.clone();
     let mut activity_rx = spine_for_discord.subscribe_activity();
-    tokio::spawn(async move {
+    producer_tasks.push(tokio::spawn(async move {
       let mut last_snapshot = None;
       loop {
         if activity_rx.changed().await.is_err() {
@@ -963,7 +971,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         }
         last_snapshot = snapshot;
       }
-    });
+    }));
   }
 
   #[cfg(all(feature = "mpris", target_os = "linux"))]
@@ -971,7 +979,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     let mpris_for_metadata = Arc::clone(mpris);
     let spine_for_mpris_metadata = spine_for_events.clone();
     let mut activity_rx = spine_for_mpris_metadata.subscribe_activity();
-    tokio::spawn(async move {
+    producer_tasks.push(tokio::spawn(async move {
       let mut last_metadata = None;
       loop {
         if activity_rx.changed().await.is_err() {
@@ -997,7 +1005,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         };
         update_mpris_metadata(&mpris_for_metadata, &mut last_metadata, snapshot, volume);
       }
-    });
+    }));
   }
 
   // Spawn MPRIS event handler to process external control requests (media keys, playerctl)
@@ -1006,9 +1014,9 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     if let Some(event_rx) = mpris.take_event_rx() {
       let mpris_for_seek = Arc::clone(mpris);
       let spine_for_mpris = spine_for_events.clone();
-      tokio::spawn(async move {
+      producer_tasks.push(tokio::spawn(async move {
         handle_mpris_events(event_rx, mpris_for_seek, spine_for_mpris).await;
-      });
+      }));
     }
   }
 
@@ -1017,9 +1025,9 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   if let Some(ref macos_media) = macos_media_manager {
     if let Some(event_rx) = macos_media.take_event_rx() {
       let spine_for_macos = spine_for_events.clone();
-      tokio::spawn(async move {
+      producer_tasks.push(tokio::spawn(async move {
         handle_macos_media_events(event_rx, spine_for_macos).await;
-      });
+      }));
     }
   }
 
@@ -1030,7 +1038,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     let macos_media_for_metadata = Arc::clone(macos_media);
     let spine_for_macos_metadata = spine_for_events.clone();
     let mut activity_rx = spine_for_events.subscribe_activity();
-    tokio::spawn(async move {
+    producer_tasks.push(tokio::spawn(async move {
       let mut last_metadata: Option<MacosMetadata> = None;
 
       loop {
@@ -1046,16 +1054,16 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         };
         update_macos_metadata(&macos_media_for_metadata, &mut last_metadata, snapshot);
       }
-    });
+    }));
   }
 
   #[cfg(all(feature = "windows-media", target_os = "windows"))]
   if let Some(ref windows_media) = windows_media_manager {
     if let Some(event_rx) = windows_media.take_event_rx() {
       let spine_for_windows = spine_for_events.clone();
-      tokio::spawn(async move {
+      producer_tasks.push(tokio::spawn(async move {
         handle_windows_media_events(event_rx, spine_for_windows).await;
-      });
+      }));
     }
   }
 
@@ -1064,7 +1072,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     let windows_media_for_metadata = Arc::clone(windows_media);
     let spine_for_windows_metadata = spine_for_events.clone();
     let mut activity_rx = spine_for_events.subscribe_activity();
-    tokio::spawn(async move {
+    producer_tasks.push(tokio::spawn(async move {
       let mut last_metadata: Option<WindowsMetadata> = None;
 
       loop {
@@ -1080,7 +1088,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         };
         update_windows_metadata(&windows_media_for_metadata, &mut last_metadata, snapshot);
       }
-    });
+    }));
   }
 
   // Kick off the deferred native-streaming startup: account probe, librespot
@@ -1342,6 +1350,14 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(queue), Some(index)),
       )
       .await;
+      let _ = spine
+        .emit_acked(EngineEvent::Decoded(
+          crate::runtime::engine::DecodedSourceFact::LocalShuffleRestored {
+            shuffle_on,
+            backup: shuffle,
+          },
+        ))
+        .await;
       restore_controls(
         spine,
         position_ms,
@@ -1380,6 +1396,14 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
+      let _ = spine
+        .emit_acked(EngineEvent::Decoded(
+          crate::runtime::engine::DecodedSourceFact::SubsonicShuffleRestored {
+            shuffle_on,
+            backup: shuffle,
+          },
+        ))
+        .await;
       restore_controls(
         spine,
         position_ms,
@@ -1417,6 +1441,14 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
+      let _ = spine
+        .emit_acked(EngineEvent::Decoded(
+          crate::runtime::engine::DecodedSourceFact::YouTubeShuffleRestored {
+            shuffle_on,
+            backup: shuffle,
+          },
+        ))
+        .await;
       restore_controls(
         spine,
         position_ms,

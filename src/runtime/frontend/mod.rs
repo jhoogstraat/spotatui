@@ -334,13 +334,23 @@ impl Runtime {
       // fold performs its final persistence barrier, so no late completion can
       // resurrect state after the flush.
       let _ = shutdown_tx.send(true);
-      for mut task in producer_tasks {
-        let abort = task.abort_handle();
-        if tokio::time::timeout(Duration::from_secs(2), &mut task)
-          .await
-          .is_err()
-        {
-          abort.abort();
+      let mut producer_tasks = producer_tasks;
+      if tokio::time::timeout(
+        Duration::from_secs(2),
+        futures::future::join_all(producer_tasks.iter_mut()),
+      )
+      .await
+      .is_err()
+      {
+        for task in &producer_tasks {
+          if !task.is_finished() {
+            task.abort();
+          }
+        }
+        for task in producer_tasks {
+          if !task.is_finished() {
+            let _ = task.await;
+          }
         }
       }
       #[cfg(feature = "streaming")]
@@ -362,14 +372,19 @@ impl Runtime {
             .await;
           tokio::time::sleep(Duration::from_millis(150)).await;
         }
+        // Put the command router into its terminal mode before persistence.
+        // Delayed transport helpers may still wake, but can no longer
+        // reactivate the device or enqueue playback after shutdown starts.
+        player.shutdown();
       }
-      // Emit an acked fact so the final flush is ordered in the fold event
-      // stream, rather than racing a direct App lock.
-      let _ = spine
-        .emit_acked(crate::runtime::engine::EngineEvent::Session(
-          crate::runtime::engine::SessionFact::FlushPersistence,
-        ))
-        .await;
+      // Quiesce the history writer before closing producer ingress, so its
+      // final listen cannot land after the persisted-session snapshot.
+      if let Some(history) = history_collector {
+        history.shutdown().await;
+      }
+      // Close producer ingress and enqueue the one ordered final flush. The
+      // spine barrier rejects all late completions after this point.
+      let _ = spine.final_flush().await;
       // Signal fold completion after the ordered flush; its select observes
       // the closed publication channel and exits even though it owns a spine
       // sender for observer notifications.
@@ -379,9 +394,6 @@ impl Runtime {
       drop(spine);
       if let Some(task) = deadline_task.take() { task.abort(); let _ = task.await; }
       if let Some(task) = fold_task.take() { let _ = task.await; }
-      if let Some(history) = history_collector {
-        history.shutdown().await;
-      }
     });
     Ok(())
   }
@@ -554,7 +566,7 @@ impl Default for Snapshot {
 /// answered. Returns the spine handle and the snapshot watch receiver.
 #[cfg(test)]
 pub(crate) async fn spawn_fold(
-  app: &Arc<tokio::sync::Mutex<App>>,
+  app: &Arc<tokio::sync::Mutex<crate::core::app::App>>,
 ) -> (
   crate::runtime::engine::Spine,
   tokio::sync::watch::Receiver<Snapshot>,
@@ -605,12 +617,12 @@ pub(crate) async fn spawn_fold(
 }
 
 /// Compatibility harness for unit tests and legacy command surfaces that still
-/// construct an `Arc<Mutex<App>>`. Production startup transfers the plain App
+/// construct a mutex-wrapped App. Production startup transfers the plain App
 /// into `fold_loop`; this shim is intentionally kept out of that ownership
 /// path until those callers migrate to the spine.
 #[cfg(test)]
 async fn fold_loop_shared(
-  app: Arc<tokio::sync::Mutex<App>>,
+  app: Arc<tokio::sync::Mutex<crate::core::app::App>>,
   tx: watch::Sender<Snapshot>,
   mut events_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::SpineMessage>,
   folds: Option<crate::runtime::engine::FoldHandles>,
@@ -948,8 +960,14 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         next_playlist_tracks_offset: None,
         action_outcome: None,
         #[cfg(feature = "streaming")]
-        native: None,
         #[cfg(feature = "streaming")]
+        native: None,
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -985,7 +1003,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1021,7 +1044,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1057,7 +1085,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1088,7 +1121,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: Some(app.apply(action.clone())),
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1130,6 +1168,7 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         next_saved_tracks_offset: None,
         next_playlist_tracks_offset: None,
         action_outcome: None,
+        #[cfg(feature = "streaming")]
         native: None,
         queue_track: popped,
         #[cfg(any(
@@ -1174,7 +1213,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1252,7 +1296,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         backend_players: Some(claim),
         #[cfg(any(feature = "subsonic", feature = "youtube"))]
@@ -1285,7 +1334,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1348,7 +1402,12 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
         action_outcome: None,
         #[cfg(feature = "streaming")]
         native: None,
-        #[cfg(feature = "streaming")]
+        #[cfg(any(
+          feature = "streaming",
+          feature = "local-files",
+          feature = "subsonic",
+          feature = "youtube"
+        ))]
         queue_track: None,
         #[cfg(any(
           feature = "local-files",
@@ -1552,7 +1611,12 @@ pub(crate) fn apply_decoded_source_fact(
     }
   }
 
-  #[cfg(feature = "streaming")]
+  #[cfg(any(
+    feature = "streaming",
+    feature = "local-files",
+    feature = "subsonic",
+    feature = "youtube"
+  ))]
   fn pop_native_queue(
     app: &mut App,
     expected: &crate::core::plugin_api::TrackInfo,
@@ -1743,6 +1807,12 @@ pub(crate) fn apply_decoded_source_fact(
       }
     }
     #[cfg(feature = "local-files")]
+    DecodedSourceFact::LocalShuffleRestored { shuffle_on, backup } => {
+      if let Some(local) = app.local_playback.as_mut() {
+        local.restore_shuffle(shuffle_on, backup);
+      }
+    }
+    #[cfg(feature = "local-files")]
     DecodedSourceFact::LocalAdvancing(value) => {
       if let Some(local) = app.local_playback.as_mut() {
         local.advancing = value;
@@ -1810,6 +1880,12 @@ pub(crate) fn apply_decoded_source_fact(
     DecodedSourceFact::SubsonicPlaybackCleared => {
       if let Some(s) = app.subsonic_playback.take() {
         s.player.stop();
+      }
+    }
+    #[cfg(feature = "subsonic")]
+    DecodedSourceFact::SubsonicShuffleRestored { shuffle_on, backup } => {
+      if let Some(session) = app.subsonic_playback.as_mut() {
+        session.restore_shuffle(shuffle_on, backup);
       }
     }
     #[cfg(feature = "subsonic")]
@@ -1930,6 +2006,12 @@ pub(crate) fn apply_decoded_source_fact(
     DecodedSourceFact::YouTubePlaybackCleared => {
       if let Some(s) = app.youtube_playback.take() {
         s.player.stop();
+      }
+    }
+    #[cfg(feature = "youtube")]
+    DecodedSourceFact::YouTubeShuffleRestored { shuffle_on, backup } => {
+      if let Some(session) = app.youtube_playback.as_mut() {
+        session.restore_shuffle(shuffle_on, backup);
       }
     }
     #[cfg(feature = "youtube")]
@@ -3306,7 +3388,7 @@ pub(crate) fn answer_query(
       vibe: app.dj.vibe.clone(),
       auto_queue: app.dj.auto_queue,
     },
-    #[cfg(feature = "dj-core")]
+    #[cfg(feature = "ai-dj")]
     FoldQuery::DjContext => FoldAnswer::DjContext {
       period: crate::infra::dj::session::period_from_config(
         &app.user_config.behavior.dj_history_period,

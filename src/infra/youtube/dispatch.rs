@@ -160,7 +160,10 @@ pub async fn route_youtube_event_spine(spine: &Spine, event: &IoEvent) -> bool {
 
 /// Compatibility wrapper for source-unit tests that construct an App directly.
 #[cfg(test)]
-pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
+pub async fn route_youtube_event(
+  app: &Arc<tokio::sync::Mutex<crate::core::app::App>>,
+  event: &IoEvent,
+) -> bool {
   let Some(spine) = app.lock().await.spine.clone() else {
     return false;
   };

@@ -147,7 +147,8 @@ fn generate_token() -> Result<String> {
 pub async fn spawn_listener(
   io_tx: Sender<IoEvent>,
   spine: crate::runtime::engine::Spine,
-) -> Result<u16> {
+  mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(u16, tokio::task::JoinHandle<()>)> {
   let listener = TcpListener::bind(("127.0.0.1", 0))
     .await
     .context("could not bind the MCP control socket on 127.0.0.1")?;
@@ -161,9 +162,14 @@ pub async fn spawn_listener(
   })
   .context("could not publish the MCP control file")?;
 
-  tokio::spawn(async move {
+  let task = tokio::spawn(async move {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-      let (stream, peer) = match listener.accept().await {
+      let accepted = tokio::select! {
+        _ = shutdown_rx.changed() => break,
+        accepted = listener.accept() => accepted,
+      };
+      let (stream, peer) = match accepted {
         Ok(accepted) => accepted,
         Err(e) => {
           log::warn!("MCP: accept failed: {e}");
@@ -184,15 +190,18 @@ pub async fn spawn_listener(
       let io_tx = io_tx.clone();
       let spine = spine.clone();
       let token = token.clone();
-      tokio::spawn(async move {
+      connections.spawn(async move {
         if let Err(e) = serve_connection(stream, io_tx, spine, token, HANDSHAKE_TIMEOUT).await {
           log::debug!("MCP: connection ended: {e}");
         }
       });
     }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    clear_handshake();
   });
 
-  Ok(port)
+  Ok((port, task))
 }
 
 /// Authenticate one connection, then hand it to the protocol loop.
@@ -389,7 +398,8 @@ mod tests {
     let (io_tx, _io_rx) = std::sync::mpsc::channel();
     let _app = Arc::new(Mutex::new(App::default()));
     let (spine, _spine_rx) = crate::runtime::frontend::spawn_fold(&_app).await;
-    let port = spawn_listener(io_tx, spine)
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (port, task) = spawn_listener(io_tx, spine, shutdown_rx)
       .await
       .expect("listener should bind");
 
@@ -411,7 +421,8 @@ mod tests {
       .expect("the probe should reach the listener");
     assert_eq!(version, super::super::protocol::PROTOCOL_MODERN);
 
-    clear_handshake();
+    shutdown_tx.send(true).unwrap();
+    task.await.unwrap();
     assert!(read_handshake().is_err(), "shutdown should unpublish it");
     unsafe { std::env::remove_var(HANDSHAKE_PATH_ENV) };
     let _ = std::fs::remove_dir_all(&dir);
