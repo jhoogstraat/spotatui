@@ -31,8 +31,6 @@ use tempfile::NamedTempFile;
 use super::{is_youtube_uri, video_id_from_uri, YouTubePlaybackState, YouTubeSource};
 #[cfg(test)]
 use crate::core::app::App;
-#[cfg(test)]
-use tokio::sync::Mutex;
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::pagination::Paged;
 use crate::core::plugin_api::TrackInfo;
@@ -44,6 +42,8 @@ use crate::runtime::engine::{
   DecodedSourceAnswer as Answer, DecodedSourceFact as Fact, DecodedSourceQuery as Query,
   EngineEvent, FoldAnswer, FoldQuery, Spine,
 };
+#[cfg(test)]
+use tokio::sync::Mutex;
 
 /// Skip direction within the YouTube queue.
 #[derive(Clone, Copy)]
@@ -160,10 +160,7 @@ pub async fn route_youtube_event_spine(spine: &Spine, event: &IoEvent) -> bool {
 
 /// Compatibility wrapper for source-unit tests that construct an App directly.
 #[cfg(test)]
-pub async fn route_youtube_event(
-  app: &Arc<Mutex<App>>,
-  event: &IoEvent,
-) -> bool {
+pub async fn route_youtube_event(app: &Arc<Mutex<App>>, event: &IoEvent) -> bool {
   let Some(spine) = app.lock().await.spine.clone() else {
     return false;
   };
@@ -203,10 +200,7 @@ async fn emit(spine: &Spine, fact: Fact) {
 /// Run a YouTube search and populate `app.search_results`. Like the Subsonic
 /// M2 search, only the songs block is populated — each row is a video; Enter
 /// dispatches the `youtube:` URIs back through this module.
-async fn run_youtube_search(
-  spine: &crate::runtime::engine::Spine,
-  query: &str,
-) {
+async fn run_youtube_search(spine: &crate::runtime::engine::Spine, query: &str) {
   let generation = spine
     .emit_acked(crate::runtime::engine::EngineEvent::Catalog(
       CatalogStateEvent::SearchRequested {
@@ -220,7 +214,11 @@ async fn run_youtube_search(
   let Some(generation) = generation else {
     return;
   };
-  let ytdlp_path = match spine.query(FoldQuery::Decoded(Query::YouTubeConfig)).await.ok() {
+  let ytdlp_path = match spine
+    .query(FoldQuery::Decoded(Query::YouTubeConfig))
+    .await
+    .ok()
+  {
     Some(FoldAnswer::Decoded(Answer::YouTubeConfig(path))) => path,
     _ => None,
   };

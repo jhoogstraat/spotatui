@@ -1895,7 +1895,12 @@ impl std::fmt::Debug for FoldAnswer {
         .field("auto_queue", auto_queue)
         .finish(),
       #[cfg(feature = "dj-core")]
-      FoldAnswer::DjContext { period, want, transcript, avoid_library } => f
+      FoldAnswer::DjContext {
+        period,
+        want,
+        transcript,
+        avoid_library,
+      } => f
         .debug_struct("DjContext")
         .field("period", period)
         .field("want", want)

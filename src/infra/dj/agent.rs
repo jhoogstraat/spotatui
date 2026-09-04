@@ -18,10 +18,13 @@ use super::exec::ToolExecutor;
 use super::session::TurnContext;
 use super::tools::{self, DjToolCall, ToolCallError};
 use super::{DjLine, DjSpeaker};
+#[cfg(test)]
 use crate::core::app::App;
 use crate::runtime::engine::{EngineEvent, SessionFact};
 use crate::runtime::engine::{FoldAnswer, FoldQuery};
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 /// Steps a conversational turn may take.

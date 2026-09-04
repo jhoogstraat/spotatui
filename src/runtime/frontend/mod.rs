@@ -239,7 +239,12 @@ impl Runtime {
     let deadline_task = {
       let spine = command_spine.clone();
       let shutdown_rx = shutdown_tx.subscribe();
-      rt.spawn(deadline_scheduler(spine, snapshot_rx, deadline_rx, Some(shutdown_rx)))
+      rt.spawn(deadline_scheduler(
+        spine,
+        snapshot_rx,
+        deadline_rx,
+        Some(shutdown_rx),
+      ))
     };
     Ok(Runtime {
       rt,
@@ -314,7 +319,16 @@ impl Runtime {
   /// state, pause native playback, stop the collector, and end every task
   /// this runtime started. Blocks until the quit sequence finishes.
   pub fn shutdown(self) -> Result<()> {
-    let Runtime { rt, snapshot_tx, shutdown_tx, spine, mut fold_task, mut deadline_task, history_collector, producer_tasks } = self;
+    let Runtime {
+      rt,
+      snapshot_tx,
+      shutdown_tx,
+      spine,
+      mut fold_task,
+      mut deadline_task,
+      history_collector,
+      producer_tasks,
+    } = self;
     rt.block_on(async move {
       // Quiesce producer loops first. This closes the ingress path before the
       // fold performs its final persistence barrier, so no late completion can
@@ -644,7 +658,10 @@ async fn fold_loop_shared(
     );
     let ack_responder = match event {
       crate::runtime::engine::SpineMessage::Ack { event, responder } => {
-        let ack = { let mut guard = app.lock().await; apply_acked(&mut guard, event) };
+        let ack = {
+          let mut guard = app.lock().await;
+          apply_acked(&mut guard, event)
+        };
         Some((responder, ack))
       }
       crate::runtime::engine::SpineMessage::Event(event) => {
@@ -656,13 +673,25 @@ async fn fold_loop_shared(
             #[cfg(not(feature = "streaming"))]
             let _ = streaming;
           }
-          EngineEvent::Catalog(event) => { let _ = crate::core::apply_catalog_state(&mut guard, &event); }
-          EngineEvent::Session(fact) => { apply_session_fact(&mut guard, fact); }
-          EngineEvent::Decoded(fact) => { apply_decoded_source_fact(&mut guard, fact); }
-          EngineEvent::History(fact) => { apply_history_fact(&mut guard, fact); }
+          EngineEvent::Catalog(event) => {
+            let _ = crate::core::apply_catalog_state(&mut guard, &event);
+          }
+          EngineEvent::Session(fact) => {
+            apply_session_fact(&mut guard, fact);
+          }
+          EngineEvent::Decoded(fact) => {
+            apply_decoded_source_fact(&mut guard, fact);
+          }
+          EngineEvent::History(fact) => {
+            apply_history_fact(&mut guard, fact);
+          }
           #[cfg(feature = "streaming")]
-          EngineEvent::Native(fact) => { let _ = apply_native_fact(&mut guard, fact); }
-          EngineEvent::Timer(fact) => { apply_timer_fact(&mut guard, fact); }
+          EngineEvent::Native(fact) => {
+            let _ = apply_native_fact(&mut guard, fact);
+          }
+          EngineEvent::Timer(fact) => {
+            apply_timer_fact(&mut guard, fact);
+          }
         }
         None
       }
@@ -673,9 +702,15 @@ async fn fold_loop_shared(
       publish(&guard, &tx, &mut catalog);
     }
     spine.signal_folded();
-    if let Some((responder, ack)) = ack_responder { let _ = responder.send(ack); }
-    if stop_after_ack { break; }
-    if tx.is_closed() { break; }
+    if let Some((responder, ack)) = ack_responder {
+      let _ = responder.send(ack);
+    }
+    if stop_after_ack {
+      break;
+    }
+    if tx.is_closed() {
+      break;
+    }
   }
 }
 
@@ -784,7 +819,9 @@ pub(super) async fn fold_loop(
     if let Some((responder, ack)) = ack_responder {
       let _ = responder.send(ack);
     }
-    if stop_after_ack { break; }
+    if stop_after_ack {
+      break;
+    }
     if tx.is_closed() {
       break;
     }
@@ -869,11 +906,7 @@ impl CatalogPublication {
   }
 }
 
-fn publish(
-  app: &App,
-  tx: &watch::Sender<Snapshot>,
-  catalog: &mut CatalogPublication,
-) {
+fn publish(app: &App, tx: &watch::Sender<Snapshot>, catalog: &mut CatalogPublication) {
   let mut next = {
     let previous = tx.borrow();
     catalog.revise(build_snapshot(app), &previous)
@@ -4213,7 +4246,14 @@ mod tests {
     let folds = queries.take().await;
     let (tx, mut snapshots) = watch::channel(Snapshot::default());
     let (deadline_tx, _deadline_rx) = watch::channel(0u64);
-    let task = tokio::spawn(fold_loop(app, tx, events_rx, folds, deadline_tx, spine.clone()));
+    let task = tokio::spawn(fold_loop(
+      app,
+      tx,
+      events_rx,
+      folds,
+      deadline_tx,
+      spine.clone(),
+    ));
     snapshots.changed().await.unwrap();
     assert!(snapshots.borrow().spotify_connected);
     drop(spine);
@@ -4739,7 +4779,14 @@ mod tests {
     let (snapshot_tx, mut snapshot_rx) = watch::channel(Snapshot::default());
     let (deadline_tx, deadline_rx) = watch::channel(0u64);
     let fold_spine = spine.clone();
-    tokio::spawn(fold_loop(app, snapshot_tx, events, folds, deadline_tx, fold_spine));
+    tokio::spawn(fold_loop(
+      app,
+      snapshot_tx,
+      events,
+      folds,
+      deadline_tx,
+      fold_spine,
+    ));
     tokio::spawn(deadline_scheduler(
       spine.clone(),
       snapshot_rx.clone(),
@@ -4759,21 +4806,22 @@ mod tests {
   async fn scheduler_emits_auth_refresh_at_the_safety_margin() {
     let mut app = App::default();
     app.auth_state.connected = true;
-    app.auth_state.token_expiry = Some(
-      SystemTime::now() + crate::core::auth::TOKEN_REFRESH_MARGIN + Duration::from_millis(40),
-    );
+    app.auth_state.token_expiry =
+      Some(SystemTime::now() + crate::core::auth::TOKEN_REFRESH_MARGIN + Duration::from_millis(40));
     let (spine, events, queries) = crate::runtime::engine::Spine::open(Default::default());
     let folds = queries.take().await;
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
     let (deadline_tx, deadline_rx) = watch::channel(0u64);
     let fold_spine = spine.clone();
-    tokio::spawn(fold_loop(app, snapshot_tx, events, folds, deadline_tx, fold_spine));
-    tokio::spawn(deadline_scheduler(
-      spine,
-      snapshot_rx,
-      deadline_rx,
-      None,
+    tokio::spawn(fold_loop(
+      app,
+      snapshot_tx,
+      events,
+      folds,
+      deadline_tx,
+      fold_spine,
     ));
+    tokio::spawn(deadline_scheduler(spine, snapshot_rx, deadline_rx, None));
 
     tokio::time::sleep(Duration::from_millis(80)).await;
   }

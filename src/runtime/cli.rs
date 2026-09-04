@@ -71,7 +71,8 @@ pub(super) async fn run_subcommand(boot: Boot, cmd: &str, matches: &ArgMatches) 
   let _sync_io_rx = boot.sync_io_rx;
   let (spine, events_rx, queries) = crate::runtime::engine::Spine::open(Default::default());
   let folds = queries.take().await;
-  let (snapshot_tx, _snapshot_rx) = tokio::sync::watch::channel(crate::runtime::frontend::Snapshot::default());
+  let (snapshot_tx, _snapshot_rx) =
+    tokio::sync::watch::channel(crate::runtime::frontend::Snapshot::default());
   let (deadline_tx, _deadline_rx) = tokio::sync::watch::channel(0u64);
   let fold_spine = spine.clone();
   tokio::spawn(crate::runtime::frontend::fold_loop(

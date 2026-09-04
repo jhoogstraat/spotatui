@@ -1437,7 +1437,13 @@ mod tests {
     )));
     app.lock().await.pending_playlist_open = Some("playlist-id".to_string());
     let (spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
-    let mut network = Network::new(None, ClientConfig::new(), Some(spine.clone()), None, temp_token_cache_path());
+    let mut network = Network::new(
+      None,
+      ClientConfig::new(),
+      Some(spine.clone()),
+      None,
+      temp_token_cache_path(),
+    );
     network.spine = Some(spine.clone());
 
     network

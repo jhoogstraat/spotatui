@@ -61,15 +61,15 @@ impl Network {
     if let Some(spine) = self.spine.as_ref() {
       crate::runtime::engine::emit_catalog_event(
         spine,
-      crate::core::catalog::CatalogStateEvent::SearchCompleted {
-        source: crate::core::source::Source::Spotify,
-        query: query.to_string(),
-        generation,
-        pages: Box::new(crate::core::catalog::SearchCompletionPages {
-          tracks,
-          ..Default::default()
-        }),
-      },
+        crate::core::catalog::CatalogStateEvent::SearchCompleted {
+          source: crate::core::source::Source::Spotify,
+          query: query.to_string(),
+          generation,
+          pages: Box::new(crate::core::catalog::SearchCompletionPages {
+            tracks,
+            ..Default::default()
+          }),
+        },
       )
       .await;
     }
@@ -221,18 +221,18 @@ impl SearchNetwork for Network {
     if let Some(spine) = self.spine.as_ref() {
       crate::runtime::engine::emit_catalog_event(
         spine,
-      crate::core::catalog::CatalogStateEvent::SearchCompleted {
-        source: crate::core::source::Source::Spotify,
-        query: search_term_snapshot,
-        generation,
-        pages: Box::new(crate::core::catalog::SearchCompletionPages {
-          tracks: tracks_page,
-          artists: artists_page,
-          albums: albums_page,
-          playlists: playlists_page,
-          shows: shows_page,
-        }),
-      },
+        crate::core::catalog::CatalogStateEvent::SearchCompleted {
+          source: crate::core::source::Source::Spotify,
+          query: search_term_snapshot,
+          generation,
+          pages: Box::new(crate::core::catalog::SearchCompletionPages {
+            tracks: tracks_page,
+            artists: artists_page,
+            albums: albums_page,
+            playlists: playlists_page,
+            shows: shows_page,
+          }),
+        },
       )
       .await;
     }

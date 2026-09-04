@@ -565,9 +565,7 @@ impl Network {
   async fn dj_youtube_resolver(&self) -> Option<resolve::YouTubeResolver> {
     #[cfg(feature = "youtube")]
     {
-      Some(resolve::YouTubeResolver::from_path(
-        self.ytdlp_path.clone(),
-      ))
+      Some(resolve::YouTubeResolver::from_path(self.ytdlp_path.clone()))
     }
     #[cfg(not(feature = "youtube"))]
     {
@@ -700,7 +698,13 @@ mod tests {
 
   async fn unauthenticated_network() -> Network {
     let app = Arc::new(Mutex::new(App::default()));
-    Network::new(None, ClientConfig::new(), None, None, temp_token_cache_path())
+    Network::new(
+      None,
+      ClientConfig::new(),
+      None,
+      None,
+      temp_token_cache_path(),
+    )
   }
 
   #[tokio::test]
@@ -914,11 +918,9 @@ mod tests {
 mod in_tui {
   use super::*;
   use crate::infra::dj::agent::Turn;
-  use crate::infra::dj::brain::DjBrain;
   use crate::infra::dj::exec::AppExecutor;
   use crate::infra::dj::session;
   use crate::infra::dj::{AskDjRequest, DjState, QUEUE_LOW_WATER};
-  use std::sync::Arc;
 
   impl Network {
     /// Service lane: run one DJ turn.
@@ -973,11 +975,8 @@ mod in_tui {
         .spine
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no engine spine"))?;
-      let context = session::turn_context_from_fold(
-        &spine,
-        request.extra_instruction.as_deref(),
-      )
-      .await?;
+      let context =
+        session::turn_context_from_fold(&spine, request.extra_instruction.as_deref()).await?;
       // Silent: the DJ transcript already shows every call, so the MCP front
       // door's status-bar announcements would be duplicated and misattributed.
       let executor = AppExecutor::silent(io_tx, spine.clone());

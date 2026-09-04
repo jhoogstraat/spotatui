@@ -249,10 +249,7 @@ async fn account_supports_native_streaming(
 ) -> (bool, Option<&'static str>) {
   let user_result = match cached_me {
     Some(user) => Ok(user),
-    None => {
-      spotify_get_typed_for::<PrivateUser>(spotify, "me", &[], token_cache_path)
-      .await
-    }
+    None => spotify_get_typed_for::<PrivateUser>(spotify, "me", &[], token_cache_path).await,
   };
   match user_result {
     #[allow(deprecated)]
@@ -476,10 +473,11 @@ fn deferred_streaming_startup(ctx: DeferredStreamingContext) -> tokio::task::Joi
 }
 
 #[cfg(feature = "streaming")]
-async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) -> Option<tokio::task::JoinHandle<()>> {
+async fn deferred_streaming_startup_inner(
+  ctx: DeferredStreamingContext,
+) -> Option<tokio::task::JoinHandle<()>> {
   let (supported, status_message) =
-    account_supports_native_streaming(&ctx.spotify, ctx.cached_me, &ctx.token_cache_path)
-      .await;
+    account_supports_native_streaming(&ctx.spotify, ctx.cached_me, &ctx.token_cache_path).await;
   if let Some(message) = status_message {
     let _ = ctx
       .spine
@@ -613,14 +611,13 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) -> Opti
   let device_name = streaming_player.device_name().to_string();
   let saved_device_id = ctx.client_config.device_id.clone();
   let mut devices_snapshot = None;
-  if let Ok(devices) =
-    spotify_get_typed_for::<rspotify::model::device::DevicePayload>(
-      &ctx.spotify,
-      "me/player/devices",
-      &[],
-      &ctx.token_cache_path,
-    )
-    .await
+  if let Ok(devices) = spotify_get_typed_for::<rspotify::model::device::DevicePayload>(
+    &ctx.spotify,
+    "me/player/devices",
+    &[],
+    &ctx.token_cache_path,
+  )
+  .await
   {
     let devices_vec = devices.devices;
     let _ = ctx
@@ -730,12 +727,9 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   if client_config.enable_streaming && !player::streaming_credentials_are_cached().unwrap_or(false)
   {
     if let Some(spotify) = spotify.as_ref() {
-      let (supported, status_message) = account_supports_native_streaming(
-        spotify,
-        cached_me.clone(),
-        &final_token_cache_path,
-      )
-      .await;
+      let (supported, status_message) =
+        account_supports_native_streaming(spotify, cached_me.clone(), &final_token_cache_path)
+          .await;
       if let Some(message) = status_message {
         let _ = spine_for_events
           .emit(crate::runtime::engine::EngineEvent::Session(
@@ -1140,16 +1134,18 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
 
   #[cfg(feature = "streaming")]
   {
-    producer_tasks.push(player::spawn_streaming_recovery_handler(player::StreamingRecoveryContext {
-      shared_position: Arc::clone(&shared_position),
-      shared_is_playing: Arc::clone(&shared_is_playing),
-      spine: spine_for_events.clone(),
-      recovery_rx: streaming_recovery_rx,
-      recovery_tx: streaming_recovery_tx.clone(),
-      client_config: client_config.clone(),
-      redirect_uri: selected_redirect_uri.clone(),
-      shutdown_rx: shutdown_tx.subscribe(),
-    }));
+    producer_tasks.push(player::spawn_streaming_recovery_handler(
+      player::StreamingRecoveryContext {
+        shared_position: Arc::clone(&shared_position),
+        shared_is_playing: Arc::clone(&shared_is_playing),
+        spine: spine_for_events.clone(),
+        recovery_rx: streaming_recovery_rx,
+        recovery_tx: streaming_recovery_tx.clone(),
+        client_config: client_config.clone(),
+        redirect_uri: selected_redirect_uri.clone(),
+        shutdown_rx: shutdown_tx.subscribe(),
+      },
+    ));
   }
 
   // Restore is a producer too: track it so shutdown can quiesce an in-flight
@@ -1251,7 +1247,9 @@ async fn restore_controls(
   repeat: crate::infra::queue::RepeatMode,
 ) {
   let active = matches!(
-    spine.query(crate::runtime::engine::FoldQuery::MediaSnapshot).await,
+    spine
+      .query(crate::runtime::engine::FoldQuery::MediaSnapshot)
+      .await,
     Ok(crate::runtime::engine::FoldAnswer::Media(Some(_)))
   );
   if !active {
@@ -1344,7 +1342,15 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(queue), Some(index)),
       )
       .await;
-      restore_controls(spine, position_ms, paused, startup_behavior, shuffle_on, repeat).await;
+      restore_controls(
+        spine,
+        position_ms,
+        paused,
+        startup_behavior,
+        shuffle_on,
+        repeat,
+      )
+      .await;
     }
     #[cfg(feature = "subsonic")]
     PersistedPlayback::Subsonic {
@@ -1374,7 +1380,15 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
-      restore_controls(spine, position_ms, paused, startup_behavior, shuffle_on, repeat).await;
+      restore_controls(
+        spine,
+        position_ms,
+        paused,
+        startup_behavior,
+        shuffle_on,
+        repeat,
+      )
+      .await;
     }
     #[cfg(feature = "youtube")]
     PersistedPlayback::YouTube {
@@ -1403,7 +1417,15 @@ async fn restore_playback_session(
         &IoEvent::StartPlayback(None, Some(uris), Some(index)),
       )
       .await;
-      restore_controls(spine, position_ms, paused, startup_behavior, shuffle_on, repeat).await;
+      restore_controls(
+        spine,
+        position_ms,
+        paused,
+        startup_behavior,
+        shuffle_on,
+        repeat,
+      )
+      .await;
     }
     #[cfg(feature = "internet-radio")]
     PersistedPlayback::Radio { station, paused } => {

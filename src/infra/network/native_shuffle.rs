@@ -564,9 +564,7 @@ impl Network {
       let mut attempt = 0u32;
       let result = loop {
         let result = match &kind {
-          FullFetch::Playlist(id) => {
-            fetch_playlist_uris(&spotify, &token_cache_path, id).await
-          }
+          FullFetch::Playlist(id) => fetch_playlist_uris(&spotify, &token_cache_path, id).await,
           FullFetch::SavedTracks => fetch_saved_track_uris(&spotify, &token_cache_path).await,
         };
         attempt += 1;

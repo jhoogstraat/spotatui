@@ -88,7 +88,9 @@ pub struct StreamingRecoveryContext {
   pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
-pub fn spawn_streaming_recovery_handler(ctx: StreamingRecoveryContext) -> tokio::task::JoinHandle<()> {
+pub fn spawn_streaming_recovery_handler(
+  ctx: StreamingRecoveryContext,
+) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
     let mut shutdown_rx = ctx.shutdown_rx.clone();
     tokio::select! {

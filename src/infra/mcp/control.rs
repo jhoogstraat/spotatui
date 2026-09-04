@@ -464,14 +464,7 @@ mod tests {
 
     let server = tokio::spawn(async move {
       let (stream, _) = listener.accept().await.unwrap();
-      serve_connection(
-        stream,
-        io_tx,
-        spine,
-        "t".to_string(),
-        HANDSHAKE_TIMEOUT,
-      )
-      .await
+      serve_connection(stream, io_tx, spine, "t".to_string(), HANDSHAKE_TIMEOUT).await
     });
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

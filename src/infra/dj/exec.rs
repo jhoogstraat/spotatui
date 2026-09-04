@@ -11,8 +11,11 @@ use super::tools::{self, DjToolCall, ToolOutcome};
 use crate::infra::network::IoEvent;
 use crate::runtime::engine::{EngineEvent, SessionFact, Spine};
 use std::sync::mpsc::Sender;
+#[cfg(test)]
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
+#[cfg(test)]
+use tokio::sync::Mutex;
 
 /// How long to wait for the IoEvent pump to answer a network-backed tool call.
 ///
