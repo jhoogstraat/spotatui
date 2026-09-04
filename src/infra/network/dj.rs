@@ -565,7 +565,9 @@ impl Network {
   async fn dj_youtube_resolver(&self) -> Option<resolve::YouTubeResolver> {
     #[cfg(feature = "youtube")]
     {
-      Some(resolve::YouTubeResolver::new(&self.app).await)
+      Some(resolve::YouTubeResolver::from_path(
+        self.client_config.ytdlp_path.clone(),
+      ))
     }
     #[cfg(not(feature = "youtube"))]
     {
@@ -698,7 +700,7 @@ mod tests {
 
   async fn unauthenticated_network() -> Network {
     let app = Arc::new(Mutex::new(App::default()));
-    Network::new(None, ClientConfig::new(), &app, temp_token_cache_path())
+    Network::new(None, ClientConfig::new(), None, None, temp_token_cache_path())
   }
 
   #[tokio::test]
@@ -971,7 +973,11 @@ mod in_tui {
         .spine
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no engine spine"))?;
-      let context = session::turn_context(&self.app, request.extra_instruction.as_deref()).await?;
+      let context = session::turn_context_from_fold(
+        &spine,
+        request.extra_instruction.as_deref(),
+      )
+      .await?;
       // Silent: the DJ transcript already shows every call, so the MCP front
       // door's status-bar announcements would be duplicated and misattributed.
       let executor = AppExecutor::silent(io_tx, spine.clone());
@@ -1052,7 +1058,8 @@ mod in_tui {
       let network = Network::new(
         None,
         crate::core::config::ClientConfig::new(),
-        &app,
+        None,
+        None,
         std::env::temp_dir().join("spotatui-dj-turn-test-cache.json"),
       );
       (network, app)

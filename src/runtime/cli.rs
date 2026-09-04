@@ -74,7 +74,8 @@ pub(super) async fn run_subcommand(boot: Boot, cmd: &str, matches: &ArgMatches) 
   let mut network = Network::new(
     boot.spotify,
     boot.client_config,
-    &app,
+    None,
+    boot.user_config.behavior.ytdlp_path.clone(),
     boot.token_cache_path,
   );
   // Ticket 17: the CLI is a command surface reading fold-published state,

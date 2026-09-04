@@ -1169,13 +1169,19 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     }));
   }
 
-  let network_app = Arc::clone(&app);
   let network_spine = spine_for_events.clone();
+  let network_ytdlp_path = user_config.behavior.ytdlp_path.clone();
+  let restore_app_for_network = Arc::clone(&app);
   info!("spawning spotify network event handler");
   let network_shutdown_rx = shutdown_tx.subscribe();
   let network_task = tokio::spawn(async move {
-    let mut network = Network::new(spotify, client_config, &network_app, final_token_cache_path);
-    network.spine = Some(network_spine.clone());
+    let mut network = Network::new(
+      spotify,
+      client_config,
+      Some(network_spine.clone()),
+      network_ytdlp_path,
+      final_token_cache_path,
+    );
 
     // The saved-device startup decision moved into
     // `deferred_streaming_startup` (it needs the native player's device
@@ -1201,7 +1207,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       // queues (user, playlists, current playback). The restore drives the
       // source's own start path, which serializes on the `App` lock like every
       // other event, so running it concurrently is safe.
-      let restore_app = Arc::clone(&network.app);
+      let restore_app = Arc::clone(&restore_app_for_network);
       let restore_spine = network_spine.clone();
       tokio::spawn(async move {
         restore_playback_session(

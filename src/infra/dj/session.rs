@@ -383,6 +383,64 @@ pub async fn turn_context(
   })
 }
 
+/// Build one DJ turn context from fold-owned immutable inputs. Workers use this
+/// path instead of retaining an application mutex while assembling a prompt.
+#[cfg(feature = "dj-core")]
+pub async fn turn_context_from_fold(
+  spine: &crate::runtime::engine::Spine,
+  extra_instruction: Option<&str>,
+) -> Result<TurnContext> {
+  let snapshot = match spine
+    .query(crate::runtime::engine::FoldQuery::DjContext)
+    .await
+    .map_err(|_| anyhow!("engine fold unavailable"))?
+  {
+    crate::runtime::engine::FoldAnswer::DjContext {
+      period,
+      want,
+      transcript,
+      avoid_library,
+    } => (period, want, transcript, avoid_library),
+    _ => anyhow::bail!("engine returned an unexpected DJ context"),
+  };
+  let (period, want, transcript, avoid_library) = snapshot;
+  let history = history_from_transcript(&transcript, extra_instruction);
+  let listens = tokio::task::spawn_blocking(crate::infra::history::load_listens)
+    .await
+    .map_err(|e| anyhow!("listening-history task failed: {e}"))?
+    .map_err(|e| anyhow!("could not read listening history: {e}"))?;
+  let brief = brief::build_brief(&listens, period);
+  let now_playing = match spine
+    .query(crate::runtime::engine::FoldQuery::MediaSnapshot)
+    .await
+    .ok()
+  {
+    Some(crate::runtime::engine::FoldAnswer::Media(Some(snapshot))) => Some(format!(
+      "{} — {}",
+      snapshot.metadata.title,
+      snapshot.primary_artist()
+    )),
+    _ => None,
+  };
+  let vibe = match spine
+    .query(crate::runtime::engine::FoldQuery::DjVibe)
+    .await
+    .ok()
+  {
+    Some(crate::runtime::engine::FoldAnswer::DjVibe { vibe, .. }) => vibe,
+    _ => None,
+  };
+  let mut brief = brief;
+  brief.now_playing = now_playing;
+  brief.vibe = vibe;
+  Ok(TurnContext {
+    brief,
+    history,
+    want,
+    avoid_library,
+  })
+}
+
 impl TurnContext {
   /// One step's request: the standing context, plus whatever the loop has run so
   /// far this turn.

@@ -40,7 +40,8 @@ pub(super) async fn start_tokio(
       let mut service_network = Network::new(
         None,
         network.client_config.clone(),
-        &network.app,
+        network.spine.clone(),
+        network.ytdlp_path.clone(),
         network.token_cache_path.clone(),
       );
       tokio::spawn(async move {

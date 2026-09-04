@@ -1515,6 +1515,9 @@ pub enum FoldQuery {
   /// The standing DJ vibe and whether auto-queue is on (vibe-effect text).
   #[cfg(feature = "dj-core")]
   DjVibe,
+  /// Immutable DJ turn inputs sampled by the fold before a worker starts.
+  #[cfg(feature = "dj-core")]
+  DjContext,
   /// The announcement-surface sources: whether the feature is enabled, the
   /// configured feed URL, and the seen-announcement dedup set.
   AnnouncementSources { seen_ids: bool },
@@ -1742,6 +1745,14 @@ pub enum FoldAnswer {
     vibe: Option<String>,
     auto_queue: bool,
   },
+  /// Conversation/configuration inputs for one DJ worker turn.
+  #[cfg(feature = "dj-core")]
+  DjContext {
+    period: crate::infra::history::RecapPeriod,
+    want: usize,
+    transcript: Vec<crate::infra::dj::DjLine>,
+    avoid_library: bool,
+  },
   /// The announcement-surface answer (feed config + optional dedup set).
   AnnouncementSources {
     enabled: bool,
@@ -1870,6 +1881,14 @@ impl std::fmt::Debug for FoldAnswer {
         .debug_struct("DjVibe")
         .field("vibe", vibe)
         .field("auto_queue", auto_queue)
+        .finish(),
+      #[cfg(feature = "dj-core")]
+      FoldAnswer::DjContext { period, want, transcript, avoid_library } => f
+        .debug_struct("DjContext")
+        .field("period", period)
+        .field("want", want)
+        .field("transcript_lines", &transcript.len())
+        .field("avoid_library", avoid_library)
         .finish(),
       FoldAnswer::AnnouncementSources {
         enabled,

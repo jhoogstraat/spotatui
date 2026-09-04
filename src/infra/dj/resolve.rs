@@ -363,6 +363,13 @@ impl YouTubeResolver {
   }
 
   #[cfg(feature = "youtube")]
+  pub fn from_path(ytdlp_path: Option<String>) -> Self {
+    Self {
+      source: crate::infra::youtube::YouTubeSource::new(ytdlp_path),
+    }
+  }
+
+  #[cfg(feature = "youtube")]
   async fn resolve(&self, title: &str, artist: &str) -> Option<TrackInfo> {
     use crate::core::source::Searcher;
     let query = format!("{artist} {title}");

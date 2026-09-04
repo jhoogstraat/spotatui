@@ -13,7 +13,6 @@ pub mod spotify_source;
 pub mod user;
 pub mod utils;
 
-use crate::core::app::App;
 use crate::core::auth;
 use crate::core::config::ClientConfig;
 use crate::core::plugin_api::{ShowInfo, TrackInfo};
@@ -323,11 +322,13 @@ pub struct Network {
   pub large_search_limit: u32,
   pub small_search_limit: u32,
   pub client_config: ClientConfig,
-  pub app: Arc<Mutex<App>>,
   /// The engine spine handle (ticket 16): handlers emit result events here
   /// instead of writing App fields. Populated by `start_services`; tests
   /// without a fold leave it `None` and handlers skip emitting.
   pub spine: Option<crate::runtime::engine::Spine>,
+  /// Immutable source configuration copied at startup; workers never need the
+  /// mutable application state to build a source resolver.
+  pub ytdlp_path: Option<String>,
   #[cfg(feature = "streaming")]
   native_idle_recovery: playback::NativeIdleRecoveryState,
   pub token_cache_path: PathBuf,
@@ -351,7 +352,8 @@ impl Network {
   pub fn new(
     spotify: Option<AuthCodePkceSpotify>,
     client_config: ClientConfig,
-    app: &Arc<Mutex<App>>,
+    spine: Option<crate::runtime::engine::Spine>,
+    ytdlp_path: Option<String>,
     token_cache_path: PathBuf,
   ) -> Self {
     Network {
@@ -359,8 +361,8 @@ impl Network {
       large_search_limit: 50,
       small_search_limit: 12,
       client_config,
-      app: Arc::clone(app),
-      spine: None,
+      spine,
+      ytdlp_path,
       native_idle_recovery: playback::NativeIdleRecoveryState::default(),
       token_cache_path,
       pending_login: None,
@@ -375,7 +377,8 @@ impl Network {
   pub fn new(
     spotify: Option<AuthCodePkceSpotify>,
     client_config: ClientConfig,
-    app: &Arc<Mutex<App>>,
+    spine: Option<crate::runtime::engine::Spine>,
+    ytdlp_path: Option<String>,
     token_cache_path: PathBuf,
   ) -> Self {
     Network {
@@ -383,8 +386,8 @@ impl Network {
       large_search_limit: 50,
       small_search_limit: 12,
       client_config,
-      app: Arc::clone(app),
-      spine: None,
+      spine,
+      ytdlp_path,
       token_cache_path,
       pending_login: None,
       consecutive_playback_auth_failures: 0,
@@ -1408,7 +1411,8 @@ mod tests {
     let mut network = Network::new(
       Some(spotify),
       ClientConfig::new(),
-      &app,
+      Some(spine.clone()),
+      None,
       token_cache_path.clone(),
     );
     network.spine = Some(spine.clone());
@@ -1431,7 +1435,7 @@ mod tests {
     )));
     app.lock().await.pending_playlist_open = Some("playlist-id".to_string());
     let (spine, _snapshots) = crate::runtime::frontend::spawn_fold(&app).await;
-    let mut network = Network::new(None, ClientConfig::new(), &app, temp_token_cache_path());
+    let mut network = Network::new(None, ClientConfig::new(), Some(spine.clone()), None, temp_token_cache_path());
     network.spine = Some(spine.clone());
 
     network

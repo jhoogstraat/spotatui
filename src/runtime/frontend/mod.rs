@@ -3160,6 +3160,15 @@ pub(crate) fn answer_query(
       vibe: app.dj.vibe.clone(),
       auto_queue: app.dj.auto_queue,
     },
+    #[cfg(feature = "dj-core")]
+    FoldQuery::DjContext => FoldAnswer::DjContext {
+      period: crate::infra::dj::session::period_from_config(
+        &app.user_config.behavior.dj_history_period,
+      ),
+      want: app.user_config.behavior.dj_batch_size,
+      transcript: app.dj.transcript.clone(),
+      avoid_library: app.dj.avoid_library,
+    },
     FoldQuery::FlushStateSave => {
       app.flush_state_save(true);
       FoldAnswer::Bool(true)
