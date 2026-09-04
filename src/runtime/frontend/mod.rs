@@ -258,6 +258,46 @@ impl Runtime {
     })
   }
 
+  /// Build the real Runtime ownership path without authentication or external
+  /// services. This keeps the lifecycle contract testable in CI while
+  /// production `boot` continues to exercise the full startup sequence.
+  #[cfg(test)]
+  pub(crate) fn boot_test() -> Self {
+    let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let (spine, events_rx, queries) = Spine::open(Default::default());
+    let folds = rt.block_on(queries.take());
+    let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+    let (shutdown_tx, _) = watch::channel(false);
+    let (deadline_tx, deadline_rx) = watch::channel(0u64);
+    let fold_task = rt.spawn(fold_loop(
+      crate::core::app::App::default(),
+      snapshot_tx.clone(),
+      events_rx,
+      folds,
+      deadline_tx,
+      spine.clone(),
+    ));
+    let deadline_task = rt.spawn(deadline_scheduler(
+      spine.clone(),
+      snapshot_rx,
+      deadline_rx,
+      Some(shutdown_tx.subscribe()),
+    ));
+    Self {
+      rt,
+      snapshot_tx,
+      shutdown_tx,
+      spine,
+      fold_task: Some(fold_task),
+      deadline_task: Some(deadline_task),
+      history_collector: None,
+      producer_tasks: Vec::new(),
+    }
+  }
+
   /// Subscribe to immutable snapshots. The current state arrives immediately.
   pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
     self.snapshot_tx.subscribe()
@@ -4371,6 +4411,34 @@ mod tests {
       .await
       .expect("flush should stop the owned fold");
     task.await.unwrap();
+  }
+
+  #[test]
+  fn runtime_lifecycle_folds_commands_deduplicates_snapshots_and_shuts_down() {
+    let runtime = Runtime::boot_test();
+    let mut snapshots = runtime.subscribe();
+    let before = snapshots.borrow().clone();
+
+    assert_eq!(
+      runtime.apply(crate::core::action::EngineAction::Notify(
+        "lifecycle".into(),
+        5
+      )),
+      crate::core::action::ActionOutcome::Applied
+    );
+    let after = snapshots.borrow_and_update().clone();
+    assert_eq!(before.notice, None);
+    assert_eq!(after.notice.as_deref(), Some("lifecycle"));
+    assert_ne!(before, after);
+    assert!(!snapshots.has_changed().unwrap());
+
+    // Re-applying the same visible fact must not publish a fresh snapshot.
+    runtime.apply(crate::core::action::EngineAction::Notify(
+      "lifecycle".into(),
+      5,
+    ));
+    assert!(!snapshots.has_changed().unwrap());
+    runtime.shutdown().expect("test runtime shuts down cleanly");
   }
 
   #[tokio::test]
