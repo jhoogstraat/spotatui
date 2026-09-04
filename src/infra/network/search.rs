@@ -58,8 +58,9 @@ impl Network {
     generation: u64,
     tracks: Option<crate::core::pagination::Paged<TrackInfo>>,
   ) {
-    crate::runtime::engine::emit_catalog_event(
-      &self.app,
+    if let Some(spine) = self.spine.as_ref() {
+      crate::runtime::engine::emit_catalog_event(
+        spine,
       crate::core::catalog::CatalogStateEvent::SearchCompleted {
         source: crate::core::source::Source::Spotify,
         query: query.to_string(),
@@ -69,8 +70,9 @@ impl Network {
           ..Default::default()
         }),
       },
-    )
-    .await;
+      )
+      .await;
+    }
   }
 }
 
@@ -216,8 +218,9 @@ impl SearchNetwork for Network {
       .as_ref()
       .map(|p| map_page(p, |s| ShowInfo::from(s)));
 
-    crate::runtime::engine::emit_catalog_event(
-      &self.app,
+    if let Some(spine) = self.spine.as_ref() {
+      crate::runtime::engine::emit_catalog_event(
+        spine,
       crate::core::catalog::CatalogStateEvent::SearchCompleted {
         source: crate::core::source::Source::Spotify,
         query: search_term_snapshot,
@@ -230,8 +233,9 @@ impl SearchNetwork for Network {
           shows: shows_page,
         }),
       },
-    )
-    .await;
+      )
+      .await;
+    }
   }
 
   async fn search_tracks_for_playlist(&mut self, search_term: String) {

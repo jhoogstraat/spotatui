@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
-use crate::core::app::App;
 #[allow(unused_imports)]
 use crate::core::catalog::CatalogStateEvent;
 use crate::core::streaming::StreamingStateEvent;
@@ -2506,31 +2505,18 @@ pub struct FoldQueries {
   pub(crate) rx: mpsc::Receiver<(FoldQuery, oneshot::Sender<Result<FoldAnswer, SpineClosed>>)>,
 }
 
-/// Read the producer spine off `App` and emit one catalog event (ticket 15).
-///
-/// Producers run under their own locks; the spine handle lives on `App`
-/// (installed at boot), so emitting is lock-free. `None` in tests that never
-/// installed a spine: callers treat that as "fold absent, nothing to do".
+/// Emit one catalog completion through the ordered producer spine.
 pub(crate) async fn emit_catalog_event(
-  app: &Arc<Mutex<App>>,
+  spine: &Spine,
   event: crate::core::catalog::CatalogStateEvent,
 ) {
-  let spine = app.lock().await.spine.clone();
-  if let Some(spine) = spine {
-    spine.emit(EngineEvent::Catalog(event)).await;
-  }
+  spine.emit(EngineEvent::Catalog(event)).await;
 }
 
-/// Emit one decoded-source fact through the fold. A missing spine means the
-/// runtime is not booted; do not mutate authoritative state outside the fold.
+/// Emit one decoded-source fact through the fold.
 #[allow(dead_code)]
-pub(crate) async fn emit_decoded_source(app: &Arc<Mutex<App>>, fact: DecodedSourceFact) {
-  let spine = app.lock().await.spine.clone();
-  if let Some(spine) = spine {
-    spine.emit(EngineEvent::Decoded(fact)).await;
-  } else {
-    log::warn!("decoded source fact dropped because engine spine is unavailable");
-  }
+pub(crate) async fn emit_decoded_source(spine: &Spine, fact: DecodedSourceFact) {
+  spine.emit(EngineEvent::Decoded(fact)).await;
 }
 
 #[cfg(test)]
