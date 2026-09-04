@@ -83,11 +83,18 @@ pub struct StreamingRecoveryContext {
   pub recovery_tx: tokio::sync::mpsc::UnboundedSender<StreamingRecoveryRequest>,
   pub client_config: ClientConfig,
   pub redirect_uri: String,
+  /// Shutdown cancellation owned by the runtime. Recovery must not continue
+  /// rebuilding a native session after the fold has begun quiescing.
+  pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 pub fn spawn_streaming_recovery_handler(ctx: StreamingRecoveryContext) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
-    handle_streaming_recovery(ctx).await;
+    let mut shutdown_rx = ctx.shutdown_rx.clone();
+    tokio::select! {
+      _ = shutdown_rx.changed() => {}
+      _ = handle_streaming_recovery(ctx) => {}
+    }
   })
 }
 

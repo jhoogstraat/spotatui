@@ -326,8 +326,14 @@ impl Runtime {
       // fold performs its final persistence barrier, so no late completion can
       // resurrect state after the flush.
       let _ = self.shutdown_tx.send(true);
-      for task in self.producer_tasks {
-        let _ = task.await;
+      for mut task in self.producer_tasks {
+        let abort = task.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+          .await
+          .is_err()
+        {
+          abort.abort();
+        }
       }
       // Emit an acked fact so the final flush is ordered in the fold event
       // stream, rather than racing a direct App lock.

@@ -442,6 +442,8 @@ struct DeferredStreamingContext {
   shared_is_playing: Arc<std::sync::atomic::AtomicBool>,
   /// Typed streaming facts from the player event handler go here (ticket 14).
   spine: crate::runtime::engine::Spine,
+  /// Cancels deferred startup and its player-event listener during shutdown.
+  shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Initialize native streaming in the background (D1). The UI renders its
@@ -451,12 +453,22 @@ struct DeferredStreamingContext {
 /// event handler, and finally makes the saved-device startup decision —
 /// dispatching its outcome through the normal IoEvent pump.
 #[cfg(feature = "streaming")]
-fn deferred_streaming_startup(ctx: DeferredStreamingContext) {
+fn deferred_streaming_startup(ctx: DeferredStreamingContext) -> tokio::task::JoinHandle<()> {
   tokio::spawn(async move {
     let spine = ctx.spine.clone();
     let spotify_startup_behavior = ctx.spotify_startup_behavior;
     let initial_shuffle_enabled = ctx.initial_shuffle_enabled;
-    deferred_streaming_startup_inner(ctx).await;
+    let mut shutdown_rx = ctx.shutdown_rx.clone();
+    let player_task = tokio::select! {
+      _ = shutdown_rx.changed() => None,
+      task = deferred_streaming_startup_inner(ctx) => task,
+    };
+    if let Some(mut task) = player_task {
+      tokio::select! {
+        _ = shutdown_rx.changed() => task.abort(),
+        _ = &mut task => {},
+      }
+    }
     // Whatever happened above (backend up, unsupported account, failed or
     // timed-out init), the pending window is over. Keep startup ordering in
     // the fold so the worker never mutates native App state directly.
@@ -468,11 +480,11 @@ fn deferred_streaming_startup(ctx: DeferredStreamingContext) {
         },
       ))
       .await;
-  });
+  })
 }
 
 #[cfg(feature = "streaming")]
-async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
+async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) -> Option<tokio::task::JoinHandle<()>> {
   let (supported, status_message) =
     account_supports_native_streaming(&ctx.spotify, ctx.cached_me, &ctx.token_cache_path, &ctx.app)
       .await;
@@ -489,7 +501,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
       .await;
   }
   if !supported {
-    return;
+    return None;
   }
 
   info!("initializing native streaming player");
@@ -544,14 +556,14 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
           },
         ))
         .await;
-      return;
+      return None;
     }
     Ok(Err(e)) => {
       info!(
         "streaming initialization panicked: {} - falling back to web api",
         e
       );
-      return;
+      return None;
     }
     Err(_) => {
       abort_handle.abort();
@@ -559,7 +571,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
         "streaming initialization hung unexpectedly (outer timeout {}s) - falling back to web api",
         outer_timeout.as_secs()
       );
-      return;
+      return None;
     }
   };
 
@@ -585,7 +597,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
     });
   if !installed {
     streaming_player.shutdown();
-    return;
+    return None;
   }
   let _ = ctx
     .spine
@@ -595,7 +607,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
     .await;
 
   // Spawn player event listener (updates app state from native player events)
-  player::spawn_player_event_handler(player::PlayerEventContext {
+  let player_task = player::spawn_player_event_handler(player::PlayerEventContext {
     player: Arc::clone(&streaming_player),
     shared_position: ctx.shared_position,
     shared_is_playing: ctx.shared_is_playing,
@@ -659,6 +671,7 @@ async fn deferred_streaming_startup_inner(ctx: DeferredStreamingContext) {
       ))
       .await;
   }
+  Some(player_task)
 }
 
 /// What a running set of shared services hands to the frontend that started
@@ -857,6 +870,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   // catalog (dispatchers, network layer). The fold task in `frontend` takes
   // the receiving half via Services.
   let history_collector = crate::infra::history::spawn_history_collector(spine_for_events.clone());
+  let mut producer_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
   #[cfg(feature = "streaming")]
   {
     let mut app_mut = app.lock().await;
@@ -1114,7 +1128,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
         crate::runtime::engine::SessionFact::NativeBackendPending(true),
       ))
       .await;
-    deferred_streaming_startup(DeferredStreamingContext {
+    producer_tasks.push(deferred_streaming_startup(DeferredStreamingContext {
       app: Arc::clone(&app),
       spotify: spotify
         .clone()
@@ -1137,12 +1151,13 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       spine: spine_for_events.clone(),
       shared_position: shared_position_for_events,
       shared_is_playing: shared_is_playing_for_events,
-    });
+      shutdown_rx: shutdown_tx.subscribe(),
+    }));
   }
 
   #[cfg(feature = "streaming")]
   {
-    player::spawn_streaming_recovery_handler(player::StreamingRecoveryContext {
+    producer_tasks.push(player::spawn_streaming_recovery_handler(player::StreamingRecoveryContext {
       shared_position: Arc::clone(&shared_position),
       shared_is_playing: Arc::clone(&shared_is_playing),
       spine: spine_for_events.clone(),
@@ -1150,7 +1165,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       recovery_tx: streaming_recovery_tx.clone(),
       client_config: client_config.clone(),
       redirect_uri: selected_redirect_uri.clone(),
-    });
+      shutdown_rx: shutdown_tx.subscribe(),
+    }));
   }
 
   let network_app = Arc::clone(&app);
@@ -1235,7 +1251,10 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
     user_config,
     discord_rpc_manager,
     history_collector,
-    producer_tasks: vec![network_task],
+    producer_tasks: {
+      producer_tasks.push(network_task);
+      producer_tasks
+    },
     shutdown_tx,
   })
 }
