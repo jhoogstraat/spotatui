@@ -53,14 +53,23 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
       query,
       scoped_loading,
     } => {
-      // Accept as latest; a replaced query surfaces Loading via the
-      // search-scoped flag the dispatcher already raised on dispatch. Rows
-      // stay visible until results land or an error replaces them: ticket
-      // 10's visible-replacement predicate lives in the domain.
+      // Accept as latest and clear the previous projection immediately. A
+      // replaced query is Loading, so old rows must not remain visible while
+      // the new request is in flight.
       app.catalog_state.accept_request(*source, query.clone());
       app.search_loading = *scoped_loading;
+      app.search_results.tracks = None;
+      app.search_results.artists = None;
+      app.search_results.albums = None;
+      app.search_results.playlists = None;
+      app.search_results.shows = None;
+      app.search_results.selected_tracks_index = None;
+      app.search_results.selected_artists_index = None;
+      app.search_results.selected_album_index = None;
+      app.search_results.selected_playlists_index = None;
+      app.search_results.selected_shows_index = None;
       CatalogOutcome {
-        search_rows_replaced: false,
+        search_rows_replaced: true,
         ..CatalogOutcome::default()
       }
     }
@@ -80,6 +89,18 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
       // Every accepted completion is terminal, including an explicit empty
       // result emitted for a failed or unconfigured source search.
       app.search_loading = false;
+      // A terminal completion replaces the complete visible search surface;
+      // an empty/failed completion therefore clears old rows as well.
+      app.search_results.tracks = None;
+      app.search_results.artists = None;
+      app.search_results.albums = None;
+      app.search_results.playlists = None;
+      app.search_results.shows = None;
+      app.search_results.selected_tracks_index = None;
+      app.search_results.selected_artists_index = None;
+      app.search_results.selected_album_index = None;
+      app.search_results.selected_playlists_index = None;
+      app.search_results.selected_shows_index = None;
       // Ticket 17: the completion carries every page, so the fold is the
       // single writer of the visible search surface (the old handler wrote
       // the non-track pages directly under the lock).
@@ -97,9 +118,6 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         app.search_results.hovered_block = SearchResultBlock::SongSearch;
         app.search_results.selected_block = SearchResultBlock::Empty;
       }
-      // A completion with no track rows is the search-failure fact: it
-      // retires the spinner but must not wipe the previous surface (the old
-      // fold only replaced pages alongside a fresh track page).
       if pages.tracks.is_some() {
         app.search_results.artists = pages.artists.clone();
         app.search_results.albums = pages.albums.clone();
@@ -123,7 +141,10 @@ pub fn apply_catalog_state(app: &mut App, event: &CatalogStateEvent) -> CatalogO
         playlists_len,
       );
       clamp_selected_index(&mut app.search_results.selected_shows_index, shows_len);
-      outcome
+      CatalogOutcome {
+        search_rows_replaced: true,
+        ..outcome
+      }
     }
     CatalogStateEvent::TrackTableReplaced {
       tracks,

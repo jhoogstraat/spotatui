@@ -682,15 +682,23 @@ async fn fold_loop_shared(
   let mut queries = folds.map(|handles| handles.queries);
   {
     let guard = app.lock().await;
-    publish(&guard, &tx, &mut catalog);
+    publish(&guard, &tx, &mut catalog, CatalogChanges::default());
   }
   loop {
     if let Some(queries) = queries.as_mut() {
       while let Ok((query, responder)) = queries.rx.try_recv() {
+        let changes = CatalogChanges {
+          library: query_changes_library(&query),
+          ..Default::default()
+        };
         let answer = {
           let mut guard = app.lock().await;
           answer_query(&mut guard, query)
         };
+        if changes.library {
+          let guard = app.lock().await;
+          publish(&guard, &tx, &mut catalog, changes);
+        }
         let _ = responder.send(Ok(answer));
       }
     }
@@ -701,7 +709,18 @@ async fn fold_loop_shared(
       } => {
         match answer {
           Some((query, responder)) => {
-            let answer = { let mut guard = app.lock().await; answer_query(&mut guard, query) };
+            let changes = CatalogChanges {
+              library: query_changes_library(&query),
+              ..Default::default()
+            };
+            let answer = {
+              let mut guard = app.lock().await;
+              let answer = answer_query(&mut guard, query);
+              if changes.library {
+                publish(&guard, &tx, &mut catalog, changes);
+              }
+              answer
+            };
             let _ = responder.send(Ok(answer));
           }
           None => queries = None,
@@ -717,11 +736,12 @@ async fn fold_loop_shared(
         ..
       }
     );
+    let mut catalog_changes = CatalogChanges::default();
     let ack_responder = match event {
       crate::runtime::engine::SpineMessage::Ack { event, responder } => {
         let ack = {
           let mut guard = app.lock().await;
-          apply_acked(&mut guard, event)
+          apply_acked(&mut guard, event, &mut catalog_changes)
         };
         Some((responder, ack))
       }
@@ -735,9 +755,12 @@ async fn fold_loop_shared(
             let _ = streaming;
           }
           EngineEvent::Catalog(event) => {
-            let _ = crate::core::apply_catalog_state(&mut guard, &event);
+            let outcome = crate::core::apply_catalog_state(&mut guard, &event);
+            catalog_changes.absorb_catalog(&event, outcome);
           }
           EngineEvent::Session(fact) => {
+            catalog_changes.library |= session_changes_library(&fact);
+            catalog_changes.detail |= session_changes_detail(&guard, &fact);
             apply_session_fact(&mut guard, fact);
           }
           EngineEvent::Decoded(fact) => {
@@ -760,7 +783,7 @@ async fn fold_loop_shared(
     signal_deadline(&deadline_tx);
     {
       let guard = app.lock().await;
-      publish(&guard, &tx, &mut catalog);
+      publish(&guard, &tx, &mut catalog, catalog_changes);
     }
     spine.signal_folded();
     if let Some((responder, ack)) = ack_responder {
@@ -789,7 +812,7 @@ pub(super) async fn fold_loop(
 ) {
   let mut catalog = CatalogPublication::default();
   let mut queries = folds.map(|handles| handles.queries);
-  publish(&app, &tx, &mut catalog);
+  publish(&app, &tx, &mut catalog, CatalogChanges::default());
   loop {
     // Answer any producer query that arrived since the last event before
     // (possibly) blocking on the next one: the try_recv drain below clears a
@@ -797,7 +820,14 @@ pub(super) async fn fold_loop(
     // with a pending query still answers.
     if let Some(queries) = queries.as_mut() {
       while let Ok((query, responder)) = queries.rx.try_recv() {
+        let changes = CatalogChanges {
+          library: query_changes_library(&query),
+          ..Default::default()
+        };
         let answer = answer_query(&mut app, query);
+        if changes.library {
+          publish(&app, &tx, &mut catalog, changes);
+        }
         let _ = responder.send(Ok(answer));
       }
     }
@@ -817,7 +847,14 @@ pub(super) async fn fold_loop(
       } => {
         match answer {
           Some((query, responder)) => {
+            let changes = CatalogChanges {
+              library: query_changes_library(&query),
+              ..Default::default()
+            };
             let answer = answer_query(&mut app, query);
+            if changes.library {
+              publish(&app, &tx, &mut catalog, changes);
+            }
             let _ = responder.send(Ok(answer));
           }
           // Query channel closed (spine dropped): stop watching it.
@@ -834,9 +871,10 @@ pub(super) async fn fold_loop(
         ..
       }
     );
+    let mut catalog_changes = CatalogChanges::default();
     let ack_responder = match event {
       crate::runtime::engine::SpineMessage::Ack { event, responder } => {
-        let ack = apply_acked(&mut app, event);
+        let ack = apply_acked(&mut app, event, &mut catalog_changes);
         Some((responder, ack))
       }
       crate::runtime::engine::SpineMessage::Event(event) => {
@@ -852,9 +890,12 @@ pub(super) async fn fold_loop(
             }
           }
           EngineEvent::Catalog(catalog) => {
-            crate::core::apply_catalog_state(&mut app, &catalog);
+            let outcome = crate::core::apply_catalog_state(&mut app, &catalog);
+            catalog_changes.absorb_catalog(&catalog, outcome);
           }
           EngineEvent::Session(fact) => {
+            catalog_changes.library |= session_changes_library(&fact);
+            catalog_changes.detail |= session_changes_detail(&app, &fact);
             apply_session_fact(&mut app, fact);
           }
           EngineEvent::Decoded(fact) => {
@@ -875,7 +916,7 @@ pub(super) async fn fold_loop(
       }
     };
     signal_deadline(&deadline_tx);
-    publish(&app, &tx, &mut catalog);
+    publish(&app, &tx, &mut catalog, catalog_changes);
     spine.signal_folded();
     if let Some((responder, ack)) = ack_responder {
       let _ = responder.send(ack);
@@ -899,14 +940,65 @@ struct CatalogPublication {
   search_revision: u64,
   detail_revision: u64,
   library_revision: u64,
+  search_tracks: Arc<[TrackInfo]>,
+  search_artists: Arc<[ArtistInfo]>,
+  search_albums: Arc<[AlbumInfo]>,
+  search_playlists: Arc<[PlaylistInfo]>,
+  search_detail: Option<SearchDetail>,
+  detail_key: Option<(RouteId, u64)>,
+  library: LibrarySnapshot,
+  initialized: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CatalogChanges {
+  search: bool,
+  detail: bool,
+  library: bool,
+}
+
+impl CatalogChanges {
+  fn absorb_catalog(&mut self, event: &CatalogStateEvent, outcome: crate::core::CatalogOutcome) {
+    self.search |= outcome.search_rows_replaced;
+    self.detail |= matches!(event, CatalogStateEvent::TrackTableReplaced { .. });
+    self.library |= outcome.library_page_upserted;
+  }
+}
+
+fn session_changes_detail(app: &App, fact: &crate::runtime::engine::SessionFact) -> bool {
+  match fact {
+    crate::runtime::engine::SessionFact::ArtistView { generation, .. }
+    | crate::runtime::engine::SessionFact::AlbumTracksSimplified { generation, .. }
+    | crate::runtime::engine::SessionFact::AlbumTracksFull { generation, .. }
+    | crate::runtime::engine::SessionFact::ShowEpisodesLanded { generation, .. }
+    | crate::runtime::engine::SessionFact::ShowEpisodesAppended { generation, .. }
+    | crate::runtime::engine::SessionFact::FullShowLanded { generation, .. } => {
+      app.metadata_generation == *generation
+    }
+    _ => false,
+  }
+}
+
+fn session_changes_library(fact: &crate::runtime::engine::SessionFact) -> bool {
+  matches!(
+    fact,
+    crate::runtime::engine::SessionFact::RecentlyPlayed { .. }
+  )
+}
+
+fn query_changes_library(query: &crate::runtime::engine::FoldQuery) -> bool {
+  matches!(
+    query,
+    crate::runtime::engine::FoldQuery::RegisterPlaylistRefresh { .. }
+      | crate::runtime::engine::FoldQuery::PublishPlaylistRefresh { .. }
+  )
 }
 
 impl CatalogPublication {
   fn revise(&mut self, mut next: Snapshot, previous: &Snapshot) -> Snapshot {
-    // `build_snapshot` receives mutable engine state, so it naturally
-    // creates fresh row containers. Keep the accepted immutable allocations
-    // when their source data is unchanged; only the changed surface is
-    // replaced and receives a new revision.
+    // This compatibility path is used by focused tests; retain allocations
+    // when values compare equal, while the runtime path below avoids even
+    // constructing fresh catalog rows for unrelated events.
     if previous.search_tracks == next.search_tracks {
       next.search_tracks = Arc::clone(&previous.search_tracks);
     }
@@ -931,33 +1023,17 @@ impl CatalogPublication {
     if previous.search_detail == next.search_detail {
       next.search_detail = previous.search_detail.clone();
     }
-    let search_changed = {
-      let old = previous;
-      old.search_loading != next.search_loading
-        || old.search_tracks != next.search_tracks
-        || old.search_artists != next.search_artists
-        || old.search_albums != next.search_albums
-        || old.search_playlists != next.search_playlists
-    };
-    if search_changed
-      && !next.search_loading
-      && (!next.search_tracks.is_empty()
-        || !next.search_artists.is_empty()
-        || !next.search_albums.is_empty()
-        || !next.search_playlists.is_empty())
+    if previous.search_tracks != next.search_tracks
+      || previous.search_artists != next.search_artists
+      || previous.search_albums != next.search_albums
+      || previous.search_playlists != next.search_playlists
     {
       self.search_revision = self.search_revision.wrapping_add(1);
     }
-    let detail_changed = previous.search_detail != next.search_detail;
-    if detail_changed && next.search_detail.is_some() {
+    if previous.search_detail != next.search_detail {
       self.detail_revision = self.detail_revision.wrapping_add(1);
     }
-    let library_changed = previous.library != next.library;
-    if library_changed
-      && (next.library.liked_songs.is_some()
-        || next.library.recently_played.is_some()
-        || next.library.playlists.is_some())
-    {
+    if previous.library != next.library {
       self.library_revision = self.library_revision.wrapping_add(1);
     }
     next.search_revision = self.search_revision;
@@ -967,10 +1043,70 @@ impl CatalogPublication {
   }
 }
 
-fn publish(app: &App, tx: &watch::Sender<Snapshot>, catalog: &mut CatalogPublication) {
+fn publish(
+  app: &App,
+  tx: &watch::Sender<Snapshot>,
+  catalog: &mut CatalogPublication,
+  changes: CatalogChanges,
+) {
   let mut next = {
-    let previous = tx.borrow();
-    catalog.revise(build_snapshot(app), &previous)
+    let initialize = !catalog.initialized;
+    let detail_key_changed = catalog.detail_key.as_ref()
+      != Some(&(app.get_current_route().id.clone(), app.metadata_generation));
+    let mut next = build_snapshot(app, catalog, changes);
+    let mut search_changed = false;
+    if changes.search || initialize {
+      if catalog.search_tracks != next.search_tracks {
+        search_changed = true;
+      } else {
+        next.search_tracks = Arc::clone(&catalog.search_tracks);
+      }
+      if catalog.search_artists != next.search_artists {
+        search_changed = true;
+      } else {
+        next.search_artists = Arc::clone(&catalog.search_artists);
+      }
+      if catalog.search_albums != next.search_albums {
+        search_changed = true;
+      } else {
+        next.search_albums = Arc::clone(&catalog.search_albums);
+      }
+      if catalog.search_playlists != next.search_playlists {
+        search_changed = true;
+      } else {
+        next.search_playlists = Arc::clone(&catalog.search_playlists);
+      }
+      catalog.search_tracks = Arc::clone(&next.search_tracks);
+      catalog.search_artists = Arc::clone(&next.search_artists);
+      catalog.search_albums = Arc::clone(&next.search_albums);
+      catalog.search_playlists = Arc::clone(&next.search_playlists);
+    }
+    let detail_changed = (changes.detail || detail_key_changed || initialize)
+      && catalog.search_detail != next.search_detail;
+    if changes.detail || detail_key_changed || initialize {
+      catalog.search_detail = next.search_detail.clone();
+      catalog.detail_key = Some((app.get_current_route().id.clone(), app.metadata_generation));
+    }
+    let library_changed = (changes.library || initialize) && catalog.library != next.library;
+    if changes.library || initialize {
+      catalog.library = next.library.clone();
+    }
+    if changes.search && search_changed {
+      catalog.search_revision = catalog.search_revision.wrapping_add(1);
+    }
+    if detail_changed && !initialize {
+      catalog.detail_revision = catalog.detail_revision.wrapping_add(1);
+    }
+    if library_changed && !initialize {
+      catalog.library_revision = catalog.library_revision.wrapping_add(1);
+    }
+    next.search_revision = catalog.search_revision;
+    next.detail_revision = catalog.detail_revision;
+    next.library_revision = catalog.library_revision;
+    if !catalog.initialized {
+      catalog.initialized = true;
+    }
+    next
   };
   tx.send_if_modified(|current| {
     // `as_of` describes an accepted publication, not engine content. Ignore
@@ -986,7 +1122,11 @@ fn publish(app: &App, tx: &watch::Sender<Snapshot>, catalog: &mut CatalogPublica
     }
   });
 }
-fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
+fn apply_acked(
+  app: &mut App,
+  event: EngineEvent,
+  catalog_changes: &mut CatalogChanges,
+) -> Option<FoldAck> {
   match &event {
     EngineEvent::Session(crate::runtime::engine::SessionFact::MetadataRequested) => {
       apply_session_fact(app, crate::runtime::engine::SessionFact::MetadataRequested);
@@ -1000,7 +1140,8 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
       Some(FoldAck::default())
     }
     EngineEvent::Catalog(CatalogStateEvent::LibraryGenerationStarted { section }) => {
-      crate::core::apply_catalog_state(app, event_catalog(&event));
+      let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
+      catalog_changes.absorb_catalog(event_catalog(&event), outcome);
       Some(FoldAck {
         catalog_generation: None,
         library_generation: Some(library_generation_matches_value(app, *section)),
@@ -1038,7 +1179,8 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
       })
     }
     EngineEvent::Catalog(CatalogStateEvent::SearchRequested { .. }) => {
-      crate::core::apply_catalog_state(app, event_catalog(&event));
+      let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
+      catalog_changes.absorb_catalog(event_catalog(&event), outcome);
       Some(FoldAck {
         catalog_generation: app
           .catalog_state
@@ -1080,6 +1222,7 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
     }
     EngineEvent::Catalog(CatalogStateEvent::SavedTracksPageUpserted { .. }) => {
       let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
+      catalog_changes.absorb_catalog(event_catalog(&event), outcome);
       Some(FoldAck {
         catalog_generation: None,
         library_generation: None,
@@ -1121,6 +1264,7 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
     }
     EngineEvent::Catalog(CatalogStateEvent::PlaylistTracksPageUpserted { .. }) => {
       let outcome = crate::core::apply_catalog_state(app, event_catalog(&event));
+      catalog_changes.absorb_catalog(event_catalog(&event), outcome);
       Some(FoldAck {
         catalog_generation: None,
         library_generation: None,
@@ -1439,6 +1583,10 @@ fn apply_acked(app: &mut App, event: EngineEvent) -> Option<FoldAck> {
             ))]
             queue_suspended: None,
           });
+        }
+        EngineEvent::Catalog(catalog) => {
+          let outcome = crate::core::apply_catalog_state(app, &catalog);
+          catalog_changes.absorb_catalog(&catalog, outcome);
         }
         _ => fold_one(app, event),
       }
@@ -4296,50 +4444,54 @@ fn answer_decoded_query(
   }
 }
 
-fn build_snapshot(app: &App) -> Snapshot {
-  let search = crate::core::plugin_api::search_results_snapshot(app);
-  let search_detail = match app.get_current_route().id {
-    crate::core::app::RouteId::Artist => app.artist.as_ref().map(|artist| SearchDetail::Artist {
-      tracks: artist.top_tracks.clone().into(),
-      albums: artist.albums.items.clone().into(),
-    }),
-    crate::core::app::RouteId::AlbumTracks => app
-      .selected_album_simplified
-      .as_ref()
-      .map(|album| SearchDetail::Album {
-        tracks: album.tracks.items.clone().into(),
-      })
-      .or_else(|| {
-        app
-          .selected_album_full
-          .as_ref()
-          .map(|album| SearchDetail::Album {
-            tracks: album.album.tracks.clone().into(),
-          })
+fn build_snapshot(app: &App, catalog: &CatalogPublication, changes: CatalogChanges) -> Snapshot {
+  let rebuild_search = changes.search || !catalog.initialized;
+  let search = rebuild_search.then(|| crate::core::plugin_api::search_results_snapshot(app));
+  let detail_key = (app.get_current_route().id.clone(), app.metadata_generation);
+  let rebuild_detail =
+    changes.detail || !catalog.initialized || catalog.detail_key.as_ref() != Some(&detail_key);
+  let search_detail = rebuild_detail
+    .then(|| match app.get_current_route().id {
+      crate::core::app::RouteId::Artist => app.artist.as_ref().map(|artist| SearchDetail::Artist {
+        tracks: artist.top_tracks.clone().into(),
+        albums: artist.albums.items.clone().into(),
       }),
-    crate::core::app::RouteId::TrackTable => {
-      app
-        .playlist_tracks
+      crate::core::app::RouteId::AlbumTracks => app
+        .selected_album_simplified
         .as_ref()
-        .map(|page| SearchDetail::Playlist {
-          tracks: page
-            .items
-            .iter()
-            .filter_map(|(_, item)| match item {
-              crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
-              crate::core::plugin_api::PlayableInfo::Episode(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .into(),
+        .map(|album| SearchDetail::Album {
+          tracks: album.tracks.items.clone().into(),
         })
-    }
-    _ => None,
-  };
-  Snapshot {
-    as_of: Instant::now(),
-    playback: crate::core::plugin_api::playback_state(app),
-    native_playback: native_playback_active(app),
-    library: LibrarySnapshot {
+        .or_else(|| {
+          app
+            .selected_album_full
+            .as_ref()
+            .map(|album| SearchDetail::Album {
+              tracks: album.album.tracks.clone().into(),
+            })
+        }),
+      crate::core::app::RouteId::TrackTable => {
+        app
+          .playlist_tracks
+          .as_ref()
+          .map(|page| SearchDetail::Playlist {
+            tracks: page
+              .items
+              .iter()
+              .filter_map(|(_, item)| match item {
+                crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
+                crate::core::plugin_api::PlayableInfo::Episode(_) => None,
+              })
+              .collect::<Vec<_>>()
+              .into(),
+          })
+      }
+      _ => None,
+    })
+    .flatten();
+  let rebuild_library = changes.library || !catalog.initialized;
+  let library = if rebuild_library {
+    LibrarySnapshot {
       liked_songs: (!app.library.saved_tracks.pages.is_empty())
         .then(|| Arc::from(crate::core::plugin_api::saved_tracks_snapshot(app))),
       recently_played: app
@@ -4351,16 +4503,40 @@ fn build_snapshot(app: &App) -> Snapshot {
         .playlists
         .as_ref()
         .map(|_| Arc::from(crate::core::plugin_api::playlists_snapshot(app))),
-    },
+    }
+  } else {
+    catalog.library.clone()
+  };
+  Snapshot {
+    as_of: Instant::now(),
+    playback: crate::core::plugin_api::playback_state(app),
+    native_playback: native_playback_active(app),
+    library,
     search_query: app.catalog_query.clone(),
     library_target: app.catalog_library_target,
     position_ms: app.playback_position_ms().map(|p| p as u64),
     queue_upcoming: app.native_queue.clone(),
-    search_tracks: search.tracks.into(),
-    search_artists: search.artists.into(),
-    search_albums: search.albums.into(),
-    search_playlists: search.playlists.into(),
-    search_detail,
+    search_tracks: search.as_ref().map_or_else(
+      || Arc::clone(&catalog.search_tracks),
+      |s| s.tracks.clone().into(),
+    ),
+    search_artists: search.as_ref().map_or_else(
+      || Arc::clone(&catalog.search_artists),
+      |s| s.artists.clone().into(),
+    ),
+    search_albums: search.as_ref().map_or_else(
+      || Arc::clone(&catalog.search_albums),
+      |s| s.albums.clone().into(),
+    ),
+    search_playlists: search.as_ref().map_or_else(
+      || Arc::clone(&catalog.search_playlists),
+      |s| s.playlists.clone().into(),
+    ),
+    search_detail: if rebuild_detail {
+      search_detail
+    } else {
+      catalog.search_detail.clone()
+    },
     search_revision: 0,
     detail_revision: 0,
     library_revision: 0,
@@ -4659,7 +4835,7 @@ mod tests {
   }
 
   #[test]
-  fn empty_search_completion_clears_loading_without_wiping_existing_rows() {
+  fn empty_search_completion_clears_loading_and_visible_rows() {
     let mut app = App::default();
     app.search_results.tracks = Some(crate::core::pagination::Paged {
       items: vec![TrackInfo {
@@ -4698,10 +4874,7 @@ mod tests {
       },
     );
     assert!(!app.search_loading);
-    assert_eq!(
-      app.search_results.tracks.as_ref().unwrap().items[0].name,
-      "cached"
-    );
+    assert!(app.search_results.tracks.is_none());
   }
 
   #[tokio::test]
@@ -4930,6 +5103,61 @@ mod tests {
   }
 
   #[test]
+  fn revision_cache_replaces_only_the_changed_search_surface() {
+    let mut app = App::default();
+    app.search_results.tracks = Some(crate::core::pagination::Paged {
+      items: vec![TrackInfo {
+        uri: Some("spotify:track:first".into()),
+        name: "first".into(),
+        artists: Vec::new(),
+        album: String::new(),
+        duration_ms: 0,
+        id: None,
+        album_id: None,
+        artist_refs: Vec::new(),
+        is_playable: true,
+        is_local: false,
+        track_number: 0,
+        explicit: false,
+        image_url: None,
+      }],
+      ..Default::default()
+    });
+    let (tx, _) = watch::channel(Snapshot::default());
+    let mut publication = CatalogPublication::default();
+    publish(
+      &app,
+      &tx,
+      &mut publication,
+      CatalogChanges {
+        search: true,
+        ..Default::default()
+      },
+    );
+    let first = tx.borrow().clone();
+    assert_eq!(first.detail_revision, 0);
+    app.status_message = Some("notice".into());
+    publish(&app, &tx, &mut publication, CatalogChanges::default());
+    let unchanged = tx.borrow().clone();
+    assert!(Arc::ptr_eq(&first.search_tracks, &unchanged.search_tracks));
+    assert_eq!(first.search_revision, unchanged.search_revision);
+
+    app.search_results.tracks.as_mut().unwrap().items[0].name = "second".into();
+    publish(
+      &app,
+      &tx,
+      &mut publication,
+      CatalogChanges {
+        search: true,
+        ..Default::default()
+      },
+    );
+    let replaced = tx.borrow().clone();
+    assert!(!Arc::ptr_eq(&first.search_tracks, &replaced.search_tracks));
+    assert!(replaced.search_revision > first.search_revision);
+  }
+
+  #[test]
   fn next_deadline_arms_playback_resync_and_seek_throttle() {
     let mut app = App::default();
     app.spotify_connected = true;
@@ -5070,11 +5298,13 @@ mod tests {
   #[test]
   fn stale_queue_fetch_claim_is_denied_by_the_fold() {
     let mut app = App::default();
+    let mut changes = CatalogChanges::default();
     let ack = apply_acked(
       &mut app,
       crate::runtime::engine::EngineEvent::Decoded(
         crate::runtime::engine::DecodedSourceFact::QueueFetchClaimed { fetch_id: 99 },
       ),
+      &mut changes,
     )
     .expect("acked claim returns a decision");
     assert!(ack.queue_fetch_claim.is_none());
@@ -5200,11 +5430,13 @@ mod tests {
   #[test]
   fn backend_claim_is_folded_and_acknowledged_in_order() {
     let mut app = App::default();
+    let mut changes = CatalogChanges::default();
     let claim = apply_acked(
       &mut app,
       crate::runtime::engine::EngineEvent::Decoded(
         crate::runtime::engine::DecodedSourceFact::ClaimBackendPlayers { keep: None },
       ),
+      &mut changes,
     )
     .expect("backend claim returns an ack");
     assert!(claim.backend_players.is_some());
@@ -5217,6 +5449,7 @@ mod tests {
           ttl_secs: 1,
         },
       ),
+      &mut changes,
     )
     .expect("following event returns an ack");
     assert!(next.backend_players.is_none());
