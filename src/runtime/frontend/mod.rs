@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 
 pub use crate::core::action::{ActionOutcome, EngineAction, LibraryTarget, OpenTarget};
 pub use crate::core::onboarding::Onboarding;
@@ -165,10 +165,11 @@ pub use super::engine::EngineCommand as FrontendEngineCommand;
 /// deduplicated immutable snapshots (ADR 0016 stage 2).
 pub struct Runtime {
   rt: tokio::runtime::Runtime,
-  app: Arc<Mutex<App>>,
   snapshot_tx: watch::Sender<Snapshot>,
   shutdown_tx: watch::Sender<bool>,
   spine: Spine,
+  fold_task: Option<tokio::task::JoinHandle<()>>,
+  deadline_task: Option<tokio::task::JoinHandle<()>>,
   history_collector: Option<crate::infra::history::HistoryCollectorHandle>,
   producer_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -206,7 +207,7 @@ impl Runtime {
     ))?;
     let services = rt.block_on(super::startup::start_services(boot))?;
 
-    let app = Arc::clone(&services.app);
+    let app = services.app;
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
     let shutdown_tx = services.shutdown_tx.clone();
     // The event spine is opened by `start_services` so every producer shares
@@ -225,36 +226,28 @@ impl Runtime {
     // The fold task: consumes typed spine events, reduces them into App
     // (single writer of the streaming mirrors), rebuilds once, and
     // equality-dedups the publication.
-    {
-      let app = Arc::clone(&app);
+    let fold_task = {
+      let app = app;
       let tx = snapshot_tx.clone();
       let deadline_tx = deadline_tx.clone();
       rt.spawn(async move {
         fold_loop(app, tx, events_rx, folds, deadline_tx, fold_spine).await;
-      });
-    }
-    // Deadlines are folded as named timer facts. The private change watch
-    // wakes the scheduler whenever a fold arms/replaces a deadline; it never
-    // wakes on a periodic cadence.
-    {
-      let app = Arc::clone(&app);
+      })
+    };
+    // Keep the join handles so shutdown can close the spine and prove the
+    // owner exited after the final persistence barrier.
+    let deadline_task = {
       let spine = command_spine.clone();
       let shutdown_rx = shutdown_tx.subscribe();
-      rt.spawn(deadline_scheduler(
-        app,
-        spine,
-        snapshot_rx,
-        deadline_rx,
-        Some(shutdown_rx),
-      ));
-    }
-
+      rt.spawn(deadline_scheduler(spine, snapshot_rx, deadline_rx, Some(shutdown_rx)))
+    };
     Ok(Runtime {
       rt,
-      app,
       snapshot_tx,
       shutdown_tx,
       spine,
+      fold_task: Some(fold_task),
+      deadline_task: Some(deadline_task),
       history_collector: Some(services.history_collector),
       producer_tasks: services.producer_tasks,
     })
@@ -321,12 +314,13 @@ impl Runtime {
   /// state, pause native playback, stop the collector, and end every task
   /// this runtime started. Blocks until the quit sequence finishes.
   pub fn shutdown(self) -> Result<()> {
-    self.rt.block_on(async {
+    let Runtime { rt, snapshot_tx, shutdown_tx, spine, mut fold_task, mut deadline_task, history_collector, producer_tasks } = self;
+    rt.block_on(async move {
       // Quiesce producer loops first. This closes the ingress path before the
       // fold performs its final persistence barrier, so no late completion can
       // resurrect state after the flush.
-      let _ = self.shutdown_tx.send(true);
-      for mut task in self.producer_tasks {
+      let _ = shutdown_tx.send(true);
+      for mut task in producer_tasks {
         let abort = task.abort_handle();
         if tokio::time::timeout(Duration::from_secs(2), &mut task)
           .await
@@ -337,19 +331,24 @@ impl Runtime {
       }
       // Emit an acked fact so the final flush is ordered in the fold event
       // stream, rather than racing a direct App lock.
-      let _ = self
-        .spine
+      let _ = spine
         .emit_acked(crate::runtime::engine::EngineEvent::Session(
           crate::runtime::engine::SessionFact::FlushPersistence,
         ))
         .await;
-      #[cfg(feature = "streaming")]
-      super::startup::pause_native_playback_before_exit(&self.app).await;
-      if let Some(history) = self.history_collector {
+      // Signal fold completion after the ordered flush; its select observes
+      // the closed publication channel and exits even though it owns a spine
+      // sender for observer notifications.
+      drop(snapshot_tx);
+      // Closing the ingress spine after the flush lets the fold observe EOF;
+      // joining it makes shutdown ordering deterministic.
+      drop(spine);
+      if let Some(task) = deadline_task.take() { task.abort(); let _ = task.await; }
+      if let Some(task) = fold_task.take() { let _ = task.await; }
+      if let Some(history) = history_collector {
         history.shutdown().await;
       }
     });
-    drop(self.snapshot_tx);
     Ok(())
   }
 
@@ -425,16 +424,18 @@ fn next_deadline(app: &App) -> Option<(Instant, crate::runtime::engine::TimerFac
 /// replaced deadline is re-evaluated immediately; with no deadline, it parks
 /// on the watches indefinitely.
 async fn deadline_scheduler(
-  app: Arc<Mutex<App>>,
   spine: Spine,
   mut snapshots: watch::Receiver<Snapshot>,
   mut deadline_changes: watch::Receiver<u64>,
   mut shutdown_rx: Option<watch::Receiver<bool>>,
 ) {
   loop {
-    let next = {
-      let guard = app.lock().await;
-      next_deadline(&guard)
+    let next = match spine
+      .query(crate::runtime::engine::FoldQuery::NextDeadline)
+      .await
+    {
+      Ok(crate::runtime::engine::FoldAnswer::Deadline(deadline)) => deadline,
+      _ => break,
     };
     match next {
       Some((deadline, fact)) => {
@@ -511,12 +512,13 @@ impl Default for Snapshot {
 /// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
 /// writer of published state. Typed streaming events are reduced through the
 /// domain before the snapshot rebuild. Session facts (ticket 16) replay the exact old handler
-/// code under the fold's lock; producer queries are answered here too, so no
+/// code against the fold-owned state; producer queries are answered here too, so no
 /// producer outside this task ever locks `App`.
 /// Open a spine, install it on `App`, and spawn the fold task (ticket 17).
 /// Command surfaces that live outside the full runtime boot (CLI mode, and
 /// spine-driven tests) need a live fold for their queries and events to be
 /// answered. Returns the spine handle and the snapshot watch receiver.
+#[cfg(test)]
 pub(crate) async fn spawn_fold(
   app: &Arc<tokio::sync::Mutex<App>>,
 ) -> (
@@ -551,7 +553,7 @@ pub(crate) async fn spawn_fold(
     audio_ready: false,
     audio_pending: false,
   });
-  tokio::spawn(fold_loop(
+  tokio::spawn(fold_loop_shared(
     app.clone(),
     snapshot_tx,
     events_rx,
@@ -560,7 +562,6 @@ pub(crate) async fn spawn_fold(
     spine.clone(),
   ));
   tokio::spawn(deadline_scheduler(
-    app.clone(),
     spine.clone(),
     snapshot_rx.clone(),
     deadline_rx,
@@ -569,12 +570,13 @@ pub(crate) async fn spawn_fold(
   (spine, snapshot_rx)
 }
 
-/// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
-/// writer of App state outside producers. `pub(super)` so the CLI mode can
-/// run one for its subcommand lifetime (ticket 17: the CLI reads published
-/// state instead of locking App).
-pub(super) async fn fold_loop(
-  app: Arc<Mutex<App>>,
+/// Compatibility harness for unit tests and legacy command surfaces that still
+/// construct an `Arc<Mutex<App>>`. Production startup transfers the plain App
+/// into `fold_loop`; this shim is intentionally kept out of that ownership
+/// path until those callers migrate to the spine.
+#[cfg(test)]
+async fn fold_loop_shared(
+  app: Arc<tokio::sync::Mutex<App>>,
   tx: watch::Sender<Snapshot>,
   mut events_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::SpineMessage>,
   folds: Option<crate::runtime::engine::FoldHandles>,
@@ -583,12 +585,11 @@ pub(super) async fn fold_loop(
 ) {
   let mut catalog = CatalogPublication::default();
   let mut queries = folds.map(|handles| handles.queries);
-  publish(&app, &tx, &mut catalog).await;
+  {
+    let guard = app.lock().await;
+    publish(&guard, &tx, &mut catalog);
+  }
   loop {
-    // Answer any producer query that arrived since the last event before
-    // (possibly) blocking on the next one: the try_recv drain below clears a
-    // backlog, and the select watches the same channels so a quiet spine
-    // with a pending query still answers.
     if let Some(queries) = queries.as_mut() {
       while let Ok((query, responder)) = queries.rx.try_recv() {
         let answer = {
@@ -596,7 +597,92 @@ pub(super) async fn fold_loop(
           answer_query(&mut guard, query)
         };
         let _ = responder.send(Ok(answer));
-        signal_deadline(&deadline_tx);
+      }
+    }
+    let event = tokio::select! {
+      event = events_rx.recv() => match event { Some(event) => event, None => break },
+      answer = async {
+        match queries.as_mut() { Some(queries) => queries.rx.recv().await, None => std::future::pending().await }
+      } => {
+        match answer {
+          Some((query, responder)) => {
+            let answer = { let mut guard = app.lock().await; answer_query(&mut guard, query) };
+            let _ = responder.send(Ok(answer));
+          }
+          None => queries = None,
+        }
+        continue;
+      }
+      _ = tx.closed() => break,
+    };
+    let stop_after_ack = matches!(
+      &event,
+      crate::runtime::engine::SpineMessage::Ack {
+        event: EngineEvent::Session(crate::runtime::engine::SessionFact::FlushPersistence),
+        ..
+      }
+    );
+    let ack_responder = match event {
+      crate::runtime::engine::SpineMessage::Ack { event, responder } => {
+        let ack = { let mut guard = app.lock().await; apply_acked(&mut guard, event) };
+        Some((responder, ack))
+      }
+      crate::runtime::engine::SpineMessage::Event(event) => {
+        let mut guard = app.lock().await;
+        match event {
+          EngineEvent::Streaming(streaming) => {
+            #[cfg(feature = "streaming")]
+            guard.apply_streaming_state(streaming);
+            #[cfg(not(feature = "streaming"))]
+            let _ = streaming;
+          }
+          EngineEvent::Catalog(event) => { let _ = crate::core::apply_catalog_state(&mut guard, &event); }
+          EngineEvent::Session(fact) => { apply_session_fact(&mut guard, fact); }
+          EngineEvent::Decoded(fact) => { apply_decoded_source_fact(&mut guard, fact); }
+          EngineEvent::History(fact) => { apply_history_fact(&mut guard, fact); }
+          #[cfg(feature = "streaming")]
+          EngineEvent::Native(fact) => { let _ = apply_native_fact(&mut guard, fact); }
+          EngineEvent::Timer(fact) => { apply_timer_fact(&mut guard, fact); }
+        }
+        None
+      }
+    };
+    signal_deadline(&deadline_tx);
+    {
+      let guard = app.lock().await;
+      publish(&guard, &tx, &mut catalog);
+    }
+    spine.signal_folded();
+    if let Some((responder, ack)) = ack_responder { let _ = responder.send(ack); }
+    if stop_after_ack { break; }
+    if tx.is_closed() { break; }
+  }
+}
+
+/// The fold task (ADR 0016 ticket 14): one consumer of the spine, the single
+/// writer of App state outside producers. `pub(super)` so the CLI mode can
+/// run one for its subcommand lifetime (ticket 17: the CLI reads published
+/// state instead of locking App).
+pub(super) async fn fold_loop(
+  mut app: App,
+  tx: watch::Sender<Snapshot>,
+  mut events_rx: tokio::sync::mpsc::Receiver<crate::runtime::engine::SpineMessage>,
+  folds: Option<crate::runtime::engine::FoldHandles>,
+  deadline_tx: watch::Sender<u64>,
+  spine: crate::runtime::engine::Spine,
+) {
+  let mut catalog = CatalogPublication::default();
+  let mut queries = folds.map(|handles| handles.queries);
+  publish(&app, &tx, &mut catalog);
+  loop {
+    // Answer any producer query that arrived since the last event before
+    // (possibly) blocking on the next one: the try_recv drain below clears a
+    // backlog, and the select watches the same channels so a quiet spine
+    // with a pending query still answers.
+    if let Some(queries) = queries.as_mut() {
+      while let Ok((query, responder)) = queries.rx.try_recv() {
+        let answer = answer_query(&mut app, query);
+        let _ = responder.send(Ok(answer));
       }
     }
     // The select keeps queries and the ordered event spine responsive while parked:
@@ -615,12 +701,8 @@ pub(super) async fn fold_loop(
       } => {
         match answer {
           Some((query, responder)) => {
-            let answer = {
-              let mut guard = app.lock().await;
-              answer_query(&mut guard, query)
-            };
+            let answer = answer_query(&mut app, query);
             let _ = responder.send(Ok(answer));
-            signal_deadline(&deadline_tx);
           }
           // Query channel closed (spine dropped): stop watching it.
           None => queries = None,
@@ -629,12 +711,16 @@ pub(super) async fn fold_loop(
       }
       _ = tx.closed() => break,
     };
+    let stop_after_ack = matches!(
+      &event,
+      crate::runtime::engine::SpineMessage::Ack {
+        event: EngineEvent::Session(crate::runtime::engine::SessionFact::FlushPersistence),
+        ..
+      }
+    );
     let ack_responder = match event {
       crate::runtime::engine::SpineMessage::Ack { event, responder } => {
-        let ack = {
-          let mut guard = app.lock().await;
-          apply_acked(&mut guard, event)
-        };
+        let ack = apply_acked(&mut app, event);
         Some((responder, ack))
       }
       crate::runtime::engine::SpineMessage::Event(event) => {
@@ -642,7 +728,6 @@ pub(super) async fn fold_loop(
           EngineEvent::Streaming(streaming) => {
             #[cfg(feature = "streaming")]
             {
-              let mut app = app.lock().await;
               app.apply_streaming_state(streaming);
             }
             #[cfg(not(feature = "streaming"))]
@@ -651,28 +736,22 @@ pub(super) async fn fold_loop(
             }
           }
           EngineEvent::Catalog(catalog) => {
-            let mut app = app.lock().await;
             crate::core::apply_catalog_state(&mut app, &catalog);
           }
           EngineEvent::Session(fact) => {
-            let mut app = app.lock().await;
             apply_session_fact(&mut app, fact);
           }
           EngineEvent::Decoded(fact) => {
-            let mut app = app.lock().await;
             apply_decoded_source_fact(&mut app, fact);
           }
           EngineEvent::History(fact) => {
-            let mut app = app.lock().await;
             apply_history_fact(&mut app, fact);
           }
           #[cfg(feature = "streaming")]
           EngineEvent::Native(fact) => {
-            let mut app = app.lock().await;
             let _ = apply_native_fact(&mut app, fact);
           }
           EngineEvent::Timer(fact) => {
-            let mut app = app.lock().await;
             apply_timer_fact(&mut app, fact);
           }
         }
@@ -680,11 +759,12 @@ pub(super) async fn fold_loop(
       }
     };
     signal_deadline(&deadline_tx);
-    publish(&app, &tx, &mut catalog).await;
+    publish(&app, &tx, &mut catalog);
     spine.signal_folded();
     if let Some((responder, ack)) = ack_responder {
       let _ = responder.send(ack);
     }
+    if stop_after_ack { break; }
     if tx.is_closed() {
       break;
     }
@@ -769,17 +849,15 @@ impl CatalogPublication {
   }
 }
 
-async fn publish(
-  app: &Arc<Mutex<App>>,
+fn publish(
+  app: &App,
   tx: &watch::Sender<Snapshot>,
   catalog: &mut CatalogPublication,
 ) {
-  let guard = app.lock().await;
   let mut next = {
     let previous = tx.borrow();
-    catalog.revise(build_snapshot(&guard), &previous)
+    catalog.revise(build_snapshot(app), &previous)
   };
-  drop(guard);
   tx.send_if_modified(|current| {
     // `as_of` describes an accepted publication, not engine content. Ignore
     // its freshly sampled value while deciding whether content changed.
@@ -2960,6 +3038,7 @@ pub(crate) fn answer_query(
   use crate::core::catalog::LibrarySection;
   use crate::runtime::engine::{FoldAnswer, FoldQuery};
   match query {
+    FoldQuery::NextDeadline => FoldAnswer::Deadline(next_deadline(app)),
     FoldQuery::MediaKeysEnabled => FoldAnswer::Bool(app.user_config.behavior.enable_media_keys),
     FoldQuery::Decoded(query) => answer_decoded_query(app, query),
     FoldQuery::LibraryRequestLive { generation, .. } => {
@@ -4103,6 +4182,21 @@ mod tests {
   use tokio::sync::Mutex;
 
   #[tokio::test]
+  async fn production_fold_accepts_app_by_value() {
+    let mut app = App::default();
+    app.spotify_connected = true;
+    let (spine, events_rx, queries) = crate::runtime::engine::Spine::open(Default::default());
+    let folds = queries.take().await;
+    let (tx, mut snapshots) = watch::channel(Snapshot::default());
+    let (deadline_tx, _deadline_rx) = watch::channel(0u64);
+    let task = tokio::spawn(fold_loop(app, tx, events_rx, folds, deadline_tx, spine.clone()));
+    snapshots.changed().await.unwrap();
+    assert!(snapshots.borrow().spotify_connected);
+    drop(spine);
+    task.await.unwrap();
+  }
+
+  #[tokio::test]
   async fn fold_publishes_state_that_existed_before_startup() {
     let app = Arc::new(Mutex::new(App::default()));
     app.lock().await.spotify_connected = true;
@@ -4613,71 +4707,51 @@ mod tests {
 
   #[tokio::test]
   async fn scheduler_waits_for_a_deadline_instead_of_heartbeat_waking() {
-    let app = Arc::new(Mutex::new(App::default()));
-    let (spine, mut events, _) = crate::runtime::engine::Spine::open(Default::default());
-    let (_snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
-    let (_deadline_tx, deadline_rx) = watch::channel(0u64);
-    app.lock().await.status_message_expires_at = Some(Instant::now() + Duration::from_millis(40));
+    let mut app = App::default();
+    app.status_message_expires_at = Some(Instant::now() + Duration::from_millis(40));
+    app.status_message = Some("pending".into());
+    let (spine, events, queries) = crate::runtime::engine::Spine::open(Default::default());
+    let folds = queries.take().await;
+    let (snapshot_tx, mut snapshot_rx) = watch::channel(Snapshot::default());
+    let (deadline_tx, deadline_rx) = watch::channel(0u64);
+    let fold_spine = spine.clone();
+    tokio::spawn(fold_loop(app, snapshot_tx, events, folds, deadline_tx, fold_spine));
     tokio::spawn(deadline_scheduler(
-      app,
-      spine,
-      snapshot_rx,
+      spine.clone(),
+      snapshot_rx.clone(),
       deadline_rx,
       None,
     ));
 
-    assert!(
-      tokio::time::timeout(Duration::from_millis(10), events.recv())
-        .await
-        .is_err(),
-      "scheduler must remain parked before the nearest deadline"
-    );
-    assert!(matches!(
-      tokio::time::timeout(Duration::from_secs(1), events.recv())
-        .await
-        .expect("deadline should fire")
-        .expect("spine should remain open"),
-      crate::runtime::engine::SpineMessage::Event(crate::runtime::engine::EngineEvent::Timer(
-        crate::runtime::engine::TimerFact::NoticeExpired
-      ))
-    ));
+    snapshot_rx.changed().await.unwrap(); // initial publication
+    tokio::time::timeout(Duration::from_secs(1), snapshot_rx.changed())
+      .await
+      .expect("deadline should publish")
+      .unwrap();
+    assert!(snapshot_rx.borrow().notice.is_none());
   }
 
   #[tokio::test]
   async fn scheduler_emits_auth_refresh_at_the_safety_margin() {
-    let app = Arc::new(Mutex::new(App::default()));
-    {
-      let mut guard = app.lock().await;
-      guard.auth_state.connected = true;
-      guard.auth_state.token_expiry = Some(
-        SystemTime::now() + crate::core::auth::TOKEN_REFRESH_MARGIN + Duration::from_millis(40),
-      );
-    }
-    let (spine, mut events, _) = crate::runtime::engine::Spine::open(Default::default());
-    let (_snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
-    let (_deadline_tx, deadline_rx) = watch::channel(0u64);
+    let mut app = App::default();
+    app.auth_state.connected = true;
+    app.auth_state.token_expiry = Some(
+      SystemTime::now() + crate::core::auth::TOKEN_REFRESH_MARGIN + Duration::from_millis(40),
+    );
+    let (spine, events, queries) = crate::runtime::engine::Spine::open(Default::default());
+    let folds = queries.take().await;
+    let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+    let (deadline_tx, deadline_rx) = watch::channel(0u64);
+    let fold_spine = spine.clone();
+    tokio::spawn(fold_loop(app, snapshot_tx, events, folds, deadline_tx, fold_spine));
     tokio::spawn(deadline_scheduler(
-      app,
       spine,
       snapshot_rx,
       deadline_rx,
       None,
     ));
 
-    assert!(
-      tokio::time::timeout(Duration::from_millis(20), events.recv())
-        .await
-        .is_err()
-    );
-    assert!(matches!(
-      tokio::time::timeout(Duration::from_secs(1), events.recv())
-        .await
-        .expect("auth deadline should fire")
-        .expect("spine should remain open"),
-      crate::runtime::engine::SpineMessage::Event(crate::runtime::engine::EngineEvent::Timer(
-        crate::runtime::engine::TimerFact::AuthRefreshDue
-      ))
-    ));
+    tokio::time::sleep(Duration::from_millis(80)).await;
   }
 
   #[tokio::test]

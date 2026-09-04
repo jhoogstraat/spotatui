@@ -1308,6 +1308,9 @@ pub use crate::core::action::LibraryTarget;
 /// never locks. Every variant names the exact decision it feeds, so the
 /// protocol stays auditable.
 pub enum FoldQuery {
+  /// Return the nearest timer deadline currently armed by the fold.
+  /// Timer scheduling is a read-only projection of fold-owned state.
+  NextDeadline,
   /// Whether OS media-key integrations are currently enabled.
   MediaKeysEnabled,
   /// Decoded-source read envelope; concrete variants are kept in the source
@@ -1707,6 +1710,8 @@ pub enum FoldQuery {
 /// match exhaustively and producers cannot mis-cast.
 /// Debug is manual: `StreamingPlayer` has no Debug.
 pub enum FoldAnswer {
+  /// The next named deadline, if any.
+  Deadline(Option<(std::time::Instant, TimerFact)>),
   Decoded(DecodedSourceAnswer),
   Bool(bool),
   U64(u64),
@@ -1845,6 +1850,7 @@ pub struct HistoryQueryState {
 impl std::fmt::Debug for FoldAnswer {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      FoldAnswer::Deadline(_) => f.write_str("Deadline"),
       FoldAnswer::Decoded(_) => f.write_str("Decoded"),
       FoldAnswer::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
       FoldAnswer::U64(v) => f.debug_tuple("U64").field(v).finish(),
