@@ -279,9 +279,9 @@ pub enum IoEvent {
   ///
   /// Runs on the **service** lane: a brain call can take a minute or more (an
   /// agent CLI is a subprocess with real startup cost), and parking that on the
-  /// serial pump would freeze every other event behind it. It touches only
-  /// `self.app` plus its own HTTP client / subprocess, which is exactly the
-  /// service-lane contract.
+  /// serial pump would freeze every other event behind it. It uses fold queries
+  /// and facts plus its own HTTP client / subprocess, which keeps the service
+  /// lane independent of serial state.
   #[cfg(feature = "ai-dj")]
   AskDj(Box<crate::infra::dj::AskDjRequest>),
   /// Top the queue up because it is running low.
@@ -472,12 +472,12 @@ impl Network {
 
   /// Events that run on the concurrent service lane in `start_tokio`: a strict
   /// subset of [`Self::event_bypasses_spotify_auth`] whose handlers touch only
-  /// `self.app` (plus their own HTTP clients / `spawn_blocking`) — never the
-  /// Spotify client, API pacing, or pending login/search limits) — so they can
-  /// execute on a detached task with a
-  /// throwaway `Network` instead of head-of-line-blocking the serial pump.
-  /// Keep in sync with the handlers: an event listed here MUST NOT read or
-  /// write anything on `Network` besides `app`.
+  /// immutable configuration plus their own HTTP clients / `spawn_blocking` —
+  /// never the Spotify client, API pacing, or pending login/search limits — so
+  /// they can execute on a detached task with a throwaway `Network` instead of
+  /// head-of-line-blocking the serial pump.
+  /// Keep in sync with the handlers: an event listed here MUST NOT access
+  /// mutable serial-lane state.
   pub fn runs_on_service_lane(io_event: &IoEvent) -> bool {
     if !Self::event_bypasses_spotify_auth(io_event) {
       return false;

@@ -90,8 +90,8 @@ impl UserNetwork for Network {
     {
       Ok(recently_played) => {
         let domain_page = map_cursor_page(&recently_played, |ph| TrackInfo::from(&ph.track));
-        // Liked checks ride the fold's dispatch fact (the producer cannot
-        // reach the IoEvent channel without the App lock it no longer takes).
+        // Liked checks ride the fold's dispatch fact; the producer never borrows
+        // fold-owned state while preparing this result.
         let track_check =
           ids::track_check_ids(recently_played.items.iter().map(|ph| ph.track.id.as_ref()));
         if !track_check.is_empty() {

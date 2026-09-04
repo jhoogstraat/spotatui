@@ -27,7 +27,7 @@ pub struct ToolSpec {
   /// decide what to confirm with the user.
   pub read_only: bool,
   /// Whether executing it needs the live Spotify client (and therefore the
-  /// serial IoEvent lane) rather than just the `App` lock.
+  /// serial IoEvent lane) rather than fold queries alone.
   pub needs_network: bool,
   pub schema: fn() -> Value,
 }

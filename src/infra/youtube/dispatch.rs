@@ -601,8 +601,8 @@ async fn acquire_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
   }
 }
 
-/// Download a video's audio into a fresh tempfile. Must be awaited **without**
-/// holding the `App` lock (this is the slowest download of any source).
+/// Download a video's audio into a fresh tempfile without blocking the fold
+/// (this is the slowest download of any source).
 async fn download_audio(source: &YouTubeSource, video_id: &str) -> Result<NamedTempFile> {
   let tmp = NamedTempFile::with_suffix(".m4a").context("creating temp file for YouTube audio")?;
   source.download_audio(video_id, tmp.path()).await?;

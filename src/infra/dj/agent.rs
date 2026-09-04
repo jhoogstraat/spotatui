@@ -5,9 +5,9 @@
 //! which is what a plain conversational reply is.
 //!
 //! Runs on the **service** lane, where a brain call may take minutes. The tools
-//! themselves do not run here: [`exec::AppExecutor`] answers the read-only ones
-//! from the `App` lock and sends the rest down the serial lane, which is the only
-//! one with a Spotify client.
+//! themselves do not run here: [`exec::AppExecutor`] answers read-only ones via
+//! fold queries and sends the rest down the serial lane, which is the only one
+//! with a Spotify client.
 //!
 //! The loop is bounded because every step of an `agent_cli` turn is a fresh
 //! subprocess, so an unbounded turn would spend the listener's subscription and
