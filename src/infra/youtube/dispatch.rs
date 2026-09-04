@@ -170,13 +170,6 @@ pub async fn route_youtube_event(
   route_youtube_event_impl(&spine, event).await
 }
 
-/// Legacy source-construction helper for queue tests and the decoded queue
-/// router. Runtime workers use the fold's `YouTubeConfig` query instead.
-pub(crate) async fn build_source(app: &Arc<Mutex<crate::core::app::App>>) -> YouTubeSource {
-  let ytdlp_path = app.lock().await.user_config.behavior.ytdlp_path.clone();
-  YouTubeSource::new(ytdlp_path)
-}
-
 async fn youtube_player(spine: &Spine) -> Option<Arc<LocalPlayer>> {
   match decoded(&spine, Query::YouTubePlayer).await? {
     Answer::YouTubePlayer(player) => player,
