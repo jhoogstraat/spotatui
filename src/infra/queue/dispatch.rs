@@ -359,23 +359,40 @@ async fn queue_status(spine: &crate::runtime::engine::Spine, message: &str) {
   feature = "subsonic",
   feature = "youtube"
 ))]
-async fn claim_queue_head(
-  spine: &crate::runtime::engine::Spine,
-) -> Option<crate::core::plugin_api::TrackInfo> {
+async fn claim_queue_head(spine: &crate::runtime::engine::Spine) -> QueueClaim {
   let head = match spine
     .query(crate::runtime::engine::FoldQuery::QueueTracks)
     .await
-    .ok()?
+    .ok()
   {
-    crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks) => tracks.drain(..).next(),
-    _ => None,
-  }?;
-  spine
+    Some(crate::runtime::engine::FoldAnswer::QueueTracks(mut tracks)) => tracks.drain(..).next(),
+    _ => return QueueClaim::Lost,
+  };
+  let Some(head) = head else {
+    return QueueClaim::Empty;
+  };
+  match spine
     .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
       crate::runtime::engine::DecodedSourceFact::QueueNativeTrackPopped { track: head },
     ))
     .await
     .and_then(|ack| ack.queue_track)
+  {
+    Some(track) => QueueClaim::Claimed(track),
+    None => QueueClaim::Lost,
+  }
+}
+
+#[cfg(any(
+  feature = "streaming",
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube"
+))]
+enum QueueClaim {
+  Empty,
+  Claimed(crate::core::plugin_api::TrackInfo),
+  Lost,
 }
 
 #[cfg(any(
@@ -419,14 +436,20 @@ async fn advance_queue(spine: &crate::runtime::engine::Spine, explicit_next: boo
       }
     }
   }
-  let Some(track) = claim_queue_head(spine).await else {
-    let _ = spine
-      .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
-        crate::runtime::engine::DecodedSourceFact::QueueSlotCleared,
-      ))
-      .await;
-    resume_suspended(spine).await;
-    return true;
+  let track = match claim_queue_head(spine).await {
+    QueueClaim::Claimed(track) => track,
+    QueueClaim::Empty => {
+      let _ = spine
+        .emit_acked(crate::runtime::engine::EngineEvent::Decoded(
+          crate::runtime::engine::DecodedSourceFact::QueueSlotCleared,
+        ))
+        .await;
+      resume_suspended(spine).await;
+      return true;
+    }
+    // Another Advance won the queue-head claim. Keep its slot/lease intact;
+    // it owns the only detached worker for that item.
+    QueueClaim::Lost => return true,
   };
   let Some(uri) = track.uri.clone() else {
     queue_status(spine, "Skipped a queued track with no URI").await;
