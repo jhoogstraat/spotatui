@@ -39,6 +39,11 @@ const MAX_API_PLAYBACK_URIS: usize = 100;
 /// tick, which is what actually recovers the intermittent player-service 401s
 /// of issue #395 (users were pressing Esc and finding playback untouched).
 const MAX_CONSECUTIVE_PLAYBACK_AUTH_FAILURES: u8 = 4;
+/// Extra quiet time after a playback poll exhausts its 429 retries. The
+/// request helper already waits for `Retry-After` between attempts; this
+/// cooldown keeps the next scheduled poll from immediately repeating the
+/// whole sequence against a still rate-limited endpoint.
+const PLAYBACK_RATE_LIMIT_COOLDOWN_SECS: u64 = 10;
 
 #[cfg(feature = "streaming")]
 const MAX_NATIVE_IDLE_RECOVERY_ATTEMPTS: u8 = 2;
@@ -1264,8 +1269,8 @@ impl PlaybackNetwork for Network {
             })
             .await;
           self
-            .emit_session_acked(SessionFact::PlaybackPollIdle {
-              clear_context: false,
+            .emit_session_acked(SessionFact::PlaybackPollRateLimited {
+              cooldown_secs: PLAYBACK_RATE_LIMIT_COOLDOWN_SECS,
             })
             .await;
           return;
@@ -3421,6 +3426,28 @@ mod tests {
         clear_context: false,
       },
     );
+    assert!(!app.is_fetching_current_playback);
+    assert_eq!(app.seek_ms, None);
+  }
+
+  #[test]
+  fn playback_rate_limit_fact_delays_the_next_poll_without_clearing_context() {
+    use crate::core::app::App;
+    use crate::core::user_config::UserConfig;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    let (io_tx, _rx) = channel();
+    let mut app = App::new(io_tx, UserConfig::new(), None);
+    app.is_fetching_current_playback = true;
+    app.seek_ms = Some(12_345);
+    let before = Instant::now();
+    crate::runtime::frontend::apply_session_fact(
+      &mut app,
+      SessionFact::PlaybackPollRateLimited { cooldown_secs: 10 },
+    );
+
+    assert!(app.instant_since_last_current_playback_poll >= before + Duration::from_secs(10));
     assert!(!app.is_fetching_current_playback);
     assert_eq!(app.seek_ms, None);
   }

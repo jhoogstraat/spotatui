@@ -2680,6 +2680,16 @@ pub(crate) fn apply_session_fact(app: &mut App, fact: crate::runtime::engine::Se
       app.is_fetching_current_playback = false;
       app.seek_ms.take();
     }
+    SessionFact::PlaybackPollRateLimited { cooldown_secs } => {
+      // Keep the last known playback context visible, but move the next poll
+      // deadline forward so a 429 does not immediately start another retry
+      // sequence. `Instant::elapsed` saturates while this timestamp is in the
+      // future, so the regular interval is added after the cooldown.
+      app.instant_since_last_current_playback_poll =
+        Instant::now() + Duration::from_secs(cooldown_secs);
+      app.is_fetching_current_playback = false;
+      app.seek_ms.take();
+    }
     #[cfg(feature = "streaming")]
     SessionFact::NativeIdleDeviceReconciled {
       native_device_id,

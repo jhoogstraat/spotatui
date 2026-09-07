@@ -1001,6 +1001,12 @@ pub enum SessionFact {
   PlaybackPollIdle {
     clear_context: bool,
   },
+  /// Spotify rejected a playback poll with a rate limit. Keep the last
+  /// playback snapshot and delay the next poll so one 429 does not start a
+  /// fresh retry sequence on every regular tick.
+  PlaybackPollRateLimited {
+    cooldown_secs: u64,
+  },
   #[cfg(feature = "streaming")]
   NativeIdleDeviceReconciled {
     native_device_id: String,
@@ -1191,6 +1197,10 @@ impl std::fmt::Debug for SessionFact {
         .finish(),
       SessionFact::PlaybackPolled { .. } => f.write_str("PlaybackPolled"),
       SessionFact::PlaybackPollIdle { .. } => f.write_str("PlaybackPollIdle"),
+      SessionFact::PlaybackPollRateLimited { cooldown_secs } => f
+        .debug_struct("PlaybackPollRateLimited")
+        .field("cooldown_secs", cooldown_secs)
+        .finish(),
       #[cfg(feature = "streaming")]
       SessionFact::NativeIdleDeviceReconciled { .. } => f.write_str("NativeIdleDeviceReconciled"),
       #[cfg(feature = "streaming")]
