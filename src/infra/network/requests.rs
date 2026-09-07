@@ -48,6 +48,23 @@ const UNAUTHORIZED_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// Longest response body echoed into the diagnostics log.
 const MAX_LOGGED_BODY_CHARS: usize = 512;
 
+#[derive(Debug)]
+pub struct SpotifyRateLimitError {
+  pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for SpotifyRateLimitError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "Spotify API rate limited (retry after {}s)",
+      self.retry_after_secs
+    )
+  }
+}
+
+impl std::error::Error for SpotifyRateLimitError {}
+
 /// Cooldown state for forced token refreshes triggered by a 401 response.
 ///
 /// Deliberately long-lived and shared: every request is a fresh call into
@@ -373,11 +390,19 @@ where
       continue;
     }
 
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt + 1 < max_attempts {
-      let backoff_secs = retry_after_secs.max(1) + u64::from(attempt);
-      tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-      attempt += 1;
-      continue;
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+      if attempt + 1 < max_attempts {
+        let backoff_secs = retry_after_secs.max(1) + u64::from(attempt);
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        attempt += 1;
+        continue;
+      }
+      return Err(
+        SpotifyRateLimitError {
+          retry_after_secs: retry_after_secs.max(1),
+        }
+        .into(),
+      );
     }
 
     return Err(anyhow!("Spotify API {} failed: {}", status, body));
@@ -530,8 +555,16 @@ pub fn normalize_spotify_payload(value: &mut Value) {
 }
 
 pub fn is_rate_limited_error(e: &anyhow::Error) -> bool {
+  if e.downcast_ref::<SpotifyRateLimitError>().is_some() {
+    return true;
+  }
   let text = e.to_string();
   text.contains("429") || text.contains("Too Many Requests") || text.contains("Too many requests")
+}
+
+pub fn rate_limit_retry_after_secs(e: &anyhow::Error) -> Option<u64> {
+  e.downcast_ref::<SpotifyRateLimitError>()
+    .map(|error| error.retry_after_secs)
 }
 
 #[allow(dead_code)]
@@ -603,6 +636,15 @@ mod tests {
     drop(token_lock);
 
     spotify
+  }
+
+  #[test]
+  fn rate_limit_error_preserves_retry_after_for_callers() {
+    let error = anyhow::Error::new(SpotifyRateLimitError {
+      retry_after_secs: 17,
+    });
+    assert!(is_rate_limited_error(&error));
+    assert_eq!(rate_limit_retry_after_secs(&error), Some(17));
   }
 
   async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {

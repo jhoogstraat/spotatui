@@ -1,3 +1,4 @@
+use super::requests;
 use super::{IoEvent, Network};
 use crate::core::app::App;
 #[cfg(feature = "streaming")]
@@ -1257,10 +1258,9 @@ impl PlaybackNetwork for Network {
       Err(e) => {
         let err = anyhow!(e);
 
-        if err.to_string().contains("429")
-          || err.to_string().contains("Too Many Requests")
-          || err.to_string().contains("Too many requests")
-        {
+        if requests::is_rate_limited_error(&err) {
+          let cooldown_secs = requests::rate_limit_retry_after_secs(&err)
+            .unwrap_or(PLAYBACK_RATE_LIMIT_COOLDOWN_SECS);
           self
             .emit_session(SessionFact::TransientStatus {
               message: "Spotify rate limit hit. Retrying automatically; please wait a few seconds."
@@ -1269,9 +1269,7 @@ impl PlaybackNetwork for Network {
             })
             .await;
           self
-            .emit_session_acked(SessionFact::PlaybackPollRateLimited {
-              cooldown_secs: PLAYBACK_RATE_LIMIT_COOLDOWN_SECS,
-            })
+            .emit_session_acked(SessionFact::PlaybackPollRateLimited { cooldown_secs })
             .await;
           return;
         }
