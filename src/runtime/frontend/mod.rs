@@ -9,6 +9,7 @@
 //! `Network`, rspotify, and librespot types stay private.
 
 use anyhow::Result;
+use rspotify::prelude::Id;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::watch;
@@ -33,13 +34,21 @@ pub struct LibrarySnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchDetail {
   Artist {
+    /// The identity returned by the catalog request, rather than the
+    /// navigation request that happened to be current when it landed.
+    target_locator: Option<String>,
+    complete: bool,
     tracks: Arc<[TrackInfo]>,
     albums: Arc<[AlbumInfo]>,
   },
   Album {
+    target_locator: Option<String>,
+    complete: bool,
     tracks: Arc<[TrackInfo]>,
   },
   Playlist {
+    target_locator: Option<String>,
+    complete: bool,
     tracks: Arc<[TrackInfo]>,
   },
 }
@@ -70,6 +79,8 @@ pub struct Snapshot {
   pub search_artists: Arc<[ArtistInfo]>,
   pub search_albums: Arc<[AlbumInfo]>,
   pub search_playlists: Arc<[PlaylistInfo]>,
+  /// Whether any search page was fetched, including a successful empty page.
+  pub search_has_results_page: bool,
   pub search_detail: Option<SearchDetail>,
   /// Monotonic revisions for accepted catalog completions. These are engine
   /// facts; adapters only translate them and never compare or cache rows.
@@ -584,6 +595,7 @@ impl Default for Snapshot {
       search_artists: Arc::from([]),
       search_albums: Arc::from([]),
       search_playlists: Arc::from([]),
+      search_has_results_page: false,
       search_detail: None,
       search_revision: 0,
       detail_revision: 0,
@@ -637,6 +649,7 @@ pub(crate) async fn spawn_fold(
     search_artists: Arc::from([]),
     search_albums: Arc::from([]),
     search_playlists: Arc::from([]),
+    search_has_results_page: false,
     search_detail: None,
     search_revision: 0,
     detail_revision: 0,
@@ -960,7 +973,11 @@ struct CatalogChanges {
 impl CatalogChanges {
   fn absorb_catalog(&mut self, event: &CatalogStateEvent, outcome: crate::core::CatalogOutcome) {
     self.search |= outcome.search_rows_replaced;
-    self.detail |= matches!(event, CatalogStateEvent::TrackTableReplaced { .. });
+    self.detail |= !outcome.stale_event_dropped && matches!(
+      event,
+      CatalogStateEvent::TrackTableReplaced { .. }
+        | CatalogStateEvent::PlaylistTracksPageUpserted { .. }
+    );
     self.library |= outcome.library_page_upserted;
   }
 }
@@ -4453,37 +4470,66 @@ fn build_snapshot(app: &App, catalog: &CatalogPublication, changes: CatalogChang
   let search_detail = rebuild_detail
     .then(|| match app.get_current_route().id {
       crate::core::app::RouteId::Artist => app.artist.as_ref().map(|artist| SearchDetail::Artist {
+        target_locator: Some(format!("spotify:artist:{}", artist.artist_id)),
+        complete: true,
         tracks: artist.top_tracks.clone().into(),
         albums: artist.albums.items.clone().into(),
       }),
       crate::core::app::RouteId::AlbumTracks => app
         .selected_album_simplified
         .as_ref()
-        .map(|album| SearchDetail::Album {
-          tracks: album.tracks.items.clone().into(),
+        .map(|album| {
+          let tracks = album.tracks.items.clone();
+          SearchDetail::Album {
+            target_locator: album
+              .album
+              .id
+              .clone()
+              .or_else(|| album.album.uri.clone()),
+            complete: album.tracks.next.is_none()
+              && album
+                .album
+                .total_tracks
+                .is_none_or(|total| tracks.len() >= total as usize),
+            tracks: tracks.into(),
+          }
         })
         .or_else(|| {
           app
             .selected_album_full
             .as_ref()
-            .map(|album| SearchDetail::Album {
-              tracks: album.album.tracks.clone().into(),
+            .map(|album| {
+              let tracks = album.album.tracks.clone();
+              SearchDetail::Album {
+                target_locator: album
+                  .album
+                  .id
+                  .clone()
+                  .or_else(|| album.album.uri.clone()),
+                complete: album
+                  .album
+                  .total_tracks
+                  .is_none_or(|total| tracks.len() >= total as usize),
+                tracks: tracks.into(),
+              }
             })
         }),
       crate::core::app::RouteId::TrackTable => {
+        let complete = app
+          .playlist_tracks
+          .as_ref()
+          .zip(app.current_playlist_track_total())
+          .is_some_and(|(page, total)| page.next.is_none()
+            && page.offset.saturating_add(page.items.len() as u32) >= total);
         app
           .playlist_tracks
           .as_ref()
-          .map(|page| SearchDetail::Playlist {
-            tracks: page
-              .items
-              .iter()
-              .filter_map(|(_, item)| match item {
-                crate::core::plugin_api::PlayableInfo::Track(track) => Some(track.clone()),
-                crate::core::plugin_api::PlayableInfo::Episode(_) => None,
-              })
-              .collect::<Vec<_>>()
-              .into(),
+          .map(|_| SearchDetail::Playlist {
+            target_locator: app
+              .current_playlist_track_table_id()
+              .map(|playlist| format!("spotify:playlist:{}", playlist.id())),
+            complete,
+            tracks: app.track_table.tracks.clone().into(),
           })
       }
       _ => None,
@@ -4532,6 +4578,10 @@ fn build_snapshot(app: &App, catalog: &CatalogPublication, changes: CatalogChang
       || Arc::clone(&catalog.search_playlists),
       |s| s.playlists.clone().into(),
     ),
+    search_has_results_page: app.search_results.tracks.is_some()
+      || app.search_results.artists.is_some()
+      || app.search_results.albums.is_some()
+      || app.search_results.playlists.is_some(),
     search_detail: if rebuild_detail {
       search_detail
     } else {
@@ -4744,6 +4794,65 @@ mod tests {
     assert_eq!(first.catalog_generation, Some(0));
     let second = spine.emit_acked(request()).await.unwrap();
     assert_eq!(second.catalog_generation, Some(1));
+  }
+
+  #[tokio::test]
+  async fn search_results_page_presence_distinguishes_empty_success_from_missing_pages() {
+    let app = Arc::new(Mutex::new(App::default()));
+    let (spine, mut snapshots) = spawn_fold(&app).await;
+    snapshots.changed().await.unwrap();
+
+    let request = crate::runtime::engine::EngineEvent::Catalog(
+      crate::core::catalog::CatalogStateEvent::SearchRequested {
+        source: Source::Radio,
+        query: "empty".into(),
+        scoped_loading: true,
+      },
+    );
+    let ack = spine.emit_acked(request).await.unwrap();
+    snapshots.borrow_and_update();
+    assert!(!snapshots.borrow().search_has_results_page);
+
+    spine
+      .emit(crate::runtime::engine::EngineEvent::Catalog(
+        crate::core::catalog::CatalogStateEvent::SearchCompleted {
+          source: Source::Radio,
+          query: "empty".into(),
+          generation: ack.catalog_generation.unwrap(),
+          pages: Box::new(crate::core::catalog::SearchCompletionPages {
+            tracks: Some(crate::core::pagination::Paged::default()),
+            ..Default::default()
+          }),
+        },
+      ))
+      .await;
+    snapshots.changed().await.unwrap();
+    assert!(snapshots.borrow().search_has_results_page);
+
+    spine
+      .emit_acked(crate::runtime::engine::EngineEvent::Catalog(
+        crate::core::catalog::CatalogStateEvent::SearchRequested {
+          source: Source::Radio,
+          query: "failed".into(),
+          scoped_loading: true,
+        },
+      ))
+      .await;
+    snapshots.borrow_and_update();
+    assert!(!snapshots.borrow().search_has_results_page);
+
+    spine
+      .emit(crate::runtime::engine::EngineEvent::Catalog(
+        crate::core::catalog::CatalogStateEvent::SearchCompleted {
+          source: Source::Radio,
+          query: "failed".into(),
+          generation: 1,
+          pages: Box::default(),
+        },
+      ))
+      .await;
+    snapshots.changed().await.unwrap();
+    assert!(!snapshots.borrow().search_has_results_page);
   }
 
   #[test]
@@ -5155,6 +5264,113 @@ mod tests {
     let replaced = tx.borrow().clone();
     assert!(!Arc::ptr_eq(&first.search_tracks, &replaced.search_tracks));
     assert!(replaced.search_revision > first.search_revision);
+  }
+
+  #[test]
+  fn playlist_detail_publishes_contiguous_pages_and_ignores_stale_completions() {
+    use crate::core::app::{ActiveBlock, RouteId, TrackTableContext};
+    use crate::core::pagination::Paged;
+    use crate::core::plugin_api::{EpisodeInfo, PlayableInfo};
+
+    let mut app = App::default();
+    let playlist_id = "37i9dQZF1DXcBWIGoYBM5M";
+    app.reset_playlist_tracks_view(
+      rspotify::model::PlaylistId::from_id(playlist_id).unwrap().into_static(),
+      TrackTableContext::MyPlaylists,
+    );
+    app.push_navigation_stack(RouteId::TrackTable, ActiveBlock::TrackTable);
+    let mut catalog = CatalogPublication::default();
+    let (tx, rx) = watch::channel(Snapshot::default());
+    publish(&app, &tx, &mut catalog, CatalogChanges::default());
+    let mut last_revision = rx.borrow().detail_revision;
+
+    // A terminal page arriving before the middle page must not expose a gap.
+    // The middle entry is an episode: completion counts fetched entries, not
+    // only the track rows this frontend supports.
+    for (offset, expected_tracks, expected_complete) in [(0, 1, false), (2, 1, false), (1, 2, true)] {
+      let item = if offset == 1 {
+        PlayableInfo::Episode(serde_json::from_value::<EpisodeInfo>(serde_json::json!({
+          "id": "episode", "uri": "spotify:episode:episode", "name": "Episode", "duration_ms": 1
+        })).unwrap())
+      } else {
+        PlayableInfo::Track(serde_json::from_value::<TrackInfo>(serde_json::json!({
+          "uri": format!("spotify:track:{offset}"), "name": format!("Track {offset}"),
+          "artists": [], "album": "", "duration_ms": 1
+        })).unwrap())
+      };
+      let event = CatalogStateEvent::PlaylistTracksPageUpserted {
+        playlist_id: playlist_id.into(),
+        generation: app.playlist_tracks_prefetch_generation,
+        page: Paged {
+          offset, limit: 1, total: 3,
+          next: (offset < 2).then(|| "next".into()),
+          previous: None,
+          items: vec![(offset, item)],
+        },
+        track_ids_for_like_check: vec![],
+      };
+      let outcome = crate::core::apply_catalog_state(&mut app, &event);
+      let mut changes = CatalogChanges::default();
+      changes.absorb_catalog(&event, outcome);
+      assert!(changes.detail);
+      publish(&app, &tx, &mut catalog, changes);
+      let snapshot = rx.borrow();
+      let Some(SearchDetail::Playlist { target_locator, complete, tracks }) = &snapshot.search_detail else {
+        panic!("expected playlist detail");
+      };
+      assert_eq!(target_locator.as_deref(), Some(format!("spotify:playlist:{playlist_id}").as_str()));
+      assert_eq!(tracks.len(), expected_tracks);
+      assert_eq!(*complete, expected_complete);
+      if offset == 2 {
+        assert_eq!(snapshot.detail_revision, last_revision);
+      } else {
+        assert!(snapshot.detail_revision > last_revision);
+      }
+      last_revision = snapshot.detail_revision;
+    }
+
+    let stale = CatalogStateEvent::PlaylistTracksPageUpserted {
+      playlist_id: playlist_id.into(),
+      generation: app.playlist_tracks_prefetch_generation.wrapping_sub(1),
+      page: Paged::default(),
+      track_ids_for_like_check: vec![],
+    };
+    let outcome = crate::core::apply_catalog_state(&mut app, &stale);
+    let mut changes = CatalogChanges::default();
+    changes.absorb_catalog(&stale, outcome);
+    assert!(!changes.detail);
+    publish(&app, &tx, &mut catalog, changes);
+    assert_eq!(rx.borrow().detail_revision, last_revision);
+  }
+
+  #[test]
+  fn detail_identity_and_completion_are_revisioned_facts() {
+    let mut publication = CatalogPublication::default();
+    let mut first = Snapshot::default();
+    first.search_detail = Some(SearchDetail::Album {
+      target_locator: Some("spotify:album:a".into()),
+      complete: false,
+      tracks: Arc::from([]),
+    });
+    let first = publication.revise(first, &Snapshot::default());
+    assert_eq!(first.detail_revision, 1);
+
+    let mut second = first.clone();
+    second.search_detail = Some(SearchDetail::Album {
+      target_locator: Some("spotify:album:b".into()),
+      complete: true,
+      tracks: Arc::from([]),
+    });
+    let second = publication.revise(second, &first);
+    assert_eq!(second.detail_revision, 2);
+    assert!(matches!(
+      second.search_detail,
+      Some(SearchDetail::Album {
+        target_locator: Some(locator),
+        complete: true,
+        ..
+      }) if locator == "spotify:album:b"
+    ));
   }
 
   #[test]

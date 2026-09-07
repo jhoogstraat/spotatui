@@ -139,6 +139,7 @@ fn api_playback_body(
       Some(body)
     }
     (None, Some(track_uris)) => {
+      let (track_uris, offset) = trim_api_playback_uris(track_uris.to_vec(), offset);
       let mut body = json!({
         "uris": track_uris.iter().map(|uri| uri.uri()).collect::<Vec<_>>()
       });
@@ -1436,18 +1437,6 @@ impl PlaybackNetwork for Network {
     uris: Option<Vec<PlayableId<'static>>>,
     offset: Option<usize>,
   ) {
-    let (uris, offset) = if context_id.is_none() {
-      match uris {
-        Some(track_uris) => {
-          let (trimmed_uris, trimmed_offset) = trim_api_playback_uris(track_uris, offset);
-          (Some(trimmed_uris), trimmed_offset)
-        }
-        None => (None, offset),
-      }
-    } else {
-      (uris, offset)
-    };
-
     let desired_shuffle_state = match self.fold_query(FoldQuery::DesiredShuffleState).await {
       Some(FoldAnswer::Bool(state)) => state,
       _ => false,
@@ -2750,6 +2739,38 @@ mod tests {
     assert_eq!(trimmed.len(), MAX_API_PLAYBACK_URIS);
     assert_eq!(offset, Some(99));
     assert_eq!(trimmed[offset.unwrap()].uri(), uris[149].uri());
+  }
+
+  #[test]
+  fn api_playback_body_caps_uri_lists_and_adjusts_offset() {
+    let uris = (0..150)
+      .map(|index| playable_track(&format!("{index:022}")))
+      .collect::<Vec<_>>();
+
+    let body = api_playback_body(None, Some(&uris), Some(149)).unwrap();
+    assert_eq!(
+      body["uris"].as_array().unwrap().len(),
+      MAX_API_PLAYBACK_URIS
+    );
+    assert_eq!(body["offset"]["position"], 99);
+    assert_eq!(body["uris"][99], uris[149].uri());
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn native_load_keeps_the_full_list_and_original_offset() {
+    let uris = (0..150)
+      .map(|index| playable_track(&format!("{index:022}")))
+      .collect::<Vec<_>>();
+
+    let request = native_load_request(None, Some(uris), Some(149)).unwrap();
+    assert!(matches!(
+      request.playing_track.as_ref(),
+      Some(PlayingTrack::Index(149))
+    ));
+    let request_debug = format!("{request:?}");
+    assert!(request_debug.contains("spotify:track:0000000000000000000000"));
+    assert!(request_debug.contains("spotify:track:0000000000000000000149"));
   }
 
   #[cfg(feature = "streaming")]

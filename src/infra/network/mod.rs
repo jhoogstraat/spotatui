@@ -49,6 +49,9 @@ use self::utils::UtilsNetwork;
 // while the feature is silently absent.
 #[allow(dead_code)]
 pub enum IoEvent {
+  /// Internal wake-up used to stop the blocking sync-to-async bridge.
+  #[allow(dead_code)]
+  ShutdownPump,
   GetCurrentPlayback,
   /// After a track transition (e.g., EndOfTrack), ensure we don't end up paused on the next item.
   /// The payload is the previous track identifier (either base62 id or a `spotify:track:` URI).
@@ -540,6 +543,7 @@ impl Network {
     }
 
     match io_event {
+      IoEvent::ShutdownPump => {}
       IoEvent::RefreshAuthentication => {
         self.refresh_authentication().await;
       }

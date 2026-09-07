@@ -2,33 +2,62 @@
 
 use crate::infra::network::{IoEvent, Network};
 
-// CLI mode never starts the pump; only a frontend launch does.
-#[allow(dead_code)] // TEMPORARY (ticket 01): the windowed frontend still drives this pump.
-pub(super) async fn start_tokio(
+fn spawn_event_bridge(
   io_rx: std::sync::mpsc::Receiver<IoEvent>,
-  network: &mut Network,
-  mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-  // Bridge the sync dispatch channel onto the async runtime: a dedicated
-  // thread does blocking recv() and forwards into a tokio channel the pump can
-  // await, replacing the old try_recv() + 5ms sleep poll (which added 0-5ms
-  // latency to every event and busy-woke the task while idle).
-  let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel::<IoEvent>();
-  let bridge_shutdown = shutdown_rx.clone();
-  let bridge_thread = std::thread::spawn(move || loop {
-    if *bridge_shutdown.borrow() {
-      break;
-    }
-    match io_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+  bridge_tx: tokio::sync::mpsc::UnboundedSender<IoEvent>,
+) -> std::thread::JoinHandle<()> {
+  std::thread::spawn(move || loop {
+    match io_rx.recv() {
+      Ok(IoEvent::ShutdownPump) | Err(_) => break,
       Ok(io_event) => {
         if bridge_tx.send(io_event).is_err() {
           break;
         }
       }
-      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
     }
-  });
+  })
+}
+
+struct EventBridge {
+  shutdown_tx: std::sync::mpsc::Sender<IoEvent>,
+  thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EventBridge {
+  fn new(
+    io_rx: std::sync::mpsc::Receiver<IoEvent>,
+    bridge_tx: tokio::sync::mpsc::UnboundedSender<IoEvent>,
+    shutdown_tx: std::sync::mpsc::Sender<IoEvent>,
+  ) -> Self {
+    Self {
+      shutdown_tx,
+      thread: Some(spawn_event_bridge(io_rx, bridge_tx)),
+    }
+  }
+}
+
+impl Drop for EventBridge {
+  fn drop(&mut self) {
+    let _ = self.shutdown_tx.send(IoEvent::ShutdownPump);
+    if let Some(thread) = self.thread.take() {
+      let _ = thread.join();
+    }
+  }
+}
+
+// CLI mode never starts the pump; only a frontend launch does.
+#[allow(dead_code)] // TEMPORARY (ticket 01): the windowed frontend still drives this pump.
+pub(super) async fn start_tokio(
+  io_rx: std::sync::mpsc::Receiver<IoEvent>,
+  shutdown_wake_tx: std::sync::mpsc::Sender<IoEvent>,
+  network: &mut Network,
+  mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+  // Bridge the sync dispatch channel onto the async runtime: a dedicated
+  // thread does blocking recv() and forwards into a tokio channel the pump can
+  // await. Shutdown sends a final private event to wake the blocking receive.
+  let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel::<IoEvent>();
+  let _bridge = EventBridge::new(io_rx, bridge_tx, shutdown_wake_tx);
   let mut service_tasks = tokio::task::JoinSet::new();
 
   loop {
@@ -148,6 +177,57 @@ pub(super) async fn start_tokio(
   }
   service_tasks.abort_all();
   while service_tasks.join_next().await.is_some() {}
-  // Do not leave a blocking bridge thread behind after the async pump exits.
-  let _ = bridge_thread.join();
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn event_bridge_preserves_order_and_wakes_on_shutdown() {
+    let (io_tx, io_rx) = std::sync::mpsc::channel();
+    let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bridge = EventBridge::new(io_rx, bridge_tx, io_tx.clone());
+
+    io_tx.send(IoEvent::GetCurrentPlayback).unwrap();
+    io_tx.send(IoEvent::PausePlayback).unwrap();
+    assert!(matches!(
+      bridge_rx.recv().await,
+      Some(IoEvent::GetCurrentPlayback)
+    ));
+    assert!(matches!(
+      bridge_rx.recv().await,
+      Some(IoEvent::PausePlayback)
+    ));
+
+    let external_sender = io_tx.clone();
+    let mut drop_task = tokio::task::spawn_blocking(move || drop(bridge));
+    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut drop_task).await {
+      Ok(result) => result.unwrap(),
+      Err(_) => {
+        external_sender.send(IoEvent::ShutdownPump).unwrap();
+        drop_task.await.unwrap();
+        panic!("bridge drop should join promptly");
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn event_bridge_drop_wakes_with_external_sender_alive() {
+    let (io_tx, io_rx) = std::sync::mpsc::channel();
+    let external_sender = io_tx.clone();
+    let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bridge = EventBridge::new(io_rx, bridge_tx, io_tx);
+
+    let mut drop_task = tokio::task::spawn_blocking(move || drop(bridge));
+    match tokio::time::timeout(std::time::Duration::from_secs(1), &mut drop_task).await {
+      Ok(result) => result.unwrap(),
+      Err(_) => {
+        external_sender.send(IoEvent::ShutdownPump).unwrap();
+        drop_task.await.unwrap();
+        panic!("bridge drop should join promptly");
+      }
+    }
+    drop(external_sender);
+  }
 }

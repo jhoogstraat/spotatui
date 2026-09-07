@@ -704,6 +704,7 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
   let mut producer_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
   app.spine = Some(spine_for_events.clone());
   let sync_io_rx = boot.sync_io_rx;
+  let sync_io_tx = app.io_tx_clone();
   let user_config = boot.user_config;
   let client_config = boot.client_config;
   let spotify = boot.spotify;
@@ -1224,7 +1225,8 @@ pub(super) async fn start_services(boot: Boot) -> Result<Services> {
       }
     }
 
-    start_tokio(sync_io_rx, &mut network, network_shutdown_rx).await;
+    let sync_io_tx = sync_io_tx.expect("Boot must provide the IoEvent sender");
+    start_tokio(sync_io_rx, sync_io_tx, &mut network, network_shutdown_rx).await;
   });
 
   Ok(Services {
