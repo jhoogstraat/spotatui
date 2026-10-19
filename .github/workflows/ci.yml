@@ -145,7 +145,7 @@ jobs:
       - name: Run tests with coverage
         run: cargo llvm-cov --locked --no-default-features --features telemetry,streaming,discord-rpc,self-update,mcp-server,ai-dj,mpris,local-files,subsonic,internet-radio,youtube --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           fail_ci_if_error: false
